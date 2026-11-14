@@ -3,7 +3,7 @@
 use crate::{BoxLayout, InlineContent, LayoutEngine, LayoutKind, LayoutNode, LayoutResult, TextMeasurer};
 use rendrix_css as css;
 use rendrix_css::{Dim, TrackItem, TrackSize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use taffy::prelude::*;
 use taffy::geometry::Point;
@@ -42,16 +42,21 @@ impl TaffyEngine {
         TaffyEngine { tree: TaffyTree::new(), nodes: HashMap::new(), last_new_nodes: 0, last_restyled_nodes: 0 }
     }
 
-    fn sync(&mut self, n: &LayoutNode, stats: &mut (usize, usize)) -> NodeId {
+    fn sync(&mut self, n: &LayoutNode, stats: &mut (usize, usize), tmp: &mut Vec<NodeId>) -> NodeId {
         let style = to_taffy(&n.style, &n.kind);
         let (kind_sig, ctx) = match &n.kind {
             LayoutKind::Box => (0, None),
             LayoutKind::Text(c) => (c.key() | 1, Some(Ctx::Text(c.clone()))),
             LayoutKind::Replaced { width, height } => ((width.to_bits() as u64) << 32 | height.to_bits() as u64 | 2, Some(Ctx::Replaced(*width, *height))),
         };
-        // Children first (post-order) so ids exist.
-        let child_ids: Vec<NodeId> = n.children.iter().map(|c| self.sync(c, stats)).collect();
-        let child_keys: Vec<u64> = n.children.iter().map(|c| c.id).collect();
+        // Children first (post-order) so ids exist. Child ids accumulate in the scratch
+        // buffer (P5: one reused allocation per layout instead of two vecs per node);
+        // `set_children`/`new_with_children` only borrow the slice during the call.
+        let base = tmp.len();
+        for c in &n.children {
+            let id = self.sync(c, stats, tmp);
+            tmp.push(id);
+        }
 
         if let Some(c) = self.nodes.get_mut(&n.id) {
             c.seen = true;
@@ -70,18 +75,27 @@ impl TaffyEngine {
                 c.kind_sig = kind_sig;
                 stats.1 += 1;
             }
-            if c.children != child_keys {
-                self.tree.set_children(c.node, &child_ids).unwrap();
-                c.children = child_keys;
+            // P5: compare child identity in place; only allocate the stored vec on change.
+            let same_children =
+                c.children.len() == n.children.len() && c.children.iter().zip(n.children.iter()).all(|(a, b)| *a == b.id);
+            if !same_children {
+                self.tree.set_children(c.node, &tmp[base..]).unwrap();
+                c.children = n.children.iter().map(|c| c.id).collect();
                 stats.1 += 1;
             }
-            c.node
+            let node = c.node;
+            tmp.truncate(base);
+            node
         } else {
             let node = match ctx {
                 Some(ctx) => self.tree.new_leaf_with_context(style.clone(), ctx).unwrap(),
-                None => self.tree.new_with_children(style.clone(), &child_ids).unwrap(),
+                None => self.tree.new_with_children(style.clone(), &tmp[base..]).unwrap(),
             };
-            self.nodes.insert(n.id, Cached { node, style, kind_sig, children: child_keys, seen: true });
+            self.nodes.insert(
+                n.id,
+                Cached { node, style, kind_sig, children: n.children.iter().map(|c| c.id).collect(), seen: true },
+            );
+            tmp.truncate(base);
             stats.0 += 1;
             node
         }
@@ -94,7 +108,8 @@ impl LayoutEngine for TaffyEngine {
             c.seen = false;
         }
         let mut stats = (0usize, 0usize);
-        let root_node = self.sync(root, &mut stats);
+        let mut tmp = Vec::new();
+        let root_node = self.sync(root, &mut stats, &mut tmp);
         // Drop nodes that disappeared.
         let stale: Vec<u64> = self.nodes.iter().filter(|(_, c)| !c.seen).map(|(k, _)| *k).collect();
         for k in stale {
@@ -353,7 +368,6 @@ pub(crate) fn to_taffy(s: &css::ComputedStyle, kind: &LayoutKind) -> Style {
     st.grid_column = Line { start: placement(s.grid_column.0), end: placement(s.grid_column.1) };
     st.grid_row = Line { start: placement(s.grid_row.0), end: placement(s.grid_row.1) };
     st.item_is_replaced = matches!(kind, LayoutKind::Replaced { .. });
-    let _ = HashSet::<u8>::new();
     st
 }
 

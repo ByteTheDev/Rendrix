@@ -2,7 +2,7 @@
 
 use crate::Engine;
 use rendrix_css::animation::{interpolate_property, property_differs, sample_animation, ANIMATABLE};
-use rendrix_css::{compute_style, ComputedStyle, MediaContext, Origin, PseudoElement, RuleSet, StyleContext, Stylesheet, TimingFunction};
+use rendrix_css::{compute_style, ComputedStyle, MediaContext, Origin, PseudoElement, RuleSet, StyleContext, TimingFunction};
 use rendrix_dom::{ElRef, NodeId, NodeKind};
 use std::sync::Arc;
 
@@ -39,6 +39,10 @@ impl Engine {
 
     /// Re-collect `<style>` and `<link rel=stylesheet>` sheets when they or the media context changed.
     /// Returns true when the rule set was rebuilt (all styles are then stale).
+    ///
+    /// P2: stylesheets are parsed once per content hash (`parse_cached`; UA sheet once via
+    /// `ua_sheet`). A rebuild caused only by a media-context change re-filters cached rules
+    /// instead of re-tokenising anything.
     pub(crate) fn refresh_rules(&mut self) -> bool {
         let media = self.media_context();
         let media_sig = (media.width.to_bits(), media.height.to_bits(), media.dpr.to_bits(), media.dark);
@@ -49,14 +53,13 @@ impl Engine {
         self.rules_dirty = false;
         self.rules_media_sig = Some(media_sig);
         let mut rules = RuleSet::new();
-        let ua = Stylesheet::parse(rendrix_css::ua::USER_AGENT_CSS);
-        rules.add_stylesheet(&ua, Origin::UserAgent, &media);
+        rules.add_stylesheet(&rendrix_css::parser::ua_sheet(), Origin::UserAgent, &media);
         let root = self.doc.root();
         for n in self.doc.depth_first(root) {
             match self.doc.tag(n) {
                 Some("style") => {
                     let css = self.doc.text_content(n);
-                    rules.add_stylesheet(&Stylesheet::parse(&css), Origin::Author, &media);
+                    rules.add_stylesheet(&rendrix_css::parser::parse_cached(&css), Origin::Author, &media);
                 }
                 Some("link") => {
                     let is_sheet = self.doc.get_attr(n, "rel").is_some_and(|r| r.eq_ignore_ascii_case("stylesheet"));
@@ -64,7 +67,7 @@ impl Engine {
                         if let Some(href) = self.doc.get_attr(n, "href") {
                             if let Some(bytes) = self.assets.read(href) {
                                 let css = String::from_utf8_lossy(&bytes).into_owned();
-                                rules.add_stylesheet(&Stylesheet::parse(&css), Origin::Author, &media);
+                                rules.add_stylesheet(&rendrix_css::parser::parse_cached(&css), Origin::Author, &media);
                             }
                         }
                     }
@@ -73,7 +76,7 @@ impl Engine {
             }
         }
         for sheet in &self.adopted_sheets {
-            rules.add_stylesheet(&Stylesheet::parse(sheet), Origin::Author, &media);
+            rules.add_stylesheet(&rendrix_css::parser::parse_cached(sheet), Origin::Author, &media);
         }
         // Register @font-face fonts that point at bundled assets.
         let faces = rules.font_faces.clone();
@@ -120,7 +123,13 @@ impl Engine {
                 })
                 .collect()
         };
-        let covered: std::collections::HashSet<NodeId> = start_nodes.iter().flat_map(|n| self.doc.depth_first(*n)).collect();
+        // P5: the covered set is only consulted for state roots; skip the O(n) scan when
+        // there is nothing to check it against.
+        let covered: Option<std::collections::HashSet<NodeId>> = if !all && !state_roots.is_empty() {
+            Some(start_nodes.iter().flat_map(|n| self.doc.depth_first(*n)).collect())
+        } else {
+            None
+        };
         for start in start_nodes {
             let parent_style = self.doc.parent(start).and_then(|p| self.styles.get(p as usize).cloned().flatten());
             self.restyle_subtree(start, parent_style, &sc, false);
@@ -128,7 +137,7 @@ impl Engine {
         // Interaction-state changes: restyle the element itself; descend only where something changed.
         if !all {
             for n in state_roots {
-                if covered.contains(&n) || !self.doc.is_alive(n) || self.doc.element(n).is_none() || !self.doc.is_connected(n) {
+                if covered.as_ref().is_some_and(|c| c.contains(&n)) || !self.doc.is_alive(n) || self.doc.element(n).is_none() || !self.doc.is_connected(n) {
                     continue;
                 }
                 let parent_style = self.doc.parent(n).and_then(|p| self.styles.get(p as usize).cloned().flatten());
@@ -319,4 +328,72 @@ fn extract_url(src: &str) -> Option<String> {
     let rest = &src[start..];
     let end = rest.find(')')?;
     Some(rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Engine, MapAssets};
+    use rendrix_dom::Document;
+
+    fn engine(html: &str, css: &str, w: f32, h: f32) -> Engine {
+        let src = format!("<html><head><style>{css}</style></head><body>{html}</body></html>");
+        let mut e = Engine::with_document(Document::parse(&src), Box::new(MapAssets::default()));
+        e.set_viewport(w, h, 1.0);
+        e.update(0.0);
+        e
+    }
+
+    fn width_of(e: &Engine, id: &str) -> String {
+        let n = e.doc.get_element_by_id(id).unwrap();
+        e.computed_value(n, "width")
+    }
+
+    #[test]
+    fn resize_reuses_ruleset_and_skips_restyle_without_viewport_deps() {
+        // P2+P3: static sheets parse once; a resize then rebuilds the same RuleSet and,
+        // with no @media and no viewport-relative values, skips the restyle entirely.
+        let mut e = engine(r#"<div id="a"><span>x</span></div>"#, "body{margin:0} #a{width:100px} #a span{color:red}", 800.0, 600.0);
+        assert!(!e.rules.has_media_rules && !e.rules.uses_viewport_units);
+        let (len, full_before, w_before) = (e.rules.len(), e.stats.full_restyles, width_of(&e, "a"));
+        assert!(len > 0);
+        e.set_viewport(700.0, 600.0, 1.0);
+        e.update(0.1);
+        assert_eq!(e.stats.full_restyles, full_before, "P3 skips the resize restyle");
+        assert_eq!(e.rules.len(), len, "P2 rebuilds the identical RuleSet without reparsing");
+        assert_eq!(width_of(&e, "a"), w_before);
+    }
+
+    #[test]
+    fn media_queries_and_viewport_units_still_restyle_on_resize() {
+        let mut e = engine(r#"<div id="a"></div>"#, "#a{width:100px} @media (max-width: 500px){#a{width:50px}}", 800.0, 600.0);
+        assert!(e.rules.has_media_rules);
+        let full_before = e.stats.full_restyles;
+        e.set_viewport(400.0, 600.0, 1.0);
+        e.update(0.1);
+        assert!(e.stats.full_restyles > full_before, "breakpoint flip must restyle");
+        assert_eq!(width_of(&e, "a"), "50px");
+
+        let mut v = engine(r#"<div id="a"></div>"#, "#a{width:50vw}", 800.0, 600.0);
+        assert!(v.rules.uses_viewport_units);
+        let full_before = v.stats.full_restyles;
+        v.set_viewport(400.0, 600.0, 1.0);
+        v.update(0.1);
+        assert!(v.stats.full_restyles > full_before, "viewport units must restyle");
+        assert_eq!(width_of(&v, "a"), "200px");
+    }
+
+    #[test]
+    fn inline_viewport_style_forces_restyle_on_resize() {
+        let mut e = engine(r#"<div id="a"></div>"#, "#a{width:100px}", 800.0, 600.0);
+        assert!(!e.doc.inline_viewport_units);
+        let a = e.doc.get_element_by_id("a").unwrap();
+        e.doc.set_attr(a, "style", "width: 10vw");
+        e.update(0.1);
+        assert!(e.doc.inline_viewport_units);
+        let full_before = e.stats.full_restyles;
+        e.set_viewport(400.0, 600.0, 1.0);
+        e.update(0.2);
+        assert!(e.stats.full_restyles > full_before);
+        assert_eq!(width_of(&e, "a"), "40px");
+    }
 }

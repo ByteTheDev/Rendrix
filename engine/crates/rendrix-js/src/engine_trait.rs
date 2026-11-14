@@ -106,4 +106,13 @@ pub trait JsEngine {
     fn take_rejections(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// Arm a wall-clock deadline for subsequently executed script: when the deadline passes, the
+    /// engine's interrupt handler fires and the running script fails with an error instead of
+    /// hanging the frame loop. `None` (the default) disables the deadline. Backends that cannot
+    /// preempt execution keep the no-op default.
+    fn set_execution_deadline(&mut self, _after: Option<std::time::Duration>) {}
+    /// Clear any armed execution deadline.
+    fn clear_execution_deadline(&mut self) {
+        self.set_execution_deadline(None);
+    }
 }

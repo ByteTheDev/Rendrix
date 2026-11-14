@@ -570,11 +570,140 @@ function scheduleImageEvents(img) {
   }, 0);
 }
 
+class CanvasGradient {
+  constructor(x0, y0, x1, y1) { this._x0 = +x0; this._y0 = +y0; this._x1 = +x1; this._y1 = +y1; this._stops = []; }
+  addColorStop(offset, color) {
+    offset = +offset;
+    if (!Number.isFinite(offset) || offset < 0 || offset > 1) throw new DOMException('The provided float value is non-finite', 'SyntaxError');
+    this._stops.push([offset, String(color)]);
+  }
+}
+class CanvasRenderingContext2D {
+  constructor(canvas) {
+    Object.defineProperty(this, '_id', { value: canvas[ID] });
+    this._resetCache();
+    N('canvas_ensure', this._id);
+  }
+  _resetCache() { this._fill = '#000000'; this._stroke = '#000000'; }
+  get canvas() { return wrap(this._id); }
+  // ----- state -----
+  save() { N('canvas_save', this._id); }
+  restore() { N('canvas_restore', this._id); }
+  // ----- transform (canvas matrix convention: x' = a*x + c*y + e) -----
+  translate(x, y) { N('canvas_transform', this._id, 1, 0, 0, 1, +x, +y); }
+  scale(x, y) { N('canvas_transform', this._id, +x, 0, 0, +(y === undefined ? x : y), 0, 0); }
+  rotate(a) { const c = Math.cos(a), s = Math.sin(a); N('canvas_transform', this._id, c, s, -s, c, 0, 0); }
+  transform(a, b, c, d, e, f) { N('canvas_transform', this._id, +a, +b, +c, +d, +e, +f); }
+  setTransform(a, b, c, d, e, f) {
+    if (a === undefined) N('canvas_set_transform', this._id, 1, 0, 0, 1, 0, 0);
+    else N('canvas_set_transform', this._id, +a, +b, +c, +d, +e, +f);
+  }
+  resetTransform() { N('canvas_set_transform', this._id, 1, 0, 0, 1, 0, 0); }
+  // ----- styles (invalid values are ignored, per spec) -----
+  _paintJSON(v) {
+    if (v instanceof CanvasGradient) {
+      if (!v._stops.length) return JSON.stringify({ color: '#000000' });
+      return JSON.stringify({ grad: { x0: v._x0, y0: v._y0, x1: v._x1, y1: v._y1, stops: v._stops } });
+    }
+    return JSON.stringify({ color: String(v) });
+  }
+  get fillStyle() { return this._fill; }
+  set fillStyle(v) { try { N('canvas_set_fill', this._id, this._paintJSON(v)); this._fill = v; } catch (_) {} }
+  get strokeStyle() { return this._stroke; }
+  set strokeStyle(v) { try { N('canvas_set_stroke', this._id, this._paintJSON(v)); this._stroke = v; } catch (_) {} }
+  get lineWidth() { return this._lineWidth === undefined ? 1 : this._lineWidth; }
+  set lineWidth(v) { v = +v; if (Number.isFinite(v) && v > 0) { N('canvas_set_line_width', this._id, v); this._lineWidth = v; } }
+  get lineCap() { return this._lineCap || 'butt'; }
+  set lineCap(v) { if (['butt', 'round', 'square'].includes(v)) { N('canvas_set_line_cap', this._id, v); this._lineCap = v; } }
+  get lineJoin() { return this._lineJoin || 'miter'; }
+  set lineJoin(v) { if (['miter', 'round', 'bevel'].includes(v)) { N('canvas_set_line_join', this._id, v); this._lineJoin = v; } }
+  get globalAlpha() { return this._alpha === undefined ? 1 : this._alpha; }
+  set globalAlpha(v) { v = +v; if (Number.isFinite(v) && v >= 0 && v <= 1) { N('canvas_set_alpha', this._id, v); this._alpha = v; } }
+  // ----- paths -----
+  beginPath() { N('canvas_begin', this._id); }
+  moveTo(x, y) { N('canvas_move_to', this._id, +x, +y); }
+  lineTo(x, y) { N('canvas_line_to', this._id, +x, +y); }
+  rect(x, y, w, h) { N('canvas_rect', this._id, +x, +y, +w, +h); }
+  arc(x, y, r, a0, a1, ccw) { mut('canvas_arc', this._id, +x, +y, +r, +a0, +a1, !!ccw); }
+  ellipse(x, y, rx, ry, rot, a0, a1, ccw) { mut('canvas_ellipse', this._id, +x, +y, +rx, +ry, +rot, +a0, +a1, !!ccw); }
+  closePath() { N('canvas_close', this._id); }
+  fill() { N('canvas_fill', this._id); }
+  stroke() { N('canvas_stroke', this._id); }
+  fillRect(x, y, w, h) { N('canvas_fill_rect', this._id, +x, +y, +w, +h); }
+  strokeRect(x, y, w, h) { N('canvas_stroke_rect', this._id, +x, +y, +w, +h); }
+  clearRect(x, y, w, h) { N('canvas_clear_rect', this._id, +x, +y, +w, +h); }
+  createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient(x0, y0, x1, y1); }
+  createRadialGradient() { throw new DOMException('Radial gradients are not supported', 'NotSupportedError'); }
+  createPattern() { throw new DOMException('Patterns are not supported', 'NotSupportedError'); }
+  // ----- images -----
+  drawImage(src, ...a) {
+    let sj, sx, sy, sw, sh, dx, dy, dw, dh;
+    if (src instanceof HTMLCanvasElement) {
+      sj = JSON.stringify({ canvas: src[ID] }); sw = src.width; sh = src.height;
+    } else if (src instanceof HTMLImageElement) {
+      const info = N('image_info', src.getAttribute('src') || '');
+      if (!info) return; // not loaded yet: paints nothing
+      sj = JSON.stringify({ img: src.getAttribute('src') }); sw = info[0]; sh = info[1];
+    } else throw new TypeError("drawImage: argument is not an image or canvas");
+    if (a.length === 2) [dx, dy] = a, [dw, dh] = [sw, sh], [sx, sy] = [0, 0];
+    else if (a.length === 4) [dx, dy, dw, dh] = a, [sx, sy] = [0, 0];
+    else if (a.length === 8) [sx, sy, sw, sh, dx, dy, dw, dh] = a;
+    else throw new TypeError(`drawImage: ${a.length + 1} arguments`);
+    if (sw <= 0 || sh <= 0 || dw === 0 || dh === 0) return;
+    mut('canvas_draw_image', this._id, sj, +sx, +sy, +sw, +sh, +dx, +dy, +dw, +dh);
+  }
+  // ----- pixels (get/put round-trip raw bytes; large rects base64-encode the whole area —
+  // prefer small rects, see the perf caveat in the A3 report) -----
+  getImageData(sx, sy, sw, sh) {
+    sw = Math.floor(sw); sh = Math.floor(sh);
+    if (sw === 0 || sh === 0) throw new DOMException('getImageData dimensions must be non-zero', 'IndexSizeError');
+    const b64 = N('canvas_get_data', this._id, Math.floor(sx), Math.floor(sy), sw, sh);
+    return new ImageData(new Uint8ClampedArray(b64ToBytes(b64).buffer), sw, sh);
+  }
+  putImageData(data, dx, dy) {
+    if (!(data instanceof ImageData)) throw new TypeError('putImageData: argument is not ImageData');
+    N('canvas_put_data', this._id, bytesToB64(data.data), data.width, data.height, Math.floor(dx), Math.floor(dy));
+  }
+  createImageData(a, b) {
+    if (a instanceof ImageData) return new ImageData(new Uint8ClampedArray(a.data), a.width, a.height);
+    const w = Math.floor(a), h = Math.floor(b);
+    if (w === 0 || h === 0) throw new DOMException('createImageData dimensions must be non-zero', 'IndexSizeError');
+    return new ImageData(w, h);
+  }
+}
+class ImageData {
+  constructor(a, b, c) {
+    if (typeof a === 'number') {
+      this.width = a; this.height = b;
+      this.data = new Uint8ClampedArray(a * b * 4);
+    } else {
+      this.data = a instanceof Uint8ClampedArray ? a : new Uint8ClampedArray(a);
+      this.width = b; this.height = c === undefined ? this.data.length / 4 / b : c;
+    }
+  }
+}
+global.CanvasRenderingContext2D = CanvasRenderingContext2D;
+global.CanvasGradient = CanvasGradient;
+global.ImageData = ImageData;
+
 class HTMLCanvasElement extends HTMLElement {
-  getContext() { return null; }   // Canvas 2D / WebGL are not implemented; feature-detect on null.
-  toDataURL() { throw new DOMException('Canvas rendering is not supported', 'NotSupportedError'); }
-  get width() { return parseInt(this.getAttribute('width') || '300', 10); } set width(v) { this.setAttribute('width', String(v)); }
-  get height() { return parseInt(this.getAttribute('height') || '150', 10); } set height(v) { this.setAttribute('height', String(v)); }
+  getContext(kind) {
+    kind = String(kind === undefined ? '' : kind);
+    if (kind === '2d') {
+      if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this);
+      else N('canvas_ensure', this[ID]);
+      return this._ctx2d;
+    }
+    // 'webgl'/'webgl2'/'webgpu'/'bitmaprenderer': not implemented — null for feature detection.
+    return null;
+  }
+  toDataURL(type) {
+    if (type !== undefined && String(type) !== 'image/png') { /* only image/png; still returns PNG */ }
+    if (this.width === 0 || this.height === 0) return 'data:,';
+    return N('canvas_data_url', this[ID]);
+  }
+  get width() { return parseInt(this.getAttribute('width') || '300', 10); } set width(v) { this.setAttribute('width', String(v)); N('canvas_resize', this[ID]); if (this._ctx2d) this._ctx2d._resetCache(); }
+  get height() { return parseInt(this.getAttribute('height') || '150', 10); } set height(v) { this.setAttribute('height', String(v)); N('canvas_resize', this[ID]); if (this._ctx2d) this._ctx2d._resetCache(); }
 }
 class HTMLStyleElement extends HTMLElement { get sheet() { return null; } }
 class HTMLLinkElement extends HTMLElement {}

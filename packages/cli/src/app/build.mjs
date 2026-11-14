@@ -3,10 +3,25 @@
 //   project/  rendrix.json, index.html, src/**/*.{ts,tsx,js}, assets…
 //      │  TypeScript compiler API: type-check, then per-module transpile to ES modules
 //      ▼
-//   rendrix-app/1 bundle (JSON): { html, modules{path→js}, assets{path→text|base64}, window, permissions }
+//   rendrix-app/1 bundle (JSON): { html, modules{path→js}, sourceMaps{path→map}, assets{path→text|base64}, window, permissions }
 //
 // The runtime never sees TypeScript: every module is plain ES2022 JavaScript before it is executed.
 // Bare imports are resolved here (node_modules ESM); the runtime resolves only bundle-relative ids.
+// `sourceMaps` carries one TypeScript-emitted v3 map per compiled module (with `sources` rewritten
+// to project-relative paths and `sourcesContent` dropped); the runtime uses them to remap error
+// stacks back to TS/TSX sources. The field is additive: bundles without it still load.
+//
+// Scope boundary: the runtime's `AppBundle::from_directory` dev loader is intentionally JS-only
+// (plain `.js`/`.mjs`, no compilation, no bare-specifier resolution). Any project with TS/TSX/JSX
+// sources or bare imports must go through this build (`rendrix dev` / `rendrix build`); the dev
+// loader rejects such directories with an actionable error instead of running partial output.
+//
+// JS/TS parity contract ("same pipeline, conditional check"): `.js`/`.mjs` and `.ts`/`.tsx`
+// sources go through the identical transpile + bundle path — JavaScript is never copied through
+// verbatim and never skips the bundler. The only difference is the type-check gate: TypeScript is
+// always type-checked, JavaScript skips type-checking by default and is only checked when the
+// caller opts in with `{ checkJs: true }` (CLI: `--check-js`). `allowJs` is forced on internally
+// so JS files are always part of the program; `checkJs` stays off unless requested.
 
 import ts from 'typescript';
 import path from 'node:path';
@@ -105,7 +120,7 @@ async function resolveBare(spec, fromFile, projectDir) {
 
 const compilerOptions = {
   target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.ReactJSX, jsxImportSource: 'rendrix',
-  sourceMap: false, inlineSourceMap: false, removeComments: false, verbatimModuleSyntax: false,
+  sourceMap: true, inlineSourceMap: false, removeComments: false, verbatimModuleSyntax: false,
 };
 
 function moduleKey(projectDir, file) {
@@ -143,19 +158,25 @@ function formatDiagnostic(project, d) {
   return `TS${d.code}: ${text}`;
 }
 
-/** Type-check the project with its tsconfig.json. Returns formatted error strings. */
-export async function typeCheck(project) {
+/** Type-check the project with its tsconfig.json. Returns formatted error strings.
+ *
+ * JS/TS parity contract: `allowJs` is always forced on so `.js` sources are part of the program
+ * and flow through the same transpile/bundle path as `.ts`; `checkJs` defaults to off so dirty
+ * JavaScript passes unless the caller opts in (`{ checkJs: true }`, CLI `--check-js`). */
+export async function typeCheck(project, { checkJs = false } = {}) {
   const configPath = path.join(project.dir, 'tsconfig.json');
   if (!(await exists(configPath))) return [];
-  const cfg = ts.getParsedCommandLineOfConfigFile(configPath, {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: d => { throw new BuildError(formatDiagnostic(project, d)); } });
-  const program = ts.createProgram({ rootNames: cfg.fileNames, options: { ...cfg.options, noEmit: true } });
+  // `allowJs`/`checkJs` are extended here (not just on the program) so file enumeration also
+  // picks up `.js` sources: without this a `.js` file is never a rootName and `checkJs` is a no-op.
+  const cfg = ts.getParsedCommandLineOfConfigFile(configPath, { allowJs: true, checkJs, noEmit: true }, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: d => { throw new BuildError(formatDiagnostic(project, d)); } });
+  const program = ts.createProgram({ rootNames: cfg.fileNames, options: { ...cfg.options, noEmit: true, allowJs: true, checkJs } });
   return ts.getPreEmitDiagnostics(program).filter(d => d.category === ts.DiagnosticCategory.Error).map(d => formatDiagnostic(project, d));
 }
 
-export async function buildApp(projectDir, { typecheck = true } = {}) {
+export async function buildApp(projectDir, { typecheck = true, checkJs = false } = {}) {
   const project = await loadProject(projectDir);
   const warnings = [];
-  const errors = typecheck ? await typeCheck(project) : [];
+  const errors = typecheck ? await typeCheck(project, { checkJs }) : [];
   if (errors.length) throw new BuildError(`Type errors in ${project.name}:\n${errors.join('\n')}`, errors);
 
   const htmlPath = path.join(project.dir, project.entry);
@@ -163,6 +184,7 @@ export async function buildApp(projectDir, { typecheck = true } = {}) {
   try { html = await readFile(htmlPath, 'utf8'); } catch { throw new BuildError(`${project.entry} not found in ${project.dir}`); }
 
   const modules = {};
+  const sourceMaps = {}; // bundle key → tsc source map (sources rewritten to project-relative paths)
   const compiled = new Map(); // abs file → key
   const sources = [];         // abs files that went into the bundle (for watching)
 
@@ -211,7 +233,22 @@ export async function buildApp(projectDir, { typecheck = true } = {}) {
     if (!isTs && /\brequire\s*\(|\bmodule\.exports\b/.test(out.outputText) && !/\bexport\b|\bimport\b/.test(out.outputText)) {
       throw new BuildError(`${path.relative(project.dir, file)} is a CommonJS module. Rendrix loads ES modules; use an ESM build of this dependency.`);
     }
-    modules[key] = out.outputText;
+    // Keep the emitted map for stack remapping, but out of the executed source: strip the
+    // `sourceMappingURL` comment (the `.map` file is not shipped in the bundle) and rewrite
+    // `sources` to the project-relative original path. `sourcesContent` is dropped to keep
+    // bundles lean — line/column remapping needs only `mappings` + `sources`.
+    let js = out.outputText.replace(/\/\/# sourceMappingURL=.*(\r?\n?)$/, '');
+    if (out.sourceMapText) {
+      try {
+        const map = JSON.parse(out.sourceMapText);
+        map.sources = [posix(path.relative(project.dir, file))];
+        delete map.sourcesContent;
+        delete map.file;
+        delete map.sourceRoot;
+        sourceMaps[key] = map;
+      } catch { /* a missing map only disables remapping for this module */ }
+    }
+    modules[key] = js;
     return key;
   }
 
@@ -252,7 +289,7 @@ export async function buildApp(projectDir, { typecheck = true } = {}) {
 
   const bundle = {
     format: BUNDLE_FORMAT, name: project.name, title: project.title, width: project.width, height: project.height,
-    html, modules, assets, permissions: project.permissions,
+    html, modules, sourceMaps, assets, permissions: project.permissions,
   };
   return { bundle, project, warnings, sources };
 }

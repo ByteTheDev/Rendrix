@@ -69,11 +69,19 @@ struct AtlasEntry {
 struct Atlas {
     texture: wgpu::Texture,
     bind: wgpu::BindGroup,
+    size: u32,
     map: HashMap<cosmic_text::CacheKey, Option<AtlasEntry>>,
     cursor_x: u32,
     cursor_y: u32,
     row_h: u32,
     pub evictions: u32,
+    /// Bumped every time the atlas is cleared. Instances always reference the
+    /// current generation's placements: the clear is deferred to the next frame
+    /// start, so no in-flight instance can ever point at a recycled slot.
+    pub generation: u64,
+    /// Set when a frame needed more space than the atlas holds; cleared (and
+    /// counted) at the next frame start.
+    overflowed: bool,
 }
 
 struct State {
@@ -88,6 +96,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     globals_buf: wgpu::Buffer,
+    globals_bind: wgpu::BindGroup,
     g_layout: wgpu::BindGroupLayout,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -103,7 +112,17 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// One pipeline draws everything; batches only split on texture switches.
+    /// The premultiplied-alpha blend contract lives in the pipeline descriptor
+    /// below and in the shader — never add a second pipeline or blend mode.
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat) -> Renderer {
+        Self::with_atlas_size(device, queue, format, ATLAS_SIZE)
+    }
+
+    /// Same renderer with an explicit glyph-atlas edge length (default 2048).
+    /// Exists for overflow-recovery tests; production keeps the default.
+    pub fn with_atlas_size(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, atlas_size: u32) -> Renderer {
+        let atlas_size = atlas_size.max(16);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rendrix shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -199,7 +218,7 @@ impl Renderer {
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         let white_bind = bind_for(&white);
-        let atlas_tex = make_tex(ATLAS_SIZE, ATLAS_SIZE, "rendrix glyph atlas");
+        let atlas_tex = make_tex(atlas_size, atlas_size, "rendrix glyph atlas");
         // A 2x2 opaque white block at the atlas origin: shapes sample it, so rects, shadows and glyphs
         // share one texture and consecutive draws merge into a single batch.
         queue.write_texture(
@@ -216,17 +235,19 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let globals_bind = Self::make_globals_bind(&device, &g_layout, &globals_buf, &inst_buf);
         Renderer {
             format,
             device,
             queue,
             pipeline,
             globals_buf,
+            globals_bind,
             g_layout,
             tex_layout,
             sampler,
             white_bind,
-            atlas: Atlas { texture: atlas_tex, bind: atlas_bind, map: HashMap::new(), cursor_x: 3, cursor_y: 0, row_h: 3, evictions: 0 },
+            atlas: Atlas { texture: atlas_tex, bind: atlas_bind, size: atlas_size, map: HashMap::new(), cursor_x: 3, cursor_y: 0, row_h: 3, evictions: 0, generation: 0, overflowed: false },
             images: HashMap::new(),
             next_image: 1,
             inst_buf,
@@ -234,6 +255,27 @@ impl Renderer {
             last_instances: 0,
             last_batches: 0,
         }
+    }
+
+    fn make_globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals_buf: &wgpu::Buffer, inst_buf: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rendrix globals bind"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: inst_buf.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Glyph-atlas evictions so far (each one cleared the map and re-uploaded).
+    pub fn atlas_evictions(&self) -> u32 {
+        self.atlas.evictions
+    }
+
+    /// Atlas generation: bumped on every eviction; used to detect mid-frame clears.
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas.generation
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -252,15 +294,21 @@ impl Renderer {
         id
     }
 
-    /// Upload under a caller-chosen id (the engine owns id allocation).
-    pub fn upload_image_as(&mut self, id: ImageId, rgba: &[u8], width: u32, height: u32) {
-        let mut pm = rgba.to_vec();
-        for px in pm.chunks_exact_mut(4) {
+    /// Premultiply straight-alpha RGBA8 in place (shared by image and canvas uploads; the
+    /// premultiplied-alpha blend contract lives in the pipeline descriptor, never per-texture).
+    fn premultiply(rgba: &mut [u8]) {
+        for px in rgba.chunks_exact_mut(4) {
             let a = px[3] as u32;
             px[0] = (px[0] as u32 * a / 255) as u8;
             px[1] = (px[1] as u32 * a / 255) as u8;
             px[2] = (px[2] as u32 * a / 255) as u8;
         }
+    }
+
+    /// Upload under a caller-chosen id (the engine owns id allocation).
+    pub fn upload_image_as(&mut self, id: ImageId, rgba: &[u8], width: u32, height: u32) {
+        let mut pm = rgba.to_vec();
+        Self::premultiply(&mut pm);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rendrix image"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -294,6 +342,75 @@ impl Renderer {
         self.images.remove(&id);
     }
 
+    // ---- Canvas 2D targets (A3) ------------------------------------------------------------
+    //
+    // One GPU texture per `<canvas>`, keyed by `canvas_image_id(node)` so ids never collide
+    // with decoded images (which count up from 1). Managed by the platform shell: create on
+    // first draw, recreate when `width`/`height` attributes change, re-upload otherwise.
+    // Dirty-region re-upload (`update_canvas_region`) is cheaper than a full re-upload when the
+    // union of a frame's draws covers less than roughly half the bitmap; the shell picks via
+    // `CanvasUpload::dirty`.
+
+    /// Full upload (or recreate on size change) of a canvas bitmap. Zero-size is a no-op:
+    /// zero-area canvases are never composited and own no texture.
+    pub fn upload_canvas(&mut self, node: u32, rgba: &[u8], width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let id = crate::display::canvas_image_id(node);
+        let same_size = self.images.get(&id).is_some_and(|t| t.width == width && t.height == height);
+        if same_size {
+            let mut pm = rgba.to_vec();
+            Self::premultiply(&mut pm);
+            self.queue.write_texture(
+                self.images.get(&id).unwrap().texture.as_image_copy(),
+                &pm,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        } else {
+            self.upload_image_as(id, rgba, width, height);
+        }
+    }
+
+    /// Re-upload only `region` (`[x, y, w, h]` in pixels) of a same-size canvas bitmap.
+    /// Falls back to a full upload when the texture is missing or the size changed.
+    pub fn update_canvas_region(&mut self, node: u32, full: &[u8], full_w: u32, full_h: u32, region: [u32; 4]) {
+        let id = crate::display::canvas_image_id(node);
+        let same = self.images.get(&id).is_some_and(|t| t.width == full_w && t.height == full_h);
+        if !same {
+            self.upload_canvas(node, full, full_w, full_h);
+            return;
+        }
+        let [x, y, w, h] = region;
+        let (w, h) = (w.min(full_w.saturating_sub(x)), h.min(full_h.saturating_sub(y)));
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut pm = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let s = ((y + row) * full_w + x) as usize * 4;
+            pm.extend_from_slice(&full[s..s + (w * 4) as usize]);
+        }
+        Self::premultiply(&mut pm);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.images.get(&id).unwrap().texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            &pm,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Drop a canvas texture (call when its element leaves the document).
+    pub fn remove_canvas(&mut self, node: u32) {
+        self.images.remove(&crate::display::canvas_image_id(node));
+    }
+
+    /// Current GPU target size, if one exists.
+    pub fn canvas_size(&self, node: u32) -> Option<(u32, u32)> {
+        self.images.get(&crate::display::canvas_image_id(node)).map(|t| (t.width, t.height))
+    }
+
     // ------------------------------------------------------------------------------------
 
     fn atlas_entry(&mut self, text: &mut TextSystem, key: cosmic_text::CacheKey) -> Option<AtlasEntry> {
@@ -305,18 +422,20 @@ impl Renderer {
             return None;
         };
         let (w, h) = (r.width + 1, r.height + 1);
-        if self.atlas.cursor_x + w > ATLAS_SIZE {
+        let size = self.atlas.size;
+        if self.atlas.cursor_x + w > size {
             self.atlas.cursor_x = 0;
             self.atlas.cursor_y += self.atlas.row_h;
             self.atlas.row_h = 0;
         }
-        if self.atlas.cursor_y + h > ATLAS_SIZE {
-            // Full: start over. Glyphs already emitted this frame may show stale data for one frame.
-            self.atlas.map.clear();
-            self.atlas.cursor_x = 3;
-            self.atlas.cursor_y = 0;
-            self.atlas.row_h = 3;
-            self.atlas.evictions += 1;
+        if self.atlas.cursor_y + h > size {
+            // Full: skip this glyph for the rest of the frame and recycle the
+            // atlas at the next frame start. Deferring the clear (instead of
+            // clearing here) guarantees no emitted instance references a stale
+            // placement; the cost is a one-frame-missing glyph under extreme
+            // text storms, never a wrong glyph.
+            self.atlas.overflowed = true;
+            return None;
         }
         let (x, y) = (self.atlas.cursor_x, self.atlas.cursor_y);
         self.atlas.cursor_x += w;
@@ -332,8 +451,23 @@ impl Renderer {
         Some(e)
     }
 
+    /// Recycle the glyph atlas if the previous frame overflowed it. Runs at frame
+    /// start so in-flight instances never go stale.
+    fn begin_frame(&mut self) {
+        if self.atlas.overflowed {
+            self.atlas.map.clear();
+            self.atlas.cursor_x = 3;
+            self.atlas.cursor_y = 0;
+            self.atlas.row_h = 3;
+            self.atlas.evictions += 1;
+            self.atlas.generation += 1;
+            self.atlas.overflowed = false;
+        }
+    }
+
     /// Draw a display list into `target` (`size_px` physical pixels, `scale` device px per logical px).
     pub fn render(&mut self, list: &DisplayList, text: &mut TextSystem, target: &wgpu::TextureView, size_px: (u32, u32), scale: f32) {
+        self.begin_frame();
         let mut insts: Vec<Inst> = Vec::with_capacity(512);
         let mut batches: Vec<Batch> = Vec::new();
         self.flatten(list, text, scale, &mut insts, &mut batches);
@@ -341,26 +475,29 @@ impl Renderer {
         self.last_batches = batches.len();
 
         if insts.len() > self.inst_cap {
-            self.inst_cap = insts.len().next_power_of_two();
+            // Headroom growth: 25% + 256 instances of slack, rounded up, so a
+            // frame that jitters around a power of two does not reallocate
+            // every time it crosses the boundary.
+            let want = insts.len() + insts.len() / 4 + 256;
+            let mut cap = self.inst_cap.max(1024);
+            while cap < want {
+                cap *= 2;
+            }
+            self.inst_cap = cap;
             self.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rendrix instances"),
                 size: (self.inst_cap * std::mem::size_of::<Inst>()) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            // The globals bind group references the instance buffer, so it must
+            // be recreated — once per regrow, not once per frame.
+            self.globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &self.globals_buf, &self.inst_buf);
         }
         if !insts.is_empty() {
             self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&insts));
         }
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&Globals { viewport: [size_px.0 as f32, size_px.1 as f32], pad: [0.0; 2] }));
-        let g_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rendrix globals bind"),
-            layout: &self.g_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.globals_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.inst_buf.as_entire_binding() },
-            ],
-        });
 
         let bg = list.background;
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rendrix frame") });
@@ -380,7 +517,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &g_bind, &[]);
+            pass.set_bind_group(0, &self.globals_bind, &[]);
             for b in &batches {
                 let bind = match b.tex {
                     Tex::White => &self.white_bind,
@@ -745,6 +882,60 @@ mod tests {
     }
 
     #[test]
+    fn rects_batch_into_one_draw() {
+        let mut l = DisplayList::new(200.0, 200.0, Color::WHITE);
+        for i in 0..50 {
+            l.push(rect(i as f32 * 3.0, 10.0, 2.0, 2.0, Color::BLACK));
+        }
+        // Plus a translucent rect: the premultiplied-alpha contract must hold.
+        l.push(Item::Rect(RectItem { rect: [10.0, 100.0, 40.0, 40.0], radii: [0.0; 4], fill: Fill::Solid(Color::from_u8(255, 0, 0, 0.5)), border: None }));
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let img = r.render_to_rgba(&l, &mut t, (200, 200), 1.0);
+        assert_eq!(r.last_instances, 51, "one instance per rect");
+        assert_eq!(r.last_batches, 1, "atlas-sampled rects merge into a single batch, one pipeline");
+        let c = px(&img, 200, 30, 120);
+        assert!(c[0] > 240 && (c[1] as i32 - 127).abs() < 16 && (c[2] as i32 - 127).abs() < 16 && c[3] == 255, "50% red over white is pink-opaque: {c:?}");
+    }
+
+    #[test]
+    fn atlas_overflow_recovers_without_stale_frames() {
+        use rendrix_css::ComputedStyle;
+        use rendrix_layout::{InlineContent, InlineRun};
+        use std::sync::Arc;
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        // A tiny atlas forces evictions with a modest glyph set.
+        let mut r = Renderer::with_atlas_size(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm, 256);
+        let mut t = TextSystem::new();
+        // Distinct CJK codepoints: every glyph needs its own atlas slot (a .notdef
+        // box still occupies one, so missing fonts cannot hide the overflow).
+        let text: String = (0..500).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        let mut s = ComputedStyle::default();
+        s.font_size = 32.0;
+        s.color = Color::BLACK;
+        let s = Arc::new(s);
+        let content = Arc::new(InlineContent { runs: vec![InlineRun { text, style: s.clone(), node: 1, is_break: false }], container: s });
+        let mut l = DisplayList::new(2000.0, 2000.0, Color::WHITE);
+        l.push(Item::Text(TextItem { content, x: 8.0, y: 8.0, width: 1984.0 }));
+        let img1 = r.render_to_rgba(&l, &mut t, (320, 200), 1.0);
+        assert_eq!(r.atlas_generation(), 0, "overflow never clears mid-frame");
+        let (inst1, batch1) = (r.last_instances, r.last_batches);
+        assert!(inst1 > 30, "head glyphs still drawn: {inst1}");
+        // The next frame recycles the atlas at frame start, then uploads the
+        // same glyphs in the same order into the same slots: pixel-identical,
+        // with no stale placements anywhere.
+        let img2 = r.render_to_rgba(&l, &mut t, (320, 200), 1.0);
+        assert!(r.atlas_evictions() >= 1, "the overflowed atlas was recycled");
+        assert_eq!((r.last_instances, r.last_batches), (inst1, batch1));
+        assert_eq!(img1, img2, "deferred clear is pixel-stable across frames");
+        let img3 = r.render_to_rgba(&l, &mut t, (320, 200), 1.0);
+        assert_eq!(img2, img3, "steady state stays stable");
+        // … and real ink landed in the top-left where the text starts.
+        assert!(img1.chunks_exact(4).any(|p| p[0] < 128), "text produced ink");
+    }
+
+    #[test]
     fn box_shadow_is_soft_and_outside() {
         let mut l = DisplayList::new(80.0, 80.0, Color::WHITE);
         l.push(Item::Shadow(ShadowItem { rect: [20.0, 20.0, 40.0, 40.0], radii: [4.0; 4], blur: 16.0, color: Color::BLACK, inset: false, hole: [0.0; 4] }));
@@ -754,5 +945,65 @@ mod tests {
         let far = px(&img, 80, 78, 40)[0];
         assert!(inside < 40, "dense under the box: {inside}");
         assert!(near > inside && near < 255 && far > near, "falls off with distance: {inside} {near} {far}");
+    }
+
+    // ---- Canvas 2D targets (A3) ------------------------------------------------------------
+
+    fn solid_canvas(w: u32, h: u32, c: Color) -> Vec<u8> {
+        let (r, g, b, a) = ((c.r * 255.0) as u8, (c.g * 255.0) as u8, (c.b * 255.0) as u8, (c.a * 255.0) as u8);
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            v.extend_from_slice(&[r, g, b, a]);
+        }
+        v
+    }
+
+    #[test]
+    fn canvas_composites_over_dom_background() {
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        // DOM background: solid green rect covering the canvas area.
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(rect(4.0, 4.0, 24.0, 24.0, Color::from_u8(0, 255, 0, 1.0)));
+        // Canvas bitmap: opaque red 24x24, composited on top like paint.rs emits it.
+        let node = 41u32;
+        r.upload_canvas(node, &solid_canvas(24, 24, Color::from_u8(255, 0, 0, 1.0)), 24, 24);
+        l.push(Item::Image(ImageItem { image: crate::display::canvas_image_id(node), rect: [4.0, 4.0, 24.0, 24.0], radii: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0] }));
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        assert_eq!(px(&img, 64, 16, 16), [255, 0, 0, 255], "canvas paints over the DOM background");
+        assert_eq!(px(&img, 64, 2, 2), [255, 255, 255, 255]);
+        assert_eq!(px(&img, 64, 40, 40), [255, 255, 255, 255]);
+        assert_eq!(r.last_batches, 2, "one batch for DOM quads, one for the canvas texture");
+    }
+
+    #[test]
+    fn canvas_resize_recreates_the_target() {
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let node = 7u32;
+        r.upload_canvas(node, &solid_canvas(4, 4, Color::BLACK), 4, 4);
+        assert_eq!(r.canvas_size(node), Some((4, 4)));
+        // Same size: texture reused, contents refreshed.
+        r.upload_canvas(node, &solid_canvas(4, 4, Color::WHITE), 4, 4);
+        assert_eq!(r.canvas_size(node), Some((4, 4)));
+        // New size: target recreated.
+        r.upload_canvas(node, &solid_canvas(8, 2, Color::WHITE), 8, 2);
+        assert_eq!(r.canvas_size(node), Some((8, 2)));
+        // Dirty-region upload keeps the size and refreshes pixels.
+        r.update_canvas_region(node, &solid_canvas(8, 2, Color::BLACK), 8, 2, [0, 0, 8, 2]);
+        assert_eq!(r.canvas_size(node), Some((8, 2)));
+        // A canvas id never collides with decoded-image ids (which count up from 1).
+        assert!(crate::display::canvas_image_id(node) >= 0x8000_0000);
+        r.remove_canvas(node);
+        assert_eq!(r.canvas_size(node), None);
+    }
+
+    #[test]
+    fn canvas_zero_size_owns_no_texture() {
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        r.upload_canvas(9, &[], 0, 0);
+        assert_eq!(r.canvas_size(9), None);
     }
 }

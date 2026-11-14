@@ -9,6 +9,8 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
     "types": [],
     "paths": {
       "rendrix": ["__TYPES__/index.d.ts"],

@@ -1,0 +1,20 @@
+{
+  "name": "rendrix-solid-adapter",
+  "version": "0.1.0",
+  "description": "Run SolidJS components on Rendrix's DOM: fine-grained signals patch the real DOM, no second renderer",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.js",
+    "./jsx-runtime": "./src/jsx-runtime.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "solid-js": "1.9.19"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -8,3 +8,10 @@ description = "Rendrix CSS engine: parser, selectors, cascade, computed style"
 doctest = false
 
 [dependencies]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "css"
+harness = false

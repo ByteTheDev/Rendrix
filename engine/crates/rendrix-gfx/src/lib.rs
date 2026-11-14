@@ -1,5 +1,6 @@
-//! Rendrix graphics: the display list, text shaping, and the wgpu renderer.
+//! Rendrix graphics: the display list, text shaping, the wgpu renderer, and Canvas 2D raster state.
 
+pub mod canvas;
 pub mod context;
 pub mod display;
 pub mod renderer;

@@ -7,6 +7,15 @@ use std::sync::Arc;
 
 pub type ImageId = u32;
 
+/// Canvas compositing: a `<canvas>` is one more textured quad — it reuses `Item::Image` with
+/// this id, so the existing clip/transform/opacity flattening applies unchanged. Each visible
+/// canvas binds its own texture, which may add **one batch per visible canvas** to
+/// `Renderer::last_batches` (documented cost of the A3 subset; DOM content still batches as
+/// before when no canvas is present).
+pub fn canvas_image_id(node: u32) -> ImageId {
+    0x8000_0000 | (node & 0x7FFF_FFFF)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fill {
     None,

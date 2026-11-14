@@ -341,9 +341,7 @@ fn apply_inner(
         "border-width" => {
             let parts: Vec<f32> = split_ws(v).iter().map(|p| parse_border_width(p, cx)).collect::<Option<_>>()?;
             let w = box4(&parts)?;
-            for i in 0..4 {
-                st.border_width[i] = if matches!(st.border_style[i], BorderStyle::None | BorderStyle::Hidden) { w[i] } else { w[i] };
-            }
+            st.border_width = w;
         }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             let i = side_index(name)?;

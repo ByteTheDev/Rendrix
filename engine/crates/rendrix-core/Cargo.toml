@@ -13,3 +13,10 @@ rendrix-dom.workspace = true
 rendrix-layout.workspace = true
 rendrix-gfx.workspace = true
 image.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false

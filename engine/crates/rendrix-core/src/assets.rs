@@ -68,11 +68,67 @@ impl Images {
         self.by_url.insert(url.to_string(), entry.clone());
         entry
     }
+
+    /// Number of decoded images waiting for GPU upload. Used by tests and the
+    /// future per-frame upload budget; the drivers currently drain all.
+    #[allow(dead_code)]
+    pub fn pending_count(&self) -> usize {
+        self.pending_upload.len()
+    }
+
+    /// Drain up to `n` pending uploads, oldest first, so the scheduler can
+    /// bound per-frame upload work without taking the whole queue.
+    /// Not wired yet: capping needs a pending-upload repaint wake (the renderer
+    /// skips not-yet-uploaded images), so the drivers still drain all.
+    #[allow(dead_code)]
+    pub fn take_up_to(&mut self, n: usize) -> Vec<ImageEntry> {
+        let k = self.pending_upload.len().min(n);
+        self.pending_upload.drain(..k).collect()
+    }
 }
 
 pub fn decode(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
     Some((w, h, img.into_raw()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_bytes() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(2, 3, image::Rgba([10, 20, 30, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        png
+    }
+
+    #[test]
+    fn uploads_drain_bounded_oldest_first() {
+        let mut assets = MapAssets::default();
+        assets.0.insert("a.png".into(), png_bytes());
+        assets.0.insert("b.png".into(), png_bytes());
+        let mut imgs = Images::default();
+        let a = imgs.get("a.png", &assets).expect("decodes");
+        let b = imgs.get("b.png", &assets).expect("decodes");
+        assert_ne!(a.id, b.id);
+        assert_eq!((a.width, a.height), (2, 3));
+        assert_eq!(imgs.pending_count(), 2);
+        // Repeat requests share the decode and queue nothing new.
+        assert!(imgs.get("a.png", &assets).is_some());
+        assert_eq!(imgs.pending_count(), 2);
+        // Failed loads are remembered without queueing.
+        assert!(imgs.get("missing.png", &assets).is_none());
+        assert_eq!(imgs.pending_count(), 2);
+        let one = imgs.take_up_to(1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, a.id, "oldest first");
+        assert_eq!(imgs.pending_count(), 1);
+        let rest = imgs.take_up_to(99);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, b.id);
+        assert_eq!(imgs.pending_count(), 0);
+    }
 }
 

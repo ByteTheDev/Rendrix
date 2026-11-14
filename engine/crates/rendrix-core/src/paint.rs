@@ -5,7 +5,7 @@ use crate::Engine;
 use rendrix_css::animation::{mat_apply, mat_invert, mat_mul, transform_matrix, Matrix, IDENTITY};
 use rendrix_css::{BackgroundImage, BackgroundRepeat, BackgroundSize, BorderStyle, Color, ComputedStyle, Dim, ObjectFit, Overflow, PointerEvents, Visibility};
 use rendrix_dom::NodeId;
-use rendrix_gfx::{DisplayList, Fill, ImageItem, Item, RectItem, ShadowItem, TextItem};
+use rendrix_gfx::{canvas_image_id, DisplayList, Fill, ImageItem, Item, RectItem, ShadowItem, TextItem};
 use rendrix_layout::{BoxLayout, LayoutKind, LayoutNode, LayoutResult};
 
 #[derive(Debug, Clone)]
@@ -298,17 +298,23 @@ impl<'a> Painter<'a> {
                     if el.flags.focus {
                         let (s, e) = (el.form.selection_start, el.form.selection_end);
                         let w = if engine.doc.tag(c) == Some("input") { None } else { Some(content_w) };
-                        // Selection and caret are drawn under/over the text in paragraph space.
-                        let mut ts = engine.text_borrow();
-                        if s != e {
-                            for r in ts.selection_rects(content, w, s, e) {
-                                self.list.push(Item::Rect(RectItem { rect: [tx + r[0], content_y + r[1], r[2], r[3]], radii: [0.0; 4], fill: Fill::Solid(Color::rgba(0.10, 0.45, 0.91, 0.30)), border: None }));
+                        let show_caret = engine.caret_visible() && s == e;
+                        if s != e || show_caret {
+                            // One paragraph lookup serves selection geometry and the caret
+                            // (previously each query re-hashed the full text for its own lookup).
+                            let mut ts = engine.text_borrow();
+                            let para = ts.paragraph(content, w);
+                            if s != e {
+                                for r in ts.selection_rects_in(&para, s, e) {
+                                    self.list.push(Item::Rect(RectItem { rect: [tx + r[0], content_y + r[1], r[2], r[3]], radii: [0.0; 4], fill: Fill::Solid(Color::rgba(0.10, 0.45, 0.91, 0.30)), border: None }));
+                                }
                             }
-                        }
-                        if engine.caret_visible() && s == e {
-                            let (cx, cy, ch) = ts.caret(content, w, e);
-                            let col = style.caret_color.unwrap_or(style.color);
-                            self.list.push(Item::Rect(RectItem { rect: [tx + cx, content_y + cy, 1.0, ch], radii: [0.0; 4], fill: Fill::Solid(col), border: None }));
+                            if show_caret {
+                                let fallback_h = content.container.line_height.resolve(content.container.font_size);
+                                let (cx, cy, ch) = ts.caret_in(&para, e, fallback_h);
+                                let col = style.caret_color.unwrap_or(style.color);
+                                self.list.push(Item::Rect(RectItem { rect: [tx + cx, content_y + cy, 1.0, ch], radii: [0.0; 4], fill: Fill::Solid(col), border: None }));
+                            }
                         }
                     }
                 }
@@ -361,6 +367,32 @@ impl<'a> Painter<'a> {
                             self.list.push(Item::Image(ImageItem { image: img.id, rect: r, radii, uv }));
                         }
                     }
+                }
+                // Canvas 2D (A3): composite the GPU target as a plain textured quad. Clips,
+                // transforms and opacity apply through the shared flatten path; the intrinsic
+                // size comes from the width/height attributes (default 300x150). Zero-area
+                // canvases emit nothing and own no texture.
+                if engine.doc.tag(tag) == Some("canvas") {
+                    let dim = |name: &str, def: f32| {
+                        engine
+                            .doc
+                            .get_attr(tag, name)
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .map(|v| v.max(0.0))
+                            .unwrap_or(def)
+                    };
+                    if dim("width", 300.0) > 0.0 && dim("height", 150.0) > 0.0 && content_w > 0.0 && content_h > 0.0 {
+                        let radii = resolve_radii(style, b.width, b.height);
+                        self.list.push(Item::Image(ImageItem {
+                            image: canvas_image_id(tag),
+                            rect: [content_x, content_y, content_w, content_h],
+                            radii,
+                            uv: [0.0, 0.0, 1.0, 1.0],
+                        }));
+                    }
+                    // Drain this canvas from the pending set: its draws are now displayed.
+                    let doc_key = (&engine.doc as *const rendrix_dom::Document) as usize;
+                    rendrix_gfx::canvas::note_painted(doc_key, tag);
                 }
             }
             LayoutKind::Box => {

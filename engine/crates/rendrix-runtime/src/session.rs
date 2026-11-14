@@ -124,6 +124,13 @@ fn normalize(p: &str) -> String {
     p.trim_start_matches("./").trim_start_matches('/').split(['?', '#']).next().unwrap_or("").to_string()
 }
 
+impl Drop for Session {
+    // A4 workers: bounded shutdown (never deadlocks the close path).
+    fn drop(&mut self) {
+        self.js.shutdown_workers();
+    }
+}
+
 impl Session {
     /// Parse the bundle's document, install the runtime and run its scripts in document order.
     pub fn new(bundle: &AppBundle, clipboard: Box<dyn Clipboard>, viewport: (f32, f32, f32)) -> Result<Session, String> {
@@ -135,10 +142,22 @@ impl Session {
         for (path, src) in &bundle.modules {
             js.add_module(path, src.clone());
         }
+        for (path, map) in &bundle.source_maps {
+            js.add_source_map(path, &map.to_string());
+        }
         let mut session = Session { engine, js, input: InputState { window_focused: true, ..Default::default() }, clipboard, last_cursor: None, title: bundle.window_title(), bundle_name: bundle.name.clone() };
         session.run_document_scripts(bundle)?;
+        // A4 workers: hand the bundle module map + network grant to the worker registry.
+        session.js.set_worker_modules(bundle.modules.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        session.js.set_worker_network(bundle.permissions.network);
         session.js.boot();
         Ok(session)
+    }
+
+    /// D2 hot swap: validate + commit `changed` (the full bundle.modules map) without
+    /// dropping the DOM. Returns re-run entry labels; on Err the session is last-good.
+    pub fn apply_hot_update(&mut self, changed: std::collections::BTreeMap<String, String>) -> Result<Vec<String>, String> {
+        crate::hot_reload::apply_module_update(self, changed)
     }
 
     fn run_document_scripts(&mut self, bundle: &AppBundle) -> Result<(), String> {
@@ -559,7 +578,7 @@ impl Session {
         } else if cmd && matches!(k.key.as_str(), "c" | "C" | "x" | "X") {
             let (text, cut) = {
                 let e = self.engine.borrow();
-                let el = e.doc.element(id).unwrap();
+                let Some(el) = e.doc.element(id) else { return };
                 let v = e.doc.value(id);
                 let (a, b) = (el.form.selection_start.min(el.form.selection_end), el.form.selection_start.max(el.form.selection_end));
                 (v.get(a..b).unwrap_or("").to_string(), matches!(k.key.as_str(), "x" | "X"))
@@ -660,6 +679,13 @@ impl Session {
             (a, b) => a.or(b),
         };
         if tick.pending_io {
+            out.next_wake_s = Some(out.next_wake_s.map_or(now + 0.016, |w| w.min(now + 0.016)));
+        }
+        // A4 workers: pump threads (capped 16/frame into script), wake soon while spilled.
+        let worker_events = self.js.poll_workers();
+        let workers_busy = !worker_events.is_empty() || self.js.worker_pending();
+        drop(worker_events);
+        if workers_busy || self.js.worker_alive() {
             out.next_wake_s = Some(out.next_wake_s.map_or(now + 0.016, |w| w.min(now + 0.016)));
         }
         // Cursor from the element under the pointer.

@@ -42,6 +42,68 @@ test('compiles TypeScript to ES modules and rewrites imports to bundle paths', a
   } finally { await cleanup(dir); }
 });
 
+test('JS and TS take the same transpile path: identical logic compiles to identical output', async () => {
+  const dir = await project({
+    'tsconfig.json': '{"compilerOptions":{"strict":true,"module":"ESNext","target":"ES2022","moduleResolution":"bundler","noEmit":true,"lib":["ES2022","DOM"],"types":[]},"include":["src"]}',
+    'src/main.ts': "import { add as t } from './fromTs';\nimport { add as j } from './fromJs';\nexport const out = t(1, 2) + j(1, 2);",
+    'src/fromTs.ts': 'export const add = (a: number, b: number): number => a + b;',
+    'src/fromJs.js': 'export const add = (a, b) => a + b;',
+  });
+  try {
+    const { bundle } = await buildApp(dir, { typecheck: true });
+    assert.equal(bundle.modules['src/fromTs.js'], bundle.modules['src/fromJs.js'], 'types are erased; JS is transpiled, not copied');
+  } finally { await cleanup(dir); }
+});
+
+test('type-check gates TS always and JS only with checkJs', async () => {
+  const tsconfig = '{"compilerOptions":{"strict":true,"module":"ESNext","target":"ES2022","moduleResolution":"bundler","noEmit":true,"lib":["ES2022","DOM"],"types":[]},"include":["src"]}';
+  const tsDir = await project({ 'tsconfig.json': tsconfig, 'src/main.ts': "const n: number = 'not a number';\nexport {};" });
+  try {
+    await assert.rejects(buildApp(tsDir), /main\.ts.*TS2322/, 'dirty TS always fails the build');
+  } finally { await cleanup(tsDir); }
+  const jsDir = await project({
+    'tsconfig.json': tsconfig,
+    'index.html': '<html><body><script type="module" src="src/main.js"></script></body></html>',
+    'src/main.js': "/** @type {number} */\nconst n = 'not a number';\nexport default n;",
+  });
+  try {
+    const { bundle } = await buildApp(jsDir);
+    assert.ok(bundle.modules['src/main.js'], 'dirty JS passes by default (checkJs off)');
+    await assert.rejects(buildApp(jsDir, { checkJs: true }), /main\.js.*TS2322/, 'dirty JS fails with checkJs opt-in');
+  } finally { await cleanup(jsDir); }
+});
+test('dynamic import() specifiers are rewritten; variable specifiers pass through', async () => {
+  const dir = await project({
+    'src/main.ts': "const a = await import('./chunk.ts');\nexport const out: number = a.value;\nexport function load(name: string) { return import(name); }",
+    'src/chunk.ts': 'export const value = 41;',
+  });
+  try {
+    const { bundle } = await buildApp(dir, { typecheck: false });
+    assert.ok(bundle.modules['src/chunk.js'], 'dynamically imported chunk is bundled (compile follows dynamic edges)');
+    assert.match(bundle.modules['src/main.js'], /import\(['"]\.\/chunk\.js['"]\)/, 'static dynamic-import specifier is rewritten to the bundle path');
+    assert.match(bundle.modules['src/main.js'], /import\(name\)/, 'variable specifier is left for the runtime loader');
+  } finally { await cleanup(dir); }
+});
+
+test('bundles carry source maps with project-relative sources and clean module output', async () => {
+  const dir = await project({
+    'src/main.ts': "import { add } from './util';\nconst n: number = add(1, 2);\nexport default n;",
+    'src/util.ts': 'export const add = (a: number, b: number): number => a + b;',
+  });
+  try {
+    const { bundle } = await buildApp(dir, { typecheck: false });
+    assert.equal(bundle.format, 'rendrix-app/1', 'no format bump: sourceMaps is an additive field');
+    for (const key of ['src/main.js', 'src/util.js']) {
+      const map = bundle.sourceMaps[key];
+      assert.ok(map && map.version === 3, `${key} has a v3 map`);
+      assert.deepEqual(map.sources, [key.replace(/\.js$/, '.ts')], 'sources rewritten to the original path');
+      assert.ok(typeof map.mappings === 'string' && map.mappings.length > 0, 'mappings present');
+      assert.ok(!('sourcesContent' in map), 'sourcesContent dropped to keep bundles lean');
+      assert.doesNotMatch(bundle.modules[key], /sourceMappingURL/, 'no dangling map reference in executed source');
+    }
+  } finally { await cleanup(dir); }
+});
+
 test('TSX compiles to the rendrix JSX runtime', async () => {
   const dir = await project({ 'src/main.ts': "import './view.tsx';", 'src/view.tsx': 'const el = <div class="a">hi</div>; export default el;' });
   try {

@@ -9,3 +9,6 @@ doctest = false
 
 [dependencies]
 rendrix-css.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true

@@ -52,6 +52,11 @@ pub struct EngineStats {
     pub last_layout_micros: u64,
     pub last_style_micros: u64,
     pub last_paint_micros: u64,
+    /// M0 shaping signals (populated per frame; Taffy new/restyled node counts
+    /// stay inside `TaffyEngine` until its layout API exposes them).
+    pub shape_count: usize,
+    pub cache_hits: usize,
+    pub cache_len: usize,
 }
 
 pub struct Engine {
@@ -74,7 +79,9 @@ pub struct Engine {
     pub(crate) anim: HashMap<NodeId, style::AnimState>,
     pub now: f64,
 
-    layout_tree: Option<LayoutNode>,
+    /// P1: the previous frame's box tree persists across `update` calls so dirty regions can
+    /// be rebuilt and spliced by NodeId instead of rebuilding the whole tree.
+    pub(crate) layout_tree: Option<LayoutNode>,
     layout_result: LayoutResult,
     display: DisplayList,
     hits: Vec<HitEntry>,
@@ -269,6 +276,7 @@ impl Engine {
         self.stats.last_layout_micros = 0;
         self.stats.last_paint_micros = 0;
         let t0 = std::time::Instant::now();
+        let sheets_were_dirty = self.doc.sheets_dirty || self.rules_dirty;
         let rules_rebuilt = self.refresh_rules();
         // Sweep detached, unreferenced subtrees at most once a second.
         if now - self.last_gc >= 1.0 {
@@ -298,7 +306,17 @@ impl Engine {
                 self.pseudo.remove(&(n, false));
             }
         }
-        let all = dirty.all_style || rules_rebuilt || self.viewport_changed;
+        // P3 phase-1: a rebuild caused only by the media-context change (resize, DPR, dark
+        // mode) with no `@media` rules, no viewport-relative declarations and no inline
+        // viewport styles provably changes no computed style: percentages resolve at layout
+        // time, never in the cascade. Skip the restyle; layout still reruns below.
+        let viewport_neutral =
+            !self.rules.has_media_rules && !self.rules.uses_viewport_units && !self.doc.inline_viewport_units;
+        let media_only_rebuild = rules_rebuilt && !sheets_were_dirty && !dirty.all_style;
+        let mut all = dirty.all_style || rules_rebuilt || self.viewport_changed;
+        if media_only_rebuild && self.viewport_changed && viewport_neutral {
+            all = dirty.all_style;
+        }
         let mut restyled = false;
         if all || !dirty.style_roots.is_empty() || !dirty.state_roots.is_empty() {
             restyled = self.restyle(all, dirty.style_roots.clone(), dirty.state_roots.clone());
@@ -320,22 +338,54 @@ impl Engine {
             return UpdateInfo { repainted: false, animating: false, next_wake: self.next_wake() };
         }
         let relayout = restyled || dirty.layout || self.viewport_changed || self.layout_tree.is_none() || animating;
+        let vp_changed = self.viewport_changed;
         self.viewport_changed = false;
         self.force_repaint = false;
 
         if relayout {
             let t1 = std::time::Instant::now();
-            let tree = boxtree::Builder::new(self).build_root();
-            if let Some(mut tree) = tree {
-                // The root fills the viewport width.
-                let mut s = (*tree.style).clone();
-                s.width = rendrix_css::Dim::Px(self.viewport.0);
-                tree.style = Arc::new(s);
-                self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
-                self.layout_tree = Some(tree);
-            } else {
-                self.layout_tree = None;
-                self.layout_result = LayoutResult::default();
+            // P1: incremental box generation. The previous frame's tree persists in
+            // `layout_tree`; dirty regions are rebuilt and spliced by NodeId while clean
+            // style-identical subtrees are reused. Falls back to `build_root` whenever the
+            // patch cannot preserve full-build semantics (then output is still identical).
+            let mut patched = false;
+            if !all && !animating {
+                if let Some(mut tree) = self.layout_tree.take() {
+                    let mut roots: Vec<NodeId> =
+                        dirty.style_roots.iter().chain(dirty.state_roots.iter()).copied().collect();
+                    roots.retain(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n));
+                    if roots.is_empty() {
+                        // No style-affecting change (e.g. a viewport-only resize whose
+                        // restyle P3 skipped): styles — hence boxes — are identical, so the
+                        // persisted tree is reused and only Taffy re-solves.
+                        patched = true;
+                    } else {
+                        patched = boxtree::patch_tree(self, &mut tree, &roots);
+                    }
+                    if patched {
+                        if vp_changed {
+                            boxtree::refresh_root_width(&mut tree, self.viewport.0);
+                        }
+                        self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
+                        self.layout_tree = Some(tree);
+                    }
+                    // else: `tree` may have been partially drained into the reuse pool, so it
+                    // is dropped here and the full rebuild below replaces it.
+                }
+            }
+            if !patched {
+                let tree = boxtree::Builder::new(self).build_root();
+                if let Some(mut tree) = tree {
+                    // The root fills the viewport width.
+                    let mut s = (*tree.style).clone();
+                    s.width = rendrix_css::Dim::Px(self.viewport.0);
+                    tree.style = Arc::new(s);
+                    self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
+                    self.layout_tree = Some(tree);
+                } else {
+                    self.layout_tree = None;
+                    self.layout_result = LayoutResult::default();
+                }
             }
             self.stats.layouts += 1;
             self.stats.last_layout_micros = t1.elapsed().as_micros() as u64;
@@ -344,6 +394,12 @@ impl Engine {
         let t2 = std::time::Instant::now();
         self.paint();
         self.stats.last_paint_micros = t2.elapsed().as_micros() as u64;
+        {
+            let text = self.text.borrow();
+            self.stats.shape_count = text.shape_count;
+            self.stats.cache_hits = text.cache_hits;
+            self.stats.cache_len = text.cache_len();
+        }
         self.stats.frames += 1;
         UpdateInfo { repainted: true, animating, next_wake: self.next_wake() }
     }

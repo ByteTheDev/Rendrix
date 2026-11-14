@@ -8,6 +8,7 @@ use rquickjs::{Array, Ctx, Error, Exception, Function, Module, Result as QResult
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 pub type ModuleMap = Rc<RefCell<HashMap<String, String>>>;
 
@@ -53,6 +54,11 @@ pub struct QuickJsEngine {
     ctx: rquickjs::Context,
     modules: ModuleMap,
     rejections: Rc<RefCell<Vec<String>>>,
+    /// Wall-clock deadline armed around task execution (`None` = no deadline). Checked by the
+    /// interrupt handler QuickJS polls from its opcode loop, so tight loops are preempted too.
+    deadline: Rc<RefCell<Option<Instant>>>,
+    /// Set by the interrupt handler when it fires; used to recognise the resulting error.
+    interrupted: Rc<RefCell<bool>>,
 }
 
 fn to_val(v: &Value<'_>) -> Val {
@@ -63,10 +69,10 @@ fn to_val(v: &Value<'_>) -> Val {
         Type::Int => Val::Num(v.as_int().unwrap_or(0) as f64),
         Type::Float => Val::Num(v.as_float().unwrap_or(0.0)),
         Type::String => Val::Str(v.as_string().and_then(|s| s.to_string().ok()).unwrap_or_default()),
-        Type::Array => {
-            let a = v.as_array().unwrap();
-            Val::List((0..a.len()).map(|i| a.get::<Value>(i).map(|x| to_val(&x)).unwrap_or(Val::Undefined)).collect())
-        }
+        Type::Array => match v.as_array() {
+            Some(a) => Val::List((0..a.len()).map(|i| a.get::<Value>(i).map(|x| to_val(&x)).unwrap_or(Val::Undefined)).collect()),
+            None => Val::Undefined,
+        },
         _ => Val::Undefined,
     }
 }
@@ -126,6 +132,22 @@ impl QuickJsEngine {
         rt.set_max_stack_size(2 * 1024 * 1024);
         let modules: ModuleMap = Rc::new(RefCell::new(HashMap::new()));
         rt.set_loader(MapResolver(modules.clone()), MapLoader(modules.clone()));
+        let deadline: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
+        let interrupted: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        {
+            let deadline = deadline.clone();
+            let interrupted = interrupted.clone();
+            rt.set_interrupt_handler(Some(Box::new(move || {
+                let expired = match *deadline.borrow() {
+                    Some(t) => Instant::now() >= t,
+                    None => false,
+                };
+                if expired {
+                    *interrupted.borrow_mut() = true;
+                }
+                expired
+            })));
+        }
         let rejections: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         {
             let r = rejections.clone();
@@ -146,7 +168,18 @@ impl QuickJsEngine {
         }
         let ctx = rquickjs::Context::full(&rt).map_err(|e| JsError { message: e.to_string(), stack: None })?;
         ctx.with(|ctx| install_native(&ctx, host).map_err(|e| describe_exception(&ctx, e)))?;
-        Ok(QuickJsEngine { rt, ctx, modules, rejections })
+        Ok(QuickJsEngine { rt, ctx, modules, rejections, deadline, interrupted })
+    }
+
+    /// If the interrupt handler fired while this error was produced, the script was preempted by
+    /// an armed execution deadline: rewrite the engine-internal message into a runaway-script
+    /// timeout. Always clears the flag so one interrupt cannot taint later errors.
+    fn timeout_if_interrupted(&self, err: JsError) -> JsError {
+        if std::mem::replace(&mut *self.interrupted.borrow_mut(), false) {
+            JsError { message: format!("runaway script interrupted (execution budget exceeded): {}", err.message), stack: None }
+        } else {
+            err
+        }
     }
 
 }
@@ -168,7 +201,7 @@ impl JsEngine for QuickJsEngine {
             ctx.eval_with_options::<(), _>(source.as_bytes().to_vec(), opts).map_err(|e| {
                 let mut err = describe_exception(&ctx, e);
                 err.message = format!("{name}: {}", err.message);
-                err
+                self.timeout_if_interrupted(err)
             })
         })
     }
@@ -176,12 +209,12 @@ impl JsEngine for QuickJsEngine {
     fn eval_module(&mut self, name: &str) -> Result<(), JsError> {
         let src = self.modules.borrow().get(name).cloned().ok_or_else(|| JsError { message: format!("module '{name}' not found"), stack: None })?;
         self.ctx.with(|ctx| {
-            let promise = Module::evaluate(ctx.clone(), name, src).map_err(|e| describe_exception(&ctx, e))?;
+            let promise = Module::evaluate(ctx.clone(), name, src).map_err(|e| self.timeout_if_interrupted(describe_exception(&ctx, e)))?;
             match promise.finish::<()>() {
                 Ok(()) => Ok(()),
                 // Top-level await on something that needs the event loop: not an error.
                 Err(Error::WouldBlock) => Ok(()),
-                Err(e) => Err(describe_exception(&ctx, e)),
+                Err(e) => Err(self.timeout_if_interrupted(describe_exception(&ctx, e))),
             }
         })
     }
@@ -194,7 +227,7 @@ impl JsEngine for QuickJsEngine {
                 let jv = from_val(&ctx, v).map_err(|e| describe_exception(&ctx, e))?;
                 a.push_arg(jv).map_err(|e| describe_exception(&ctx, e))?;
             }
-            let out: Value = f.call_arg(a).map_err(|e| describe_exception(&ctx, e))?;
+            let out: Value = f.call_arg(a).map_err(|e| self.timeout_if_interrupted(describe_exception(&ctx, e)))?;
             Ok(to_val(&out))
         })
     }
@@ -205,7 +238,7 @@ impl JsEngine for QuickJsEngine {
                 Ok(true) => {}
                 Ok(false) => return Ok(()),
                 Err(_) => {
-                    return self.ctx.with(|ctx| Err(describe_exception(&ctx, Error::Exception)));
+                    return self.ctx.with(|ctx| Err(self.timeout_if_interrupted(describe_exception(&ctx, Error::Exception))));
                 }
             }
         }
@@ -221,5 +254,15 @@ impl JsEngine for QuickJsEngine {
 
     fn take_rejections(&mut self) -> Vec<String> {
         std::mem::take(&mut *self.rejections.borrow_mut())
+    }
+
+    fn set_execution_deadline(&mut self, after: Option<Duration>) {
+        *self.interrupted.borrow_mut() = false;
+        *self.deadline.borrow_mut() = after.map(|d| Instant::now() + d);
+    }
+
+    fn clear_execution_deadline(&mut self) {
+        *self.interrupted.borrow_mut() = false;
+        *self.deadline.borrow_mut() = None;
     }
 }

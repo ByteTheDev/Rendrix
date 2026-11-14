@@ -81,6 +81,16 @@ impl Headless {
         for img in engine.take_image_uploads() {
             self.renderer.upload_image_as(img.id, &img.rgba, img.width, img.height);
         }
+        // A3 canvas: create-or-refresh per-canvas GPU targets (partial re-upload).
+        for up in rendrix_js::canvas_ops::take_canvas_uploads(&engine) {
+            if up.rgba.is_empty() { self.renderer.remove_canvas(up.node); continue; }
+            match up.dirty {
+                Some(r) if r[2] * r[3] * 2 < up.width * up.height => {
+                    self.renderer.update_canvas_region(up.node, &up.rgba, up.width, up.height, r)
+                }
+                _ => self.renderer.upload_canvas(up.node, &up.rgba, up.width, up.height),
+            }
+        }
         let mut text = engine.text_borrow();
         let rgba = self.renderer.render_to_rgba(engine.display_list(), &mut text, (w, h), self.scale);
         Shot { width: w, height: h, rgba }
@@ -94,6 +104,16 @@ impl Headless {
         let engine = self.session.engine.borrow();
         for img in engine.take_image_uploads() {
             self.renderer.upload_image_as(img.id, &img.rgba, img.width, img.height);
+        }
+        // A3 canvas: create-or-refresh per-canvas GPU targets (partial re-upload).
+        for up in rendrix_js::canvas_ops::take_canvas_uploads(&engine) {
+            if up.rgba.is_empty() { self.renderer.remove_canvas(up.node); continue; }
+            match up.dirty {
+                Some(r) if r[2] * r[3] * 2 < up.width * up.height => {
+                    self.renderer.update_canvas_region(up.node, &up.rgba, up.width, up.height, r)
+                }
+                _ => self.renderer.upload_canvas(up.node, &up.rgba, up.width, up.height),
+            }
         }
         let mut text = engine.text_borrow();
         self.renderer.render(engine.display_list(), &mut text, &view, (w, h), self.scale);
@@ -124,6 +144,25 @@ impl Headless {
         self.session.pointer_move(x, y);
         self.session.pointer_down(x, y, 0);
         self.session.pointer_up(x, y, 0);
+    }
+
+    /// Inject file-dialog results without OS UI (`Some(paths)` picks, `None` cancels).
+    pub fn set_dialog_mock(&mut self, result: Option<Option<Vec<String>>>) {
+        self.session.js.host.borrow_mut().set_dialog_mock(result);
+    }
+
+    /// Simulate an OS file drop at viewport coordinates, through the same public
+    /// `JsRuntime::dispatch` path the window driver uses for `DroppedFile`.
+    pub fn drop_files(&mut self, x: f32, y: f32, paths: &[&str]) {
+        let target = self.session.engine.borrow().hit_test(x, y);
+        let files: Vec<Value> = paths.iter().map(|p| serde_json::json!({ "name": p.rsplit('/').next().unwrap_or(p), "path": p })).collect();
+        self.session.js.dispatch("drop", target, &serde_json::json!({ "clientX": x, "clientY": y, "button": 0, "dataTransfer": { "files": files, "dropEffect": "copy" } }));
+    }
+
+    /// A second window over the same bundle: an independent `Session` (engine + JS context),
+    /// exactly like `window.rs` builds for `window.open`.
+    pub fn open_secondary(&self, bundle: &AppBundle) -> Result<Headless, String> {
+        Headless::new(bundle, self.size, self.scale)
     }
 
     pub fn click_selector(&mut self, selector: &str) -> Result<(), String> {

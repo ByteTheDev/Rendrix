@@ -37,6 +37,11 @@ impl SelectorElement for ElRef<'_> {
     fn id(&self) -> Option<&str> {
         self.data().id.as_deref()
     }
+    /// P5: the split class list is already cached on the element; hand it out so the
+    /// cascade does not re-split the `class` attribute on every candidate lookup.
+    fn classes(&self) -> Option<&[String]> {
+        Some(&self.data().classes)
+    }
     fn has_class(&self, class: &str) -> bool {
         self.data().classes.iter().any(|c| c == class)
     }

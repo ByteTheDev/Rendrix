@@ -36,6 +36,10 @@ pub struct Paragraph {
     buffer: Buffer,
     /// Byte offset in `text` where each cosmic line (split on '\n') starts.
     line_starts: Vec<usize>,
+    /// Width constraint the buffer was shaped with (`None` = unconstrained).
+    /// Paint/layout reuse a cached paragraph only for requested widths this
+    /// fits, so coarse cache keys can never produce an overflowing paragraph.
+    pub wrap: Option<f32>,
 }
 
 pub struct Raster {
@@ -54,13 +58,45 @@ struct ParaKey {
     width_bits: u32,
 }
 
+/// Paragraph cache capacity. When full the least-recently-used entry is evicted
+/// (never a full `clear()`, so a shaping storm cannot drop the whole hot set).
+pub const PARA_CACHE_CAP: usize = 2048;
+/// Width quantisation step for the paragraph cache: widths falling in the same
+/// step share one shaping. Shaping always uses the step's floor, so a cached
+/// paragraph was wrapped at a width ≤ the requested one and can never overflow
+/// it (at most it keeps one extra break near a bucket boundary).
+pub const PARA_CACHE_QUANT: f32 = 0.5;
+
+/// Quantise a layout width down to the cache grid. Non-finite/negative widths
+/// (should not happen) map to zero instead of producing garbage keys.
+fn quantize_width(w: f32) -> f32 {
+    if !w.is_finite() {
+        return 0.0;
+    }
+    ((w / PARA_CACHE_QUANT).floor() * PARA_CACHE_QUANT).max(0.0)
+}
+
+fn width_bits(q: f32) -> u32 {
+    // `q` is already a multiple of PARA_CACHE_QUANT, so this is exact for any
+    // realistic viewport width.
+    ((q / PARA_CACHE_QUANT).round() as u32).wrapping_add(1)
+}
+
+struct CacheEntry {
+    para: Rc<Paragraph>,
+    last_used: u64,
+}
+
 pub struct TextSystem {
     pub fonts: FontSystem,
     swash: SwashCache,
-    cache: HashMap<ParaKey, Rc<Paragraph>>,
+    cache: HashMap<ParaKey, CacheEntry>,
+    clock: u64,
     installed: HashSet<String>,
     /// Stats for tests/profiling.
     pub shape_count: usize,
+    /// Paragraph-cache lookups served without shaping.
+    pub cache_hits: usize,
 }
 
 impl Default for TextSystem {
@@ -99,7 +135,22 @@ impl TextSystem {
             .faces()
             .flat_map(|f| f.families.iter().map(|(n, _)| n.to_lowercase()).collect::<Vec<_>>())
             .collect();
-        TextSystem { fonts, swash: SwashCache::new(), cache: HashMap::new(), installed, shape_count: 0 }
+        TextSystem { fonts, swash: SwashCache::new(), cache: HashMap::new(), clock: 0, installed, shape_count: 0, cache_hits: 0 }
+    }
+
+    /// Number of paragraphs currently cached.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Hit rate over `paragraph()` lookups (`hits / (hits + shapes)`).
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.shape_count;
+        if total == 0 {
+            1.0
+        } else {
+            self.cache_hits as f64 / total as f64
+        }
     }
 
     /// Register an application font (TTF/OTF bytes).
@@ -215,7 +266,7 @@ impl TextSystem {
             }
         }
         // Empty content has no height; an explicit trailing newline still occupies a line.
-        Paragraph { width: max_w, height, glyphs, segments, text, buffer, line_starts }
+        Paragraph { width: max_w, height, glyphs, segments, text, buffer, line_starts, wrap: width }
     }
 
     pub fn paragraph(&mut self, content: &InlineContent, width: Option<f32>) -> Rc<Paragraph> {
@@ -229,25 +280,44 @@ impl TextSystem {
                 }
             }
         }
-        let key = ParaKey { content: content.key(), width_bits: width.map(|w| (w * 64.0).round() as u32 + 1).unwrap_or(0) };
-        if let Some(p) = self.cache.get(&key) {
-            return p.clone();
+        // Coarse width key: resize/scroll drags sweep many nearby widths, and shaping
+        // at the bucket floor keeps every width in the bucket sharing one paragraph
+        // that provably fits (constraint ≤ requested width).
+        let qw = width.map(quantize_width);
+        let key = ParaKey { content: content.key(), width_bits: qw.map(width_bits).unwrap_or(0) };
+        if let Some(e) = self.cache.get_mut(&key) {
+            self.clock = self.clock.wrapping_add(1);
+            e.last_used = self.clock;
+            self.cache_hits += 1;
+            return e.para.clone();
         }
-        if self.cache.len() > 2048 {
-            self.cache.clear();
+        if self.cache.len() >= PARA_CACHE_CAP {
+            // Least-recently-used eviction of a single entry: the hot set survives a
+            // shaping storm instead of being dropped by a full clear.
+            if let Some(victim) = self.cache.iter().min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k) {
+                self.cache.remove(&victim);
+            }
         }
-        let p = Rc::new(self.build(content, width));
-        self.cache.insert(key, p.clone());
+        let p = Rc::new(self.build(content, qw));
+        self.clock = self.clock.wrapping_add(1);
+        self.cache.insert(key, CacheEntry { para: p.clone(), last_used: self.clock });
         p
     }
 
     /// Caret position (x, top y, height) for a byte offset into the concatenated text.
     pub fn caret(&mut self, content: &InlineContent, width: Option<f32>, byte: usize) -> (f32, f32, f32) {
         let p = self.paragraph(content, width);
+        let fallback_h = content.container.line_height.resolve(content.container.font_size);
+        self.caret_in(&p, byte, fallback_h)
+    }
+
+    /// [`caret`](Self::caret) against an already-resolved paragraph, so paint can
+    /// reuse one `paragraph()` lookup for caret + selection + hit segments instead
+    /// of re-hashing the full text per query.
+    pub fn caret_in(&self, p: &Paragraph, byte: usize, fallback_h: f32) -> (f32, f32, f32) {
         let byte = byte.min(p.text.len());
         let line = p.line_starts.iter().rposition(|s| *s <= byte).unwrap_or(0);
         let idx = byte - p.line_starts[line];
-        let fallback_h = content.container.line_height.resolve(content.container.font_size);
         let mut best: Option<(f32, f32, f32)> = None;
         for run in p.buffer.layout_runs() {
             if run.line_i != line {
@@ -263,11 +333,8 @@ impl TextSystem {
             let x = x.unwrap_or_else(|| run.glyphs.last().map(|g| g.x + g.w).unwrap_or(0.0));
             let at_end = run.glyphs.last().is_none_or(|g| idx >= g.end);
             best = Some((x, run.line_top, run.line_height));
-            if !at_end || x > 0.0 || run.glyphs.is_empty() {
-                // Keep scanning only if the index may belong to a later wrapped run of the same line.
-                if !at_end {
-                    break;
-                }
+            if !at_end {
+                break;
             }
         }
         best.unwrap_or((0.0, 0.0, fallback_h))
@@ -276,6 +343,11 @@ impl TextSystem {
     /// Byte offset nearest to a point inside the paragraph.
     pub fn hit(&mut self, content: &InlineContent, width: Option<f32>, x: f32, y: f32) -> usize {
         let p = self.paragraph(content, width);
+        self.hit_in(&p, x, y)
+    }
+
+    /// [`hit`](Self::hit) against an already-resolved paragraph.
+    pub fn hit_in(&self, p: &Paragraph, x: f32, y: f32) -> usize {
         match p.buffer.hit(x, y) {
             Some(c) => p.line_starts.get(c.line).copied().unwrap_or(0) + c.index,
             None => p.text.len(),
@@ -285,6 +357,11 @@ impl TextSystem {
     /// Selection rectangles (x, y, w, h) for the byte range, in paragraph coordinates.
     pub fn selection_rects(&mut self, content: &InlineContent, width: Option<f32>, start: usize, end: usize) -> Vec<[f32; 4]> {
         let p = self.paragraph(content, width);
+        self.selection_rects_in(&p, start, end)
+    }
+
+    /// [`selection_rects`](Self::selection_rects) against an already-resolved paragraph.
+    pub fn selection_rects_in(&self, p: &Paragraph, start: usize, end: usize) -> Vec<[f32; 4]> {
         let (start, end) = (start.min(end), start.max(end));
         let mut out = Vec::new();
         for run in p.buffer.layout_runs() {
@@ -390,6 +467,52 @@ mod tests {
         assert_eq!(t.shape_count, n);
         t.measure(&c, Some(20.0));
         assert_eq!(t.shape_count, n + 1, "a width that forces wrapping needs its own layout");
+    }
+
+    #[test]
+    fn quantized_widths_share_shaping() {
+        let mut t = TextSystem::new();
+        let c = content("hello world this wraps over several lines when the width is narrow", 16.0);
+        let (nw, _) = t.measure(&c, None);
+        assert!(nw > 160.0, "test needs wrapping content, natural width {nw}");
+        let n0 = t.shape_count;
+        let (w1, h1) = t.measure(&c, Some(150.1));
+        assert_eq!(t.shape_count, n0 + 1, "the unconstrained shape is already cached; one bucket shape");
+        let (w2, h2) = t.measure(&c, Some(150.4));
+        assert_eq!(t.shape_count, n0 + 1, "same 0.5px bucket shares the shaping");
+        assert_eq!((w1, h1), (w2, h2));
+        assert!(t.cache_hits >= 2, "bucket lookups hit: {}", t.cache_hits);
+        // Wrap-correctness: the bucket paragraph was shaped at the bucket floor, so it fits.
+        for w in [150.1f32, 150.4] {
+            let p = t.paragraph(&c, Some(w));
+            assert_eq!(p.wrap, Some(150.0));
+            assert!(p.width <= w, "shaped width {} fits requested {w}", p.width);
+            assert!(p.height > h1 * 0.99, "still wrapped");
+        }
+        t.measure(&c, Some(160.1));
+        assert_eq!(t.shape_count, n0 + 2, "a new bucket shapes once more");
+        assert!(t.hit_rate() > 0.4, "hit rate {}", t.hit_rate());
+    }
+
+    #[test]
+    fn cache_evicts_lru_instead_of_clearing() {
+        let mut t = TextSystem::new();
+        let n = PARA_CACHE_CAP + 52;
+        let mut last = content("placeholder", 16.0);
+        for i in 0..n {
+            last = content(&format!("eviction probe paragraph number {i}"), 16.0);
+            t.measure(&last, Some(200.0));
+        }
+        assert_eq!(t.cache_len(), PARA_CACHE_CAP, "cache stays capped without a full clear");
+        let shapes = t.shape_count;
+        // The most recent content is still hot: no reshaping.
+        t.measure(&last, Some(200.0));
+        assert_eq!(t.shape_count, shapes, "recent entries survive; hits={}", t.cache_hits);
+        // The earliest content was evicted long ago: reshapes instead of hitting a cleared cache.
+        let first = content("eviction probe paragraph number 0", 16.0);
+        t.measure(&first, Some(200.0));
+        assert!(t.shape_count > shapes, "evicted entries reshape on demand");
+        assert_eq!(t.cache_len(), PARA_CACHE_CAP);
     }
 
     #[test]

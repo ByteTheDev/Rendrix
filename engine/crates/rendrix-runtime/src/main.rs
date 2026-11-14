@@ -23,6 +23,7 @@ struct Args {
     headless: bool,
     screenshot: Option<PathBuf>,
     script: Option<PathBuf>,
+    inspect: Option<PathBuf>,
     size: Option<(u32, u32)>,
     scale: f32,
     out: Option<PathBuf>,
@@ -31,7 +32,7 @@ struct Args {
 
 fn parse() -> Args {
     let mut it = std::env::args().skip(1).peekable();
-    let mut a = Args { cmd: "run".into(), path: None, headless: false, screenshot: None, script: None, size: None, scale: 1.0, out: None, runtime: None };
+    let mut a = Args { cmd: "run".into(), path: None, headless: false, screenshot: None, script: None, inspect: None, size: None, scale: 1.0, out: None, runtime: None };
     if let Some(first) = it.peek() {
         if first == "run" || first == "pack" || first == "doctor" || first == "bench" {
             a.cmd = it.next().unwrap();
@@ -42,6 +43,7 @@ fn parse() -> Args {
             "--headless" => a.headless = true,
             "--screenshot" => a.screenshot = it.next().map(PathBuf::from),
             "--script" => a.script = it.next().map(PathBuf::from),
+            "--inspect" => a.inspect = it.next().map(PathBuf::from),
             "--out" => a.out = it.next().map(PathBuf::from),
             "--runtime" => a.runtime = it.next().map(PathBuf::from),
             "--scale" => a.scale = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
@@ -98,11 +100,16 @@ fn real_main(args: Args) -> Result<(), String> {
         println!("packed '{}' -> {}", bundle.name, out.display());
         return Ok(());
     }
-    if args.headless || args.screenshot.is_some() || args.script.is_some() {
+    if args.headless || args.screenshot.is_some() || args.script.is_some() || args.inspect.is_some() {
         let size = args.size.unwrap_or((bundle.width, bundle.height));
         let mut h = Headless::new(&bundle, size, args.scale)?;
         eprintln!("[rendrix] headless on {}", h.adapter);
         h.settle(Duration::from_secs(2));
+        if let Some(path) = &args.inspect {
+            let snap = rendrix_runtime::inspector::snapshot(&h.session);
+            std::fs::write(path, serde_json::to_string_pretty(&snap).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            println!("[inspect] {}", path.display());
+        }
         if let Some(script) = &args.script {
             let text = std::fs::read_to_string(script).map_err(|e| format!("{}: {e}", script.display()))?;
             let steps: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", script.display()))?;

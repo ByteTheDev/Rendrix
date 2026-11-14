@@ -16,6 +16,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+criterion = "0.5"
 taffy = { version = "0.9", default-features = false, features = ["std", "flexbox", "grid", "block_layout", "content_size", "taffy_tree"] }
 cosmic-text = "0.14"
 wgpu = "25"

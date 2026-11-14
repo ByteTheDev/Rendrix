@@ -18,6 +18,12 @@ pub trait SelectorElement: Sized + Clone {
     fn id(&self) -> Option<&str>;
     fn has_class(&self, class: &str) -> bool;
     fn attr(&self, name: &str) -> Option<&str>;
+    /// Pre-split class list, when the implementor caches it (avoids re-splitting the
+    /// `class` attribute on every candidate lookup). Defaults to `None`, which falls
+    /// back to splitting `attr("class")`.
+    fn classes(&self) -> Option<&[String]> {
+        None
+    }
     fn parent_element(&self) -> Option<Self>;
     fn prev_sibling_element(&self) -> Option<Self>;
     fn next_sibling_element(&self) -> Option<Self>;

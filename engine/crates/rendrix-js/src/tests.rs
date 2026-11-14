@@ -195,12 +195,30 @@ fn platform_dispatch_reaches_listeners_with_event_data() {
     run(&mut r, "globalThis.got = []; const t = document.getElementById('t'); t.addEventListener('pointerdown', e => got.push([e.type, e.clientX, e.clientY, e.button, e.isTrusted, e instanceof MouseEvent]));\
         document.addEventListener('keydown', e => { got.push([e.key, e.code, e.ctrlKey, e.target === document.body || e.target === window]); if (e.key === 'x') e.preventDefault(); });");
     let t = r.engine.borrow().doc.get_element_by_id("t").unwrap();
-    r.dispatch("pointerdown", Some(t), &serde_json::json!({"clientX": 12.5, "clientY": 7, "button": 0}));
+    r.dispatch(
+        "pointerdown",
+        Some(t),
+        &serde_json::json!({"clientX": 12.5, "clientY": 7, "button": 0}),
+    );
     let body = r.engine.borrow().doc.body().unwrap();
-    let ok = r.dispatch("keydown", Some(body), &serde_json::json!({"key": "a", "code": "KeyA", "ctrlKey": true}));
-    let prevented = !r.dispatch("keydown", Some(body), &serde_json::json!({"key": "x", "code": "KeyX"}));
-    assert!(ok && prevented, "dispatch reports whether default was prevented");
-    assert_eq!(s(&mut r, "got"), r#"[["pointerdown",12.5,7,0,true,true],["a","KeyA",true,true],["x","KeyX",false,true]]"#);
+    let ok = r.dispatch(
+        "keydown",
+        Some(body),
+        &serde_json::json!({"key": "a", "code": "KeyA", "ctrlKey": true}),
+    );
+    let prevented = !r.dispatch(
+        "keydown",
+        Some(body),
+        &serde_json::json!({"key": "x", "code": "KeyX"}),
+    );
+    assert!(
+        ok && prevented,
+        "dispatch reports whether default was prevented"
+    );
+    assert_eq!(
+        s(&mut r, "got"),
+        r#"[["pointerdown",12.5,7,0,true,true],["a","KeyA",true,true],["x","KeyX",false,true]]"#
+    );
 }
 
 #[test]
@@ -241,15 +259,133 @@ fn form_control_values_selection_and_focus_events() {
 fn modules_resolve_relative_imports_and_support_top_level_await() {
     let mut r = rt("");
     r.add_module("main.js", "import { add, PI } from './lib/math.js'; import def, * as ns from './lib/more'; import { version } from 'rendrix'; const v = await Promise.resolve(5); globalThis.out = [add(v, 1), PI, def(), Object.keys(ns).join(), typeof version];".into());
-    r.add_module("lib/math.js", "export const PI = 3; export function add(a, b) { return a + b; }".into());
-    r.add_module("lib/more.js", "import { PI } from './math.js'; export default () => PI * 2; export const extra = 1;".into());
+    r.add_module(
+        "lib/math.js",
+        "export const PI = 3; export function add(a, b) { return a + b; }".into(),
+    );
+    r.add_module(
+        "lib/more.js",
+        "import { PI } from './math.js'; export default () => PI * 2; export const extra = 1;"
+            .into(),
+    );
     r.run_module("main.js").expect("module graph evaluates");
     assert_eq!(s(&mut r, "out"), r#"[6,3,6,"default,extra","string"]"#);
     r.add_module("bad.js", "import './nope.js';".into());
     let e = r.run_module("bad.js").unwrap_err();
-    assert!(e.message.to_lowercase().contains("nope") || e.message.to_lowercase().contains("resolv") || e.message.to_lowercase().contains("could not"), "{}", e.message);
-    r.add_module("throws.js", "throw new TypeError('startup failure');".into());
-    assert!(r.run_module("throws.js").unwrap_err().message.contains("startup failure"));
+    assert!(
+        e.message.to_lowercase().contains("nope")
+            || e.message.to_lowercase().contains("resolv")
+            || e.message.to_lowercase().contains("could not"),
+        "{}",
+        e.message
+    );
+    r.add_module(
+        "throws.js",
+        "throw new TypeError('startup failure');".into(),
+    );
+    assert!(r
+        .run_module("throws.js")
+        .unwrap_err()
+        .message
+        .contains("startup failure"));
+}
+
+#[test]
+fn runaway_scripts_are_interrupted_inside_the_task_budget() {
+    use std::time::{Duration, Instant};
+    let mut r = rt("");
+    r.set_task_budget(Duration::from_millis(200));
+    // A tight loop with no awaits or calls would hang the frame loop without the guard.
+    let start = Instant::now();
+    let e = r.run_script("loop", "while (true) {}").unwrap_err();
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "interrupt fired instead of hanging"
+    );
+    assert!(e.message.contains("runaway script interrupted"), "{e}");
+    // The engine stays usable after an interrupt: the flag is cleared and no deadline lingers.
+    run(&mut r, "globalThis.after = 1 + 1;");
+    assert_eq!(s(&mut r, "after"), "2");
+    // Microtask storms are preempted the same way (surfaced via take_errors, not a hang).
+    r.run_script(
+        "storm",
+        "Promise.resolve().then(function loop() { return Promise.resolve().then(loop); });",
+    )
+    .expect("scheduling the storm succeeds");
+    assert!(
+        r.take_errors()
+            .iter()
+            .any(|m| m.contains("runaway script interrupted")),
+        "storm recorded: {:?}",
+        r.take_errors()
+    );
+    // A pending top-level await still suspends cleanly (WouldBlock), not an error.
+    r.add_module(
+        "tla.js",
+        "await new Promise(res => setTimeout(res, 20)); globalThis.tla = 'done';".into(),
+    );
+    r.run_module("tla.js")
+        .expect("pending TLA suspends without error");
+    pump(&mut r, 60);
+    assert_eq!(s(&mut r, "tla"), "done");
+}
+
+#[test]
+fn error_stacks_remap_to_original_sources_via_bundle_maps() {
+    let mut r = rt("");
+    // Map the compiled module back to its original TS source (synthetic v3 map; deltas
+    // accumulate, so the second line uses zero deltas to stay on original line 2).
+    r.add_source_map(
+        "main.js",
+        r#"{"version":3,"sources":["src/main.ts"],"names":[],"mappings":"AACA;AAAA"}"#,
+    );
+    // Invalid maps and unknown files must not break reporting.
+    r.add_source_map("bad.js", "not json");
+    r.add_module(
+        "main.js",
+        "function boom() { throw new Error('kablam'); }\nboom();".into(),
+    );
+    let e = r.run_module("main.js").unwrap_err();
+    assert!(e.message.contains("kablam"), "{e}");
+    let stack = e.stack.as_deref().unwrap_or("");
+    assert!(
+        stack.contains("(src/main.ts:2:"),
+        "frames remap to the original source: {stack}"
+    );
+    assert!(
+        !stack.contains("main.js"),
+        "no unmapped frames remain: {stack}"
+    );
+    // Errors without a registered map keep their compiled locations.
+    r.add_module("plain.js", "throw new Error('raw');".into());
+    let e = r.run_module("plain.js").unwrap_err();
+    assert!(
+        e.stack.as_deref().unwrap_or("").contains("plain.js:1:"),
+        "{e}"
+    );
+}
+
+#[test]
+fn dynamic_import_loads_chunks_with_top_level_await_in_order() {
+    let mut r = rt("");
+    r.add_module(
+        "main.js",
+        "globalThis.seq = []; const m = await import('./lib/chunk.js'); seq.push('main:' + m.val);"
+            .into(),
+    );
+    r.add_module(
+        "lib/chunk.js",
+        "globalThis.seq.push('chunk-eval'); const v = await Promise.resolve(7); globalThis.seq.push('chunk-tla'); export const val = v * 6;".into(),
+    );
+    r.run_module("main.js").expect("dynamic import evaluates");
+    assert_eq!(s(&mut r, "seq"), r#"["chunk-eval","chunk-tla","main:42"]"#);
+    // A variable (non-literal) specifier flows through the same loader, resolved against the importer.
+    r.add_module("lib/other.js", "export const x = 'loaded';".into());
+    r.add_module("loader.js", "import { x } from './lib/other.js'; export async function load(n) { return import(n); } globalThis.staticOther = x;".into());
+    r.add_module("main2.js", "import { load } from './loader.js'; const m = await load('./lib/other.js'); globalThis.dyn = m.x;".into());
+    r.run_module("main2.js")
+        .expect("variable dynamic import evaluates");
+    assert_eq!(s(&mut r, "[staticOther, dyn]"), r#"["loaded","loaded"]"#);
 }
 
 #[test]
@@ -307,7 +443,10 @@ fn abort_controller_and_structured_clone() {
 #[test]
 fn fetch_reads_bundled_assets_and_data_urls_and_aborts() {
     let mut assets = MapAssets::default();
-    assets.0.insert("data/info.json".into(), br#"{"name":"rendrix","n":[1,2]}"#.to_vec());
+    assets.0.insert(
+        "data/info.json".into(),
+        br#"{"name":"rendrix","n":[1,2]}"#.to_vec(),
+    );
     let mut r = rt_with("", assets);
     run(
         &mut r,
@@ -420,8 +559,11 @@ fn wrappers_are_collected_and_native_nodes_freed() {
 #[test]
 fn unsupported_apis_are_honestly_absent_or_throw() {
     let mut r = rt("<canvas id=c width=10 height=10></canvas>");
-    assert_eq!(s(&mut r, "[typeof WebSocket, typeof XMLHttpRequest, typeof IntersectionObserver, typeof WebGLRenderingContext]"), r#"["undefined","undefined","undefined","undefined"]"#);
-    assert_eq!(s(&mut r, "document.getElementById('c').getContext('2d')"), "null");
+    assert_eq!(s(&mut r, "[typeof WebSocket, typeof XMLHttpRequest, typeof IntersectionObserver, typeof WebGLRenderingContext]"), r#"["function","undefined","undefined","undefined"]"#);
+    assert_eq!(
+        s(&mut r, "typeof document.getElementById('c').getContext('2d')"),
+        "object"
+    );
     run(&mut r, "globalThis.e = (() => { try { document.body.attachShadow({}); } catch (e) { return e.name; } })();");
     assert_eq!(s(&mut r, "e"), "NotSupportedError");
 }
@@ -432,7 +574,11 @@ fn filesystem_access_is_permission_gated() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("a.txt"), "hello").unwrap();
     let mut r = rt("");
-    r.host.borrow_mut().permissions = Permissions { network: false, fs_read: vec![dir.clone()], fs_write: vec![] };
+    r.host.borrow_mut().permissions = Permissions {
+        network: false,
+        fs_read: vec![dir.clone()],
+        fs_write: vec![],
+    };
     let p = dir.join("a.txt").to_string_lossy().replace('\\', "/");
     run(
         &mut r,
@@ -453,4 +599,495 @@ fn crypto_random_values_come_from_the_os_and_look_random() {
     run(&mut r, "const a = crypto.randomUUID(), b = crypto.randomUUID(); const buf = crypto.getRandomValues(new Uint8Array(4096)); const distinct = new Set(buf).size;
                  globalThis.out = [/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(a), a !== b, distinct > 200];");
     assert_eq!(s(&mut r, "out"), "[true,true,true]");
+}
+
+// ------------------------------------------------------------------------------------
+// Dedicated workers (A4)
+// ------------------------------------------------------------------------------------
+
+/// Worker-aware pump: outbox → threads → capped delivery, plus normal timers.
+fn wpump(rt: &mut JsRuntime, ms: u64) {
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    while std::time::Instant::now() < end {
+        rt.poll_workers();
+        rt.tick();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    rt.poll_workers();
+    rt.tick();
+}
+
+fn wrt(modules: &[(&str, &str)]) -> JsRuntime {
+    let mut r = rt("");
+    let map: std::collections::HashMap<String, String> = modules
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    for (k, v) in &map {
+        r.add_module(k, v.clone());
+    }
+    r.set_worker_modules(map);
+    r
+}
+
+#[test]
+fn worker_round_trip_echo_with_timers_and_url_forms() {
+    let mut r = wrt(&[(
+        "worker.js",
+        "onmessage = e => setTimeout(() => postMessage({ echo: e.data }), 5);",
+    )]);
+    run(
+        &mut r,
+        "globalThis.got = []; globalThis.errs = [];
+         const mk = u => { const w = new Worker(u); w.onmessage = e => got.push(e.data); w.onerror = e => errs.push(e.message); return w; };
+         globalThis.w1 = mk('worker.js');
+         globalThis.w2 = mk(new URL('worker.js', location.href));
+         w1.postMessage({ a: 1 }); w2.postMessage([1, 'x']);",
+    );
+    wpump(&mut r, 400);
+    assert_eq!(
+        s(&mut r, "errs"),
+        "[]",
+        "no worker errors: {:?}",
+        s(&mut r, "errs")
+    );
+    assert_eq!(
+        s(&mut r, "got.map(x => JSON.stringify(x)).sort()"),
+        r#"["{\"echo\":[1,\"x\"]}","{\"echo\":{\"a\":1}}"]"#
+    );
+    run(&mut r, "w1.terminate(); w2.terminate();");
+    wpump(&mut r, 200);
+    assert!(!r.worker_alive(), "terminated workers reap their threads");
+}
+
+#[test]
+fn worker_structured_clone_binary_payloads() {
+    let mut r = wrt(&[(
+        "worker.js",
+        "onmessage = e => {
+           const d = e.data;
+           postMessage({ n: d.n, neg: d.neg, nan: d.nan, big: d.big, date: d.date.getTime(), re: [d.re.source, d.re.flags],
+             m: [...d.m.entries()].map(([k, v]) => [k, [...v]]), s: [...d.s], u8: [...d.u8], f64: [...d.f64],
+             nested: d.nested, err: [d.err.name, d.err.message], circ: d.circ.self === d.circ });
+         };",
+    )]);
+    run(
+        &mut r,
+        "globalThis.got = null; globalThis.errs = [];
+         const w = new Worker('worker.js'); w.onmessage = e => { got = e.data; }; w.onerror = e => errs.push(e.message);
+         const circ = {}; circ.self = circ;
+         w.postMessage({ n: 42, neg: -Infinity, nan: NaN, big: 1000000000000000000000000000000n, date: new Date(123456789), re: /ab+c/gi,
+           m: new Map([[1, new Set([2, 3])]]), s: new Set(['a', 1]), u8: new Uint8Array([1, 2, 250]), f64: new Float64Array([0.5, -1.25]),
+           nested: { a: [{ b: [true, null, 'x'] }] }, err: new TypeError('kablam'), circ });",
+    );
+    wpump(&mut r, 500);
+    assert_eq!(s(&mut r, "errs"), "[]");
+    assert_eq!(s(&mut r, "got.n"), "42");
+    assert_eq!(
+        s(
+            &mut r,
+            "[got.neg === -Infinity, Number.isNaN(got.nan), got.big.toString(), got.date]"
+        ),
+        r#"[true,true,"1000000000000000000000000000000",123456789]"#
+    );
+    assert_eq!(s(&mut r, "JSON.stringify([got.re, got.m, got.s, got.u8, got.f64, got.nested, got.err, got.circ])"), r#"[["ab+c","gi"],[[1,[2,3]]],["a",1],[1,2,250],[0.5,-1.25],{"a":[{"b":[true,null,"x"]}]},["TypeError","kablam"],true]"#);
+    run(&mut r, "w.terminate();");
+    wpump(&mut r, 150);
+}
+
+#[test]
+fn worker_error_event_on_throw() {
+    let mut r = wrt(&[(
+        "worker.js",
+        "onmessage = e => { if (e.data === 'throw') throw new Error('handler-fail-515'); postMessage('ok:' + e.data); };",
+    )]);
+    run(
+        &mut r,
+        "globalThis.got = []; globalThis.errs = [];
+         const w = new Worker('worker.js'); w.onmessage = e => got.push(e.data); w.onerror = e => errs.push(e.message);
+         w.postMessage('first');",
+    );
+    wpump(&mut r, 300);
+    assert_eq!(s(&mut r, "got"), r#"["ok:first"]"#);
+    run(&mut r, "w.postMessage('throw');");
+    wpump(&mut r, 300);
+    assert!(
+        s(&mut r, "errs").contains("handler-fail-515"),
+        "handler throw surfaces as error event: {}",
+        s(&mut r, "errs")
+    );
+    // The worker survives a handler throw.
+    run(&mut r, "w.postMessage('again');");
+    wpump(&mut r, 300);
+    assert!(
+        s(&mut r, "got").contains("ok:again"),
+        "worker survives: {}",
+        s(&mut r, "got")
+    );
+
+    // A worker whose initial evaluation throws reports the error and stays alive.
+    let mut r2 = wrt(&[("bad.js", "throw new TypeError('top-level-boom-77');")]);
+    run(
+        &mut r2,
+        "globalThis.errs2 = []; const w2 = new Worker('bad.js'); w2.onerror = e => errs2.push(e.message);",
+    );
+    wpump(&mut r2, 300);
+    assert!(
+        s(&mut r2, "errs2").contains("top-level-boom-77"),
+        "{}",
+        s(&mut r2, "errs2")
+    );
+    run(&mut r, "w.terminate();");
+    run(&mut r2, "w2.terminate();");
+    wpump(&mut r, 150);
+    wpump(&mut r2, 150);
+}
+
+#[test]
+fn worker_terminate_then_post_does_not_crash() {
+    let mut r = wrt(&[("worker.js", "onmessage = e => postMessage(e.data);")]);
+    run(
+        &mut r,
+        "globalThis.got = []; globalThis.errs = [];
+         const w = new Worker('worker.js'); w.onmessage = e => got.push(e.data); w.onerror = e => errs.push('ERR:' + e.message);
+         w.postMessage('before');",
+    );
+    wpump(&mut r, 200);
+    run(
+        &mut r,
+        "w.terminate(); w.postMessage('after-terminate'); w.postMessage({ x: 1 }); w.terminate();",
+    );
+    wpump(&mut r, 300);
+    assert_eq!(
+        s(&mut r, "errs"),
+        "[]",
+        "no errors from post-after-terminate"
+    );
+    assert!(!r.worker_alive());
+    assert_eq!(
+        s(&mut r, "__rendrix_workerLiveCount()"),
+        "0",
+        "main-side handles are released"
+    );
+}
+
+#[test]
+fn worker_fifty_create_terminate_cycles_do_not_leak() {
+    let mut r = wrt(&[("worker.js", "onmessage = e => postMessage({ n: e.data });")]);
+    run(
+        &mut r,
+        "globalThis.got = []; globalThis.errs = [];
+         globalThis.cycle = i => { const w = new Worker('worker.js'); w.onmessage = e => got.push(e.data.n); w.onerror = e => errs.push(e.message); w.postMessage(i); return w; };",
+    );
+    for i in 0..50 {
+        run(&mut r, &format!("globalThis.wc = cycle({i});"));
+        // Wait for the echo (deterministic) instead of an arbitrary sleep: spawn + QuickJS init
+        // latency varies, and terminating before the first round trip proves nothing about leaks.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s(&mut r, "String(got[got.length - 1])") != i.to_string()
+            && std::time::Instant::now() < end
+        {
+            wpump(&mut r, 10);
+        }
+        run(&mut r, "wc.terminate();");
+        wpump(&mut r, 10);
+    }
+    wpump(&mut r, 600);
+    assert_eq!(s(&mut r, "errs"), "[]", "{}", s(&mut r, "errs"));
+    assert!(!r.worker_alive(), "all 50 workers reaped");
+    assert_eq!(s(&mut r, "__rendrix_workerLiveCount()"), "0");
+    assert_eq!(
+        s(&mut r, "got.length > 40"),
+        "true",
+        "most echoes landed before termination (got {} echoes)",
+        s(&mut r, "got.length")
+    );
+    // The runtime still works afterwards (ids recycled, no poisoning).
+    run(&mut r, "globalThis.final = null; const w = new Worker('worker.js'); w.onmessage = e => { final = e.data; }; w.postMessage('done');");
+    wpump(&mut r, 300);
+    assert_eq!(s(&mut r, "final"), r#"{"n":"done"}"#);
+    run(&mut r, "w.terminate();");
+    wpump(&mut r, 150);
+}
+
+#[test]
+fn worker_busy_worker_does_not_stall_the_frame_pump() {
+    let mut r = wrt(&[(
+        "worker.js",
+        "onmessage = () => { for (let i = 0; i < 200; i++) postMessage({ i }); };",
+    )]);
+    run(
+        &mut r,
+        "globalThis.count = 0; const w = new Worker('worker.js'); w.onmessage = () => { count++; }; w.postMessage('go');",
+    );
+    // Each pump delivers at most WORKER_MAX_PER_TICK events and returns promptly even while the
+    // worker floods the channel — this is the frame-stall assertion (tick-count, not wall-clock).
+    // A wall-time budget (not a pump count) bounds the loop: thread spawn + QuickJS init alone
+    // cost tens of ms, so a tight pump loop would starve the worker before it posts anything.
+    let mut polls = 0;
+    let start = std::time::Instant::now();
+    while s(&mut r, "count") != "200" && start.elapsed() < std::time::Duration::from_secs(10) {
+        let t = std::time::Instant::now();
+        let delivered = r.poll_workers().len();
+        r.tick();
+        assert!(delivered <= 16, "per-frame cap respected (got {delivered})");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "a single pump never stalls the frame loop"
+        );
+        polls += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(
+        s(&mut r, "count"),
+        "200",
+        "all 200 messages eventually delivered ({polls} pumps)"
+    );
+    assert!(
+        polls > 12,
+        "delivery was actually spread across frames ({polls})"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "no stall: {elapsed:?}"
+    );
+    run(&mut r, "w.terminate();");
+    wpump(&mut r, 150);
+}
+
+#[test]
+fn worker_has_no_dom_access_and_no_nested_workers() {
+    let mut r = wrt(&[(
+        "worker.js",
+        "const results = [];
+         for (const [name, fn] of [['document', () => document.createElement('div')], ['window', () => window.alert(1)], ['localStorage', () => localStorage.getItem('a')], ['rAF', () => requestAnimationFrame(() => {})]]) {
+           try { fn(); results.push(name + ':NO-THROW'); } catch (e) { results.push(name + ':' + e.message); }
+         }
+         try { new Worker('x.js'); results.push('nested:NO-THROW'); } catch (e) { results.push('nested:' + e.name); }
+         try { importScripts('x.js'); results.push('importScripts:NO-THROW'); } catch (e) { results.push('importScripts:' + e.message.slice(0, 60)); }
+         postMessage(results);",
+    )]);
+    run(
+        &mut r,
+        "globalThis.got = null; globalThis.errs = [];
+         const w = new Worker('worker.js'); w.onmessage = e => { got = e.data; }; w.onerror = e => errs.push(e.message);",
+    );
+    wpump(&mut r, 400);
+    assert_eq!(s(&mut r, "errs"), "[]");
+    for expect in [
+        "document:",
+        "window:",
+        "localStorage:",
+        "rAF:",
+        "nested:NotSupportedError",
+        "importScripts:",
+    ] {
+        assert!(
+            s(&mut r, "got").contains(expect),
+            "missing '{expect}': {}",
+            s(&mut r, "got")
+        );
+    }
+    assert!(
+        s(&mut r, "got").contains("not available in dedicated workers"),
+        "{}",
+        s(&mut r, "got")
+    );
+    run(&mut r, "w.terminate();");
+    wpump(&mut r, 150);
+}
+
+#[test]
+fn worker_fetch_and_worker_timers() {
+    let mut r = wrt(&[(
+        "worker.js",
+        "postMessage('started');
+         setTimeout(() => {
+           fetch('data:text/plain,hi-worker').then(r => r.text()).then(t => postMessage({ fetched: t }));
+         }, 5);
+         fetch('data:application/json;base64,eyJqIjoxfQ==').then(r => r.json()).then(j => postMessage({ json: j }));",
+    )]);
+    run(
+        &mut r,
+        "globalThis.got = []; const w = new Worker('worker.js'); w.onmessage = e => got.push(e.data);",
+    );
+    wpump(&mut r, 500);
+    assert!(s(&mut r, "got").contains("started"), "{}", s(&mut r, "got"));
+    assert!(
+        s(&mut r, "got").contains(r#"{"fetched":"hi-worker"}"#),
+        "data: URL fetch in worker: {}",
+        s(&mut r, "got")
+    );
+    assert!(
+        s(&mut r, "got").contains(r#"{"json":{"j":1}}"#),
+        "{}",
+        s(&mut r, "got")
+    );
+    run(&mut r, "w.terminate();");
+    wpump(&mut r, 150);
+}
+
+#[test]
+fn worker_idle_pump_cost_is_negligible_with_no_workers() {
+    let mut r = rt("");
+    // No Worker objects created: the prelude outbox drain + empty channel probe dominate.
+    // This is a smoke bound (real cost is ~µs); it guards against accidental blocking.
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        assert!(r.poll_workers().is_empty());
+    }
+    let elapsed = start.elapsed();
+    assert!(!r.worker_alive() && !r.worker_pending());
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "100 idle pumps took {elapsed:?}"
+    );
+}
+
+#[test]
+fn worker_console_forwards_with_prefix() {
+    let mut r = wrt(&[(
+        "worker.js",
+        "console.log('hello from worker', 42); postMessage('logged');",
+    )]);
+    run(
+        &mut r,
+        "globalThis.got = null; const w = new Worker('worker.js'); w.onmessage = e => { got = e.data; };",
+    );
+    wpump(&mut r, 300);
+    assert_eq!(s(&mut r, "got"), "logged");
+    let lines: Vec<String> = r
+        .host
+        .borrow_mut()
+        .take_console()
+        .into_iter()
+        .map(|(l, m)| format!("{l}:{m}"))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("[worker 1] hello from worker 42")),
+        "worker console forwarded: {lines:?}"
+    );
+    run(&mut r, "w.terminate();");
+    wpump(&mut r, 150);
+}
+
+// ------------------------------------------------------------------------------------
+// Canvas 2D (A3, approved subset)
+// ------------------------------------------------------------------------------------
+
+#[test]
+fn canvas_2d_context_kinds_and_attributes() {
+    let mut r = rt("<canvas id=c width=20 height=10></canvas>");
+    run(
+        &mut r,
+        "globalThis.c = document.getElementById('c'); globalThis.x = c.getContext('2d');",
+    );
+    assert_eq!(s(&mut r, "x !== null && typeof x.fillRect"), "function");
+    assert_eq!(
+        s(&mut r, "c.getContext('2d') === x"),
+        "true",
+        "one context object per canvas"
+    );
+    assert_eq!(s(&mut r, "[c.getContext('webgl'), c.getContext('webgl2'), c.getContext('webgpu'), c.getContext('nope')]"), "[null,null,null,null]");
+    assert_eq!(s(&mut r, "[c.width, c.height]"), "[20,10]");
+    assert_eq!(
+        s(
+            &mut r,
+            "[typeof CanvasRenderingContext2D, typeof CanvasGradient, typeof ImageData]"
+        ),
+        r#"["function","function","function"]"#
+    );
+    assert_eq!(
+        s(&mut r, "c.toDataURL().slice(0, 22)"),
+        "data:image/png;base64,"
+    );
+    // width/height reflect attributes; setting width clears the bitmap and resets state.
+    run(
+        &mut r,
+        "x.fillStyle = 'red'; x.fillRect(0, 0, 20, 10); c.width = 20;",
+    );
+    assert_eq!(
+        s(&mut r, "[...x.getImageData(0, 0, 1, 1).data].join()"),
+        "0,0,0,0"
+    );
+    assert_eq!(s(&mut r, "[c.width, x.fillStyle]"), "[20,\"#000000\"]");
+}
+
+#[test]
+fn canvas_2d_pixels_paths_gradients_and_images() {
+    let mut r =
+        rt("<canvas id=c width=24 height=24></canvas><canvas id=d width=8 height=8></canvas>");
+    run(
+        &mut r,
+        "globalThis.c = document.getElementById('c'); globalThis.x = c.getContext('2d');
+         x.fillStyle = 'red'; x.fillRect(0, 0, 24, 24);
+         globalThis.px = (a, b) => [...x.getImageData(a, b, 1, 1).data].join();
+         globalThis.red = px(1, 1);",
+    );
+    assert_eq!(s(&mut r, "red"), "255,0,0,255");
+    // Paths: triangle fill.
+    run(&mut r, "x.fillStyle = '#0000ff'; x.beginPath(); x.moveTo(2, 20); x.lineTo(22, 20); x.lineTo(12, 4); x.closePath(); x.fill();");
+    assert_eq!(s(&mut r, "px(12, 16)"), "0,0,255,255");
+    // Arc + stroke with round caps.
+    run(&mut r, "x.strokeStyle = 'black'; x.lineWidth = 4; x.lineCap = 'round'; x.beginPath(); x.moveTo(2, 2); x.lineTo(10, 2); x.stroke();");
+    assert_eq!(s(&mut r, "px(6, 2)"), "0,0,0,255");
+    // Linear gradient (2-stop) across a fresh rect.
+    run(
+        &mut r,
+        "x.clearRect(0, 0, 24, 24); const g = x.createLinearGradient(0, 0, 24, 0); g.addColorStop(0, 'black'); g.addColorStop(1, 'white');
+         x.fillStyle = g; x.fillRect(0, 0, 24, 4);
+         globalThis.gok = (() => { const [a, b, c] = [px(1, 2), px(12, 2), px(22, 2)].map(s => +s.split(',')[0]); return a < 40 && Math.abs(b - 128) < 20 && c > 210; })();",
+    );
+    assert_eq!(s(&mut r, "gok"), "true");
+    // Transform: scale moves paint.
+    run(&mut r, "x.clearRect(0, 0, 24, 24); x.save(); x.setTransform(2, 0, 0, 2, 0, 0); x.fillStyle = 'lime'; x.fillRect(0, 0, 4, 4); x.restore();");
+    assert_eq!(
+        s(&mut r, "[px(1, 1), px(5, 5), px(8, 8)].join('|')"),
+        "0,255,0,255|0,255,0,255|0,0,0,0"
+    );
+    // drawImage canvas -> canvas, then get/put round-trip.
+    run(
+        &mut r,
+        "const d = document.getElementById('d'); const dx = d.getContext('2d');
+         dx.drawImage(c, 4, 4, 4, 4, 0, 0, 8, 8);
+         globalThis.copied = [...dx.getImageData(0, 0, 1, 1).data].join();
+         const snap = x.getImageData(0, 0, 24, 24); x.clearRect(0, 0, 24, 24); x.putImageData(snap, 0, 0);
+         globalThis.restored = px(1, 1);",
+    );
+    assert_eq!(s(&mut r, "copied"), "0,255,0,255");
+    assert_eq!(s(&mut r, "restored"), "0,255,0,255");
+    // Invalid styles are ignored, bad arcs throw IndexSizeError, zero-size reads throw.
+    run(
+        &mut r,
+        "globalThis.errs = []; x.fillStyle = 'nope-not-a-color'; globalThis.kept = x.fillStyle;
+         try { x.arc(1, 1, -2, 0, 1); } catch (e) { errs.push(e.name); }
+         try { x.getImageData(0, 0, 0, 4); } catch (e) { errs.push(e.name); }
+         try { x.createRadialGradient(0,0,1,0,0,2); } catch (e) { errs.push(e.name); }",
+    );
+    assert_eq!(
+        s(&mut r, "[kept, errs]"),
+        r#"["lime",["IndexSizeError","IndexSizeError","NotSupportedError"]]"#
+    );
+}
+
+#[test]
+fn canvas_draws_do_not_restlye_or_relayout_siblings() {
+    let mut r = rt("<style>#a{width:40px;height:40px;background:green}</style><div id=a></div><canvas id=c width=16 height=16></canvas><div id=b></div>");
+    r.engine.borrow_mut().update(0.0);
+    let (rs0, lo0) = {
+        let e = r.engine.borrow();
+        (e.stats.restyles, e.stats.layouts)
+    };
+    run(&mut r, "const x = document.getElementById('c').getContext('2d'); x.fillStyle = 'red'; x.fillRect(0, 0, 16, 16);");
+    let info = r.engine.borrow_mut().update(0.0);
+    let e = r.engine.borrow();
+    assert!(info.repainted, "a canvas draw repaints");
+    assert_eq!(
+        (e.stats.restyles, e.stats.layouts),
+        (rs0, lo0),
+        "no sibling restyle or relayout"
+    );
 }

@@ -11,8 +11,20 @@ doctest = false
 rendrix-core.workspace = true
 rendrix-dom.workspace = true
 rendrix-css.workspace = true
+rendrix-gfx.workspace = true
 rquickjs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 getrandom = "0.2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+rfd = "0.18"
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+accesskit = "0.25"
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "js"
+harness = false

@@ -285,6 +285,35 @@ fn calc(expr: &str, cx: &LengthContext) -> Option<Dim> {
     }
 }
 
+/// True when a declaration value can resolve against the viewport size.
+///
+/// Conservative by design: any `var()` reference may substitute a viewport-relative
+/// length, so values containing `var(` are treated as viewport-dependent. Otherwise a
+/// viewport unit only counts when it directly follows a number (`10vw`, `.5vh`),
+/// so identifiers that merely contain those letters (font names, URLs) do not trip it.
+pub fn value_uses_viewport_units(v: &str) -> bool {
+    let lower = v.to_ascii_lowercase();
+    if lower.contains("var(") {
+        return true;
+    }
+    let b = lower.as_bytes();
+    for needle in [&b"vw"[..], &b"vh"[..], &b"vmin"[..], &b"vmax"[..]] {
+        let mut i = 0;
+        while i + needle.len() <= b.len() {
+            if &b[i..i + needle.len()] == needle {
+                let prev = if i == 0 { b' ' } else { b[i - 1] };
+                if prev.is_ascii_digit() || prev == b'.' {
+                    return true;
+                }
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
 /// Parse a time value (`200ms`, `0.3s`) to seconds.
 pub fn parse_time(s: &str) -> Option<f32> {
     let (n, u) = split_number(s)?;
@@ -379,6 +408,22 @@ mod tests {
         assert!(substitute_vars("var(--missing)", &v).is_none());
         v.insert("--loop".to_string(), "var(--loop)".to_string());
         assert!(substitute_vars("var(--loop)", &v).is_none());
+    }
+
+    #[test]
+    fn viewport_unit_detection() {
+        // P3: only real viewport units count, and var() is conservatively dependent.
+        assert!(value_uses_viewport_units("10vw"));
+        assert!(value_uses_viewport_units("calc(100% - 2vmin)"));
+        assert!(value_uses_viewport_units(".5vh"));
+        assert!(value_uses_viewport_units("var(--w)"));
+        assert!(value_uses_viewport_units("var(--w, 10vw)"));
+        assert!(!value_uses_viewport_units("10px"));
+        assert!(!value_uses_viewport_units("50%"));
+        assert!(!value_uses_viewport_units("2em"));
+        assert!(!value_uses_viewport_units("review"));
+        assert!(!value_uses_viewport_units("\"navhigh\""));
+        assert!(!value_uses_viewport_units("url(image-vw.png)"));
     }
 
     #[test]
