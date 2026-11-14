@@ -509,6 +509,9 @@ pub struct CanvasUpload {
 
 pub fn take_canvas_uploads(engine: &rendrix_core::Engine) -> Vec<CanvasUpload> {
     let key = (&engine.doc as *const rendrix_dom::Document) as usize;
+    // 3D scenes render into their canvas bitmaps first, so the drain below uploads 3D
+    // content through the existing canvas texture path (windowed + headless screenshots).
+    crate::scene3d::flush_scenes(engine);
     // Reconcile attribute sizes first (a `setAttribute('width',…)` without a JS setter call
     // still resizes + clears the bitmap, per spec). A size change marks the whole bitmap so
     // the recreated GPU target is refreshed even with no further draws.

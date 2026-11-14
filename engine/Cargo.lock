@@ -1268,6 +1268,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.34.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "627003914c6057c9c8f0832ee4f870b5a4f599d0cfa83f4072675114860cd0ff"
+
+[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2736,10 +2742,13 @@ dependencies = [
  "bytemuck",
  "cosmic-text",
  "criterion",
+ "glam",
  "image",
  "pollster 0.4.0",
  "rendrix-css",
  "rendrix-layout",
+ "serde",
+ "serde_json",
  "wgpu",
 ]
 

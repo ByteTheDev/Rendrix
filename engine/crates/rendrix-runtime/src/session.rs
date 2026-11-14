@@ -663,6 +663,8 @@ impl Session {
         }
         let mut info = self.engine.borrow_mut().update(now);
         self.js.after_layout();
+        // 3D scenes: prune scenes of dead nodes, re-arm on backing-size changes.
+        rendrix_js::scene3d::sync_scenes(&mut self.engine.borrow_mut());
         if self.engine.borrow().has_pending_changes() {
             let mut e = self.engine.borrow_mut();
             let second = e.update(now);

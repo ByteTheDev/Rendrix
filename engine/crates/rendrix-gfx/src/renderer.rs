@@ -1,8 +1,10 @@
 //! The wgpu renderer: flattens a [`DisplayList`] into GPU instances and draws them.
 
 use crate::display::*;
+use crate::scene3d::{build_box, build_plane, build_sphere, cloned_scene, Geometry, SceneDraw, Vertex3};
 use crate::text::TextSystem;
 use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
 use rendrix_css::animation::{mat_apply, mat_mul, Matrix, IDENTITY};
 use rendrix_css::Color;
 use std::collections::HashMap;
@@ -90,6 +92,56 @@ struct State {
     opacity: Vec<f32>,
 }
 
+// ---- 3D forward pass (R6.2 v1) ------------------------------------------------------
+//
+// One depth-tested pipeline coexists with the 2D SDF pass: the 2D pass draws first,
+// then each `SceneDraw` viewport composites on top with viewport+scissor set to the
+// CSS layout rect. Lighting is Blinn-Phong with a single directional + ambient
+// (see scene3d.wgsl); transparency, shadows and textures are deferred.
+
+/// Interleaved 3D vertex: position + normal.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct V3 {
+    pos: [f32; 3],
+    nrm: [f32; 3],
+}
+
+impl From<Vertex3> for V3 {
+    fn from(v: Vertex3) -> Self {
+        V3 { pos: v.pos, nrm: v.normal }
+    }
+}
+
+/// Per-scene block of the 3D uniform buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FrameU {
+    view_proj: [[f32; 4]; 4],
+    cam_pos: [f32; 4],
+    light_dir: [f32; 4],
+    light_color: [f32; 4],
+    ambient: [f32; 4],
+}
+
+/// Per-mesh block of the 3D uniform buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MeshU {
+    model: [[f32; 4]; 4],
+    normal_mat: [[f32; 4]; 4],
+    base: [f32; 4],
+    emissive: [f32; 4],
+    /// metal, roughness, shininess, unused.
+    params: [f32; 4],
+}
+
+struct GpuMesh {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    count: u32,
+}
+
 pub struct Renderer {
     format: wgpu::TextureFormat,
     device: wgpu::Device,
@@ -109,6 +161,21 @@ pub struct Renderer {
     /// Number of instances drawn in the last frame (profiling).
     pub last_instances: usize,
     pub last_batches: usize,
+    // ---- 3D forward pass (R6.2 v1) -------------------------------------------------
+    td_pipeline: wgpu::RenderPipeline,
+    td_bind: wgpu::BindGroup,
+    td_frame_buf: wgpu::Buffer,
+    td_mesh_buf: wgpu::Buffer,
+    td_box: GpuMesh,
+    td_plane: GpuMesh,
+    td_sphere: GpuMesh,
+    /// Raw-triangle meshes keyed by (scene_id, mesh_index, scene_revision).
+    td_tris: HashMap<(u64, usize, u64), GpuMesh>,
+    depth: Option<(u32, u32, wgpu::Texture)>,
+    /// Target size of the last `render` call (for standalone 3D compositing).
+    last_size: (u32, u32),
+    /// 3D meshes drawn in the last frame (profiling).
+    pub last_3d_meshes: usize,
 }
 
 impl Renderer {
@@ -236,6 +303,97 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let globals_bind = Self::make_globals_bind(&device, &g_layout, &globals_buf, &inst_buf);
+        // ---- 3D forward pass --------------------------------------------------
+        let td_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rendrix 3d shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("scene3d.wgsl").into()),
+        });
+        let td_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rendrix 3d uniforms"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        // Two buffers (frame: viewProj/camera/lights, rewritten per scene; mesh:
+        // model/material, rewritten per mesh) so every binding sits at offset 0 —
+        // uniform binding offsets must respect the 256-byte alignment limit.
+        let td_frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rendrix 3d frame"),
+            size: std::mem::size_of::<FrameU>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let td_mesh_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rendrix 3d mesh"),
+            size: std::mem::size_of::<MeshU>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let td_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rendrix 3d bind"),
+            layout: &td_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: td_frame_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: td_mesh_buf.as_entire_binding() },
+            ],
+        });
+        let td_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("rendrix 3d layout"), bind_group_layouts: &[&td_layout], push_constant_ranges: &[] });
+        let td_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("rendrix 3d pipeline"),
+            layout: Some(&td_pl),
+            vertex: wgpu::VertexState {
+                module: &td_module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<V3>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &td_module,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            // No face culling in v1: procedural shapes and imported triangle soup do
+            // not share one winding convention; low-poly scenes stay cheap anyway.
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, front_face: wgpu::FrontFace::Ccw, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let gpu_mesh = |verts: &[Vertex3], idx: &[u32], label: &str| {
+            let v: Vec<V3> = verts.iter().copied().map(V3::from).collect();
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX });
+            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(idx), usage: wgpu::BufferUsages::INDEX });
+            GpuMesh { vbuf, ibuf, count: idx.len() as u32 }
+        };
+        let (box_v, box_i) = build_box();
+        let (plane_v, plane_i) = build_plane();
+        let (sph_v, sph_i) = build_sphere();
+        let td_box = gpu_mesh(&box_v, &box_i, "rendrix 3d box");
+        let td_plane = gpu_mesh(&plane_v, &plane_i, "rendrix 3d plane");
+        let td_sphere = gpu_mesh(&sph_v, &sph_i, "rendrix 3d sphere");
         Renderer {
             format,
             device,
@@ -254,6 +412,17 @@ impl Renderer {
             inst_cap,
             last_instances: 0,
             last_batches: 0,
+            td_pipeline,
+            td_bind,
+            td_frame_buf,
+            td_mesh_buf,
+            td_box,
+            td_plane,
+            td_sphere,
+            td_tris: HashMap::new(),
+            depth: None,
+            last_size: (1, 1),
+            last_3d_meshes: 0,
         }
     }
 
@@ -470,9 +639,11 @@ impl Renderer {
         self.begin_frame();
         let mut insts: Vec<Inst> = Vec::with_capacity(512);
         let mut batches: Vec<Batch> = Vec::new();
-        self.flatten(list, text, scale, &mut insts, &mut batches);
+        let mut scenes: Vec<SceneDraw> = Vec::new();
+        self.flatten(list, text, scale, &mut insts, &mut batches, &mut scenes);
         self.last_instances = insts.len();
         self.last_batches = batches.len();
+        self.last_size = size_px;
 
         if insts.len() > self.inst_cap {
             // Headroom growth: 25% + 256 instances of slack, rounded up, so a
@@ -531,6 +702,18 @@ impl Renderer {
                 pass.draw(0..4, b.start..b.end);
             }
         }
+        // 3D viewports composite on top of the 2D frame in the same encoder, so
+        // `render_to_rgba` captures them too. Pure-2D frames skip everything: no
+        // store lock (flag check), no depth texture, no extra submit.
+        if list.has_3d && !scenes.is_empty() {
+            let dv = self.depth_view(size_px.0.max(1), size_px.1.max(1));
+            self.last_3d_meshes = self.composite_3d(&mut encoder, target, &dv, &scenes, size_px);
+        } else {
+            self.last_3d_meshes = 0;
+            if !list.has_3d && !self.td_tris.is_empty() {
+                self.td_tris.clear();
+            }
+        }
         self.queue.submit(Some(encoder.finish()));
     }
 
@@ -583,7 +766,7 @@ impl Renderer {
 
     // ------------------------------------------------------------------------------------
 
-    fn flatten(&mut self, list: &DisplayList, text: &mut TextSystem, scale: f32, insts: &mut Vec<Inst>, batches: &mut Vec<Batch>) {
+    fn flatten(&mut self, list: &DisplayList, text: &mut TextSystem, scale: f32, insts: &mut Vec<Inst>, batches: &mut Vec<Batch>, scenes: &mut Vec<SceneDraw>) {
         let mut st = State { xf: vec![[scale, 0.0, 0.0, scale, 0.0, 0.0]], clip: vec![(NO_CLIP, 0.0)], opacity: vec![1.0] };
         let push = |insts: &mut Vec<Inst>, batches: &mut Vec<Batch>, tex: Tex, inst: Inst| {
             let idx = insts.len() as u32;
@@ -730,9 +913,193 @@ impl Renderer {
                         st.opacity.pop();
                     }
                 }
+                // 3D viewports ignore opacity (opaque forward pass in v1) but honour
+                // the transform + clip stacks: the rect is resolved to device pixels
+                // here and the GPU pass re-applies it as viewport + scissor.
+                Item::Scene3D(s) => {
+                    if s.rect[2] <= 0.0 || s.rect[3] <= 0.0 {
+                        continue;
+                    }
+                    let corners = [mat_apply(xf, s.rect[0], s.rect[1]), mat_apply(xf, s.rect[0] + s.rect[2], s.rect[1]), mat_apply(xf, s.rect[0], s.rect[1] + s.rect[3]), mat_apply(xf, s.rect[0] + s.rect[2], s.rect[1] + s.rect[3])];
+                    let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.0), a.1.max(c.0)));
+                    let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.1), a.1.max(c.1)));
+                    let (ix0, iy0) = (x0.max(clip[0]), y0.max(clip[1]));
+                    let (ix1, iy1) = (x1.min(clip[0] + clip[2]), y1.min(clip[1] + clip[3]));
+                    if ix1 - ix0 >= 0.5 && iy1 - iy0 >= 0.5 {
+                        scenes.push(SceneDraw { scene_id: s.scene_id, rect_px: [ix0, iy0, ix1 - ix0, iy1 - iy0] });
+                    }
+                }
             }
         }
         let _ = IDENTITY;
+    }
+}
+
+impl Renderer {
+    /// Composite 3D scene viewports over an already-rendered 2D frame.
+    ///
+    /// `draws` carry physical-pixel rects (see [`SceneDraw`]); each resolves its
+    /// scene from the [`crate::scene3d`] store, sets viewport + scissor to the CSS
+    /// layout rect, and draws depth-tested. Returns the number of meshes drawn.
+    /// Draws with missing scenes, empty meshes or fully-culled content cost no pass.
+    fn composite_3d(
+        &mut self,
+        enc: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        draws: &[SceneDraw],
+        size_px: (u32, u32),
+    ) -> usize {
+        // Phase 1 (needs `&mut`): upload any uncached raw-triangle meshes.
+        for d in draws {
+            let Some(scene) = cloned_scene(d.scene_id) else { continue };
+            for (mi, mesh) in scene.meshes.iter().enumerate() {
+                let Geometry::Tris { verts, indices } = &mesh.geometry else { continue };
+                let key = (d.scene_id, mi, scene.revision);
+                if self.td_tris.contains_key(&key) {
+                    continue;
+                }
+                let v: Vec<V3> = verts.iter().copied().map(V3::from).collect();
+                let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rendrix 3d tris"),
+                    contents: bytemuck::cast_slice(&v),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rendrix 3d tris idx"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                self.td_tris.insert(key, GpuMesh { vbuf, ibuf, count: indices.len() as u32 });
+            }
+        }
+        // Phase 2 (read-only GPU state): one render pass per visible scene.
+        let mut drawn = 0usize;
+        let mut used: Vec<(u64, usize, u64)> = Vec::new();
+        for d in draws {
+            let (rx, ry, rw, rh) = (d.rect_px[0], d.rect_px[1], d.rect_px[2], d.rect_px[3]);
+            if rw < 1.0 || rh < 1.0 {
+                continue;
+            }
+            let Some(scene) = cloned_scene(d.scene_id) else { continue };
+            if scene.meshes.is_empty() {
+                continue;
+            }
+            let vp = scene.camera.view_proj(rw, rh);
+            let visible = scene.visible_meshes(&vp);
+            if visible.is_empty() {
+                continue;
+            }
+            // Clamp the viewport into the target; fully-offscreen draws are skipped.
+            let (tx, ty) = (size_px.0 as f32, size_px.1 as f32);
+            let (cx0, cy0) = (rx.max(0.0), ry.max(0.0));
+            let (cx1, cy1) = ((rx + rw).min(tx), (ry + rh).min(ty));
+            if cx1 - cx0 < 1.0 || cy1 - cy0 < 1.0 {
+                continue;
+            }
+            let (dir, lcol) = scene.key_light();
+            let amb = scene.ambient();
+            let frame = FrameU {
+                view_proj: vp.to_cols_array_2d(),
+                cam_pos: [scene.camera.position.x, scene.camera.position.y, scene.camera.position.z, 1.0],
+                light_dir: [dir.x, dir.y, dir.z, 0.0],
+                light_color: [lcol[0], lcol[1], lcol[2], 1.0],
+                ambient: [amb[0], amb[1], amb[2], 1.0],
+            };
+            self.queue.write_buffer(&self.td_frame_buf, 0, bytemuck::bytes_of(&frame));
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rendrix 3d pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.td_pipeline);
+            pass.set_viewport(cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0, 1.0);
+            pass.set_scissor_rect(cx0 as u32, cy0 as u32, (cx1 - cx0) as u32, (cy1 - cy0) as u32);
+            pass.set_bind_group(0, &self.td_bind, &[]);
+            for mi in visible {
+                let mesh = &scene.meshes[mi];
+                if mesh.world_sphere().1 < 1e-9 {
+                    continue;
+                }
+                let nmat = mesh.transform.inverse().transpose();
+                let uni = MeshU {
+                    model: mesh.transform.to_cols_array_2d(),
+                    normal_mat: nmat.to_cols_array_2d(),
+                    base: mesh.material.base_color,
+                    emissive: [mesh.material.emissive[0], mesh.material.emissive[1], mesh.material.emissive[2], 1.0],
+                    params: [mesh.material.metallic, mesh.material.roughness, 128.0 + (8.0 - 128.0) * mesh.material.roughness, 0.0],
+                };
+                self.queue.write_buffer(&self.td_mesh_buf, 0, bytemuck::bytes_of(&uni));
+                let gpu: &GpuMesh = match &mesh.geometry {
+                    Geometry::Box => &self.td_box,
+                    Geometry::Plane => &self.td_plane,
+                    Geometry::Sphere => &self.td_sphere,
+                    Geometry::Tris { .. } => {
+                        let key = (d.scene_id, mi, scene.revision);
+                        used.push(key);
+                        match self.td_tris.get(&key) {
+                            Some(g) => g,
+                            None => continue,
+                        }
+                    }
+                };
+                pass.set_vertex_buffer(0, gpu.vbuf.slice(..));
+                pass.set_index_buffer(gpu.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..gpu.count, 0, 0..1);
+                drawn += 1;
+            }
+        }
+        // Drop GPU buffers for scenes/meshes that no longer exist (bounded cache).
+        if used.len() != self.td_tris.len() {
+            self.td_tris.retain(|k, _| used.contains(k));
+        }
+        drawn
+    }
+
+    /// Depth texture for the 3D pass, recreated only when the viewport size changes.
+    fn depth_view(&mut self, w: u32, h: u32) -> wgpu::TextureView {
+        let rebuild = self.depth.as_ref().is_none_or(|(dw, dh, _)| *dw != w || *dh != h);
+        if rebuild {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rendrix 3d depth"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth24Plus,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.depth = Some((w, h, tex));
+        }
+        self.depth.as_ref().unwrap().2.create_view(&Default::default())
+    }
+
+    /// Composite caller-supplied 3D viewports over `output_view` (standalone entry
+    /// point; `render` calls the same path internally for display-list scenes).
+    /// `depth_view` must match `output_view`'s size. Zero draws = zero GPU work.
+    pub fn render_3d_scenes(&mut self, draws: &[SceneDraw], output_view: &wgpu::TextureView, depth_view: &wgpu::TextureView) -> usize {
+        if draws.is_empty() {
+            return 0;
+        }
+        let size = self.last_size;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rendrix 3d frame") });
+        let n = self.composite_3d(&mut enc, output_view, depth_view, draws, size);
+        if n > 0 {
+            self.queue.submit(Some(enc.finish()));
+        }
+        self.last_3d_meshes = n;
+        n
     }
 }
 
@@ -1005,5 +1372,45 @@ mod tests {
         let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
         r.upload_canvas(9, &[], 0, 0);
         assert_eq!(r.canvas_size(9), None);
+    }
+
+    // ---- 3D scene compositing (R6.2 v1) ------------------------------------------------
+
+    #[test]
+    fn scene3d_box_composites_over_the_2d_frame() {
+        use crate::scene3d;
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let id = 0x3D00_0001u64;
+        scene3d::upsert_scene(
+            id,
+            r#"{"camera": {"position": [0, 0.6, 4.2], "lookAt": [0, 0, 0]},
+                "meshes": [{"geo": {"kind": "box"},
+                            "material": {"color": [1, 0, 0, 1]},
+                            "transform": {"scale": [2, 2, 2]}}]}"#,
+        )
+        .unwrap();
+        // Pure-2D control frame first: no scenes anywhere, zero 3D cost.
+        let mut plain = DisplayList::new(64.0, 64.0, Color::WHITE);
+        plain.push(rect(0.0, 0.0, 64.0, 64.0, Color::WHITE));
+        let img0 = r.render_to_rgba(&plain, &mut t, (64, 64), 1.0);
+        assert_eq!(r.last_3d_meshes, 0, "no Scene3D items: nothing drawn");
+        assert!(img0.chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
+        // Same frame with a scene viewport: the red box must land on top.
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(Item::Scene3D(Scene3DItem { scene_id: id, rect: [4.0, 4.0, 56.0, 56.0] }));
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        scene3d::remove_scene(id);
+        assert_eq!(r.last_3d_meshes, 1, "one visible box mesh drawn");
+        let red = img.chunks_exact(4).filter(|p| p[0] > 150 && p[1] < 120 && p[2] < 120).count();
+        assert!(red > 100, "box painted {red} reddish pixels");
+        assert_eq!(px(&img, 64, 1, 1), [255, 255, 255, 255], "outside the viewport stays background");
+        // A missing scene paints nothing (transparent, never wrong).
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(Item::Scene3D(Scene3DItem { scene_id: 0x3D00_9999, rect: [4.0, 4.0, 56.0, 56.0] }));
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        assert_eq!(r.last_3d_meshes, 0);
+        assert!(img.chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
     }
 }

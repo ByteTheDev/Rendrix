@@ -559,7 +559,14 @@ fn wrappers_are_collected_and_native_nodes_freed() {
 #[test]
 fn unsupported_apis_are_honestly_absent_or_throw() {
     let mut r = rt("<canvas id=c width=10 height=10></canvas>");
-    assert_eq!(s(&mut r, "[typeof WebSocket, typeof XMLHttpRequest, typeof IntersectionObserver, typeof WebGLRenderingContext]"), r#"["function","undefined","undefined","undefined"]"#);
+    assert_eq!(
+        s(&mut r, "[typeof WebSocket, typeof XMLHttpRequest, typeof IntersectionObserver]"),
+        r#"["function","undefined","undefined"]"#
+    );
+    assert_eq!(
+        s(&mut r, "[typeof WebGLRenderingContext, typeof WebGL2RenderingContext, typeof RendrixScene, typeof Rendrix3D]"),
+        r#"["function","function","object","object"]"#
+    );
     assert_eq!(
         s(&mut r, "typeof document.getElementById('c').getContext('2d')"),
         "object"
@@ -991,7 +998,12 @@ fn canvas_2d_context_kinds_and_attributes() {
         "true",
         "one context object per canvas"
     );
-    assert_eq!(s(&mut r, "[c.getContext('webgl'), c.getContext('webgl2'), c.getContext('webgpu'), c.getContext('nope')]"), "[null,null,null,null]");
+    assert_eq!(
+        s(&mut r, "[c.getContext('2d') === x, c.getContext('webgl2') === c.getContext('webgl2'), c.getContext('webgl') !== null]"),
+        "[true,true,true]",
+        "one context object per kind, cached"
+    );
+    assert_eq!(s(&mut r, "[c.getContext('webgpu'), c.getContext('bitmaprenderer'), c.getContext('nope')]"), "[null,null,null]");
     assert_eq!(s(&mut r, "[c.width, c.height]"), "[20,10]");
     assert_eq!(
         s(
@@ -1089,5 +1101,156 @@ fn canvas_draws_do_not_restlye_or_relayout_siblings() {
         (e.stats.restyles, e.stats.layouts),
         (rs0, lo0),
         "no sibling restyle or relayout"
+    );
+}
+
+// ------------------------------------------------------------------------------------
+// 3D scenes (v1 subset): primary RendrixScene API, webgl2-context alias, CPU rasterizer
+// ------------------------------------------------------------------------------------
+
+#[test]
+fn scene3d_api_presence_and_aliases() {
+    let mut r = rt("<canvas id=c width=20 height=10></canvas><rendrix-scene id=s></rendrix-scene>");
+    run(
+        &mut r,
+        "globalThis.c = document.getElementById('c');
+         globalThis.gl2 = c.getContext('webgl2');
+         globalThis.gl1 = c.getContext('webgl');
+         globalThis.box = Rendrix3D.createBoxScene({ color: [1, 0, 0, 1] });",
+    );
+    assert_eq!(
+        s(&mut r, "[gl2 !== null, gl1 !== null, gl2 instanceof WebGL2RenderingContext, gl1 instanceof WebGLRenderingContext, gl2 === c.getContext('webgl2')]"),
+        "[true,true,true,true,true]"
+    );
+    assert_eq!(
+        s(&mut r, "[box.meshes.length, box.meshes[0].geo.kind, box.camera.position.join()]"),
+        r#"[1,"box","0,0,6"]"#
+    );
+    // RendrixScene hosts: canvas and <rendrix-scene> both attach, round-trip and remove.
+    run(
+        &mut r,
+        "globalThis.h1 = RendrixScene.createScene('c', box);
+         globalThis.h2 = RendrixScene.createScene(document.getElementById('s'), box);
+         globalThis.roundtrip = [RendrixScene.getScene('c').meshes.length, RendrixScene.getScene('s').camera.fovY];
+         h1.setCamera({ fovY: 60 }); h1.addBox({ size: 1, color: [0, 1, 0, 1] });
+         globalThis.after = RendrixScene.getScene('c').meshes.length;
+         h1.remove(); globalThis.gone = RendrixScene.getScene('c');",
+    );
+    assert_eq!(s(&mut r, "roundtrip"), r#"[1,40]"#);
+    assert_eq!(s(&mut r, "after"), "2", "setCamera keeps meshes, addBox appends");
+    assert_eq!(s(&mut r, "gone"), "null", "remove drops the scene");
+    assert_eq!(
+        s(&mut r, "RendrixScene.getScene('missing-id')"),
+        "null",
+        "unknown elements read back as null (no throw)"
+    );
+}
+
+#[test]
+fn scene3d_validation_errors_and_unsupported_gl_calls() {
+    let mut r = rt("<canvas id=c width=20 height=10></canvas>");
+    run(
+        &mut r,
+        "globalThis.errs = [];
+         try { RendrixScene.createScene('c', { meshes: [{ geo: { kind: 'torus' } }] }); } catch (e) { errs.push(e.name); }
+         try { RendrixScene.createScene('c', { meshes: [{ geo: { kind: 'tris', verts: [0, 1] } }] }); } catch (e) { errs.push(e.name); }
+         try { RendrixScene.createScene(document.body, {}); } catch (e) { errs.push(e.name); }
+         try { RendrixScene.createScene('no-such-id', {}); } catch (e) { errs.push(e.constructor.name); }
+         try { RendrixScene.createScene('c', 'not-an-object'); } catch (e) { errs.push(e.constructor.name); }",
+    );
+    assert_eq!(
+        s(&mut r, "errs"),
+        r#"["NotSupportedError","NotSupportedError","TypeError","TypeError","TypeError"]"#,
+        "bad descs and bad hosts fail loudly, never silently"
+    );
+    // Unsupported GL calls warn and no-op (or return null) — never crash.
+    run(
+        &mut r,
+        "const gl = document.getElementById('c').getContext('webgl2');
+         globalThis.warns = []; const origWarn = console.warn; console.warn = m => warns.push(String(m));
+         let tex = null, threw = null;
+         try {
+           tex = gl.createTexture();
+           gl.drawElements(gl.TRIANGLES, 0, 0);
+           gl.enable(12345);
+           gl.drawArrays(5, 0, 3);
+           gl.drawArrays(gl.TRIANGLES, 0, 3);
+           globalThis.params = [gl.getError(), gl.isContextLost(), gl.getParameter(99999), gl.getExtension('WEBGL_debug')];
+         } catch (e) { threw = String(e); }
+         console.warn = origWarn;",
+    );
+    assert_eq!(s(&mut r, "threw"), "null");
+    assert_eq!(s(&mut r, "tex"), "null");
+    assert_eq!(s(&mut r, "params"), "[0,false,null,null]");
+    assert_eq!(s(&mut r, "warns.length >= 5"), "true", "every unsupported call warned");
+}
+
+#[test]
+fn scene3d_renders_into_the_canvas_bitmap_only_when_dirty() {
+    let mut r = rt("<canvas id=c width=200 height=150></canvas>");
+    run(
+        &mut r,
+        "RendrixScene.createScene('c', Rendrix3D.createBoxScene({ color: [1, 0, 0, 1], camPos: [0, 0, 6] }));",
+    );
+    let px = |rgba: &[u8], w: u32, x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    };
+    let first = crate::canvas_ops::take_canvas_uploads(&r.engine.borrow());
+    assert_eq!(first.len(), 1, "one upload for the dirty scene canvas");
+    assert_eq!((first[0].width, first[0].height), (200, 150));
+    let center = px(&first[0].rgba, 200, 100, 75);
+    assert!(
+        center[0] > 100 && center[1] < 60 && center[2] < 60 && center[3] == 255,
+        "red box face covers the canvas center: {center:?}"
+    );
+    assert_eq!(px(&first[0].rgba, 200, 2, 2)[3], 0, "corners stay transparent");
+    // No changes → no upload (per-frame upload only when dirty).
+    let second = crate::canvas_ops::take_canvas_uploads(&r.engine.borrow());
+    assert!(second.is_empty(), "clean scenes upload nothing");
+    // A triangle-soup draw through the webgl2 alias lands in the same bitmap.
+    run(
+        &mut r,
+        "const gl = document.getElementById('c').getContext('webgl2');
+         gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,-1, 3,-1,-1, -1,3,-1]), gl.STATIC_DRAW);
+         gl.uniform4f(null, 1, 1, 1, 1);
+         gl.drawArrays(gl.TRIANGLES, 0, 3);",
+    );
+    let third = crate::canvas_ops::take_canvas_uploads(&r.engine.borrow());
+    assert_eq!(third.len(), 1);
+    let lit = px(&third[0].rgba, 200, 100, 75);
+    assert!(lit[0] > 100 && lit[3] == 255, "white soup triangle covers the center: {lit:?}");
+}
+
+#[test]
+fn scene3d_element_removal_drops_the_scene() {
+    let mut r = rt("<canvas id=c width=40 height=30></canvas>");
+    run(
+        &mut r,
+        "RendrixScene.createScene('c', Rendrix3D.createBoxScene({}));
+         globalThis.keep = document.getElementById('c');",
+    );
+    let id = r.engine.borrow().doc.get_element_by_id("c").unwrap();
+    let get = |r: &mut JsRuntime| {
+        r.host
+            .borrow_mut()
+            .call("scene3d_get", &[Val::Num(id as f64)])
+    };
+    assert!(matches!(get(&mut r), Ok(Val::Str(_))), "scene is stored");
+    // Detach and drop every JS reference, then sweep like the frame loop does. The
+    // strong-wrapper reconcile is throttled (500 ms), so wait it out.
+    run(&mut r, "document.body.innerHTML = ''; globalThis.keep = null;");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    run(&mut r, "1;");
+    r.collect_garbage();
+    run(&mut r, "1;");
+    r.collect_garbage();
+    run(&mut r, "1;");
+    r.engine.borrow_mut().doc.collect_garbage();
+    r.host.borrow_mut().call("take_freed", &[]).unwrap();
+    assert!(
+        matches!(get(&mut r), Ok(Val::Null)),
+        "the scene died with its element"
     );
 }

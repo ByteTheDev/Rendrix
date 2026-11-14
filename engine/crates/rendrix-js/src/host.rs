@@ -1231,12 +1231,17 @@ impl Host for DomHost {
             // ---- memory ----
             "detach_epoch" => Val::Num(doc!().doc.detach_epoch as f64),
             "take_freed" => {
-                let mut e = doc!();
-                // Sweep now so script-side state for unreachable nodes is dropped promptly.
-                e.doc.collect_garbage();
-                let freed = e.doc.take_freed();
-                let mut all = e.take_freed_for_js();
-                all.extend(freed);
+                let all = {
+                    let mut e = doc!();
+                    // Sweep now so script-side state for unreachable nodes is dropped promptly.
+                    e.doc.collect_garbage();
+                    let freed = e.doc.take_freed();
+                    let mut all = e.take_freed_for_js();
+                    all.extend(freed);
+                    all
+                };
+                // 3D scenes die with their host element (stops future renders + frees memory).
+                crate::scene3d::remove_many(crate::canvas_ops::doc_key(self), &all);
                 ids(all)
             }
             "retain" => {
@@ -1456,6 +1461,10 @@ impl Host for DomHost {
                 Val::List(names.into_iter().map(Val::Str).collect())
             }
             other if other.starts_with("canvas_") => match crate::canvas_ops::canvas_op(self, other, a) {
+                Some(r) => r?,
+                None => return Err(format!("unknown native operation '{other}'")),
+            },
+            other if other.starts_with("scene3d_") => match crate::scene3d::scene_op(self, other, a) {
                 Some(r) => r?,
                 None => return Err(format!("unknown native operation '{other}'")),
             },

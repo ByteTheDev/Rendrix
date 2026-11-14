@@ -1051,6 +1051,7 @@ for (const [k, v] of Object.entries({
   EventTarget, Event, CustomEvent, UIEvent, FocusEvent, MouseEvent, PointerEvent, WheelEvent, KeyboardEvent, InputEvent, SubmitEvent, ErrorEvent, MessageEvent, PromiseRejectionEvent, ProgressEvent, DOMException,
   Node, CharacterData, Text, Comment, DocumentFragment, Element, HTMLElement, Document, NodeList, HTMLCollection, DOMRect, DOMTokenList, CSSStyleDeclaration,
   HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement, HTMLFormElement, HTMLAnchorElement, HTMLLabelElement, HTMLImageElement, HTMLCanvasElement, HTMLStyleElement, HTMLLinkElement, HTMLScriptElement,
+  WebGLRenderingContext, WebGL2RenderingContext, RendrixScene, Rendrix3D, RendrixSceneElement, RendrixSceneHandle,
   MutationObserver, ResizeObserver, MediaQueryList,
   URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, AbortSignal, Headers, Request, Response, Blob, File, FormData, Storage,
   WebSocket, CloseEvent, DragEvent, DataTransfer, Worker,

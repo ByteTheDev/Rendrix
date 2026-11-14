@@ -67,12 +67,23 @@ pub struct ImageItem {
     pub uv: [f32; 4],
 }
 
+/// A 3D scene viewport: the GPU scene registered under `scene_id` (the hosting
+/// element's DOM id) composites into `rect`. Missing scenes paint nothing, so a
+/// stale item is transparent, never wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scene3DItem {
+    pub scene_id: u64,
+    /// Border-box rect in logical pixels.
+    pub rect: [f32; 4],
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     Rect(RectItem),
     Shadow(ShadowItem),
     Text(TextItem),
     Image(ImageItem),
+    Scene3D(Scene3DItem),
     /// Clip subsequent items to a rounded rectangle until the matching `PopClip`.
     PushClip { rect: [f32; 4], radius: f32 },
     PopClip,
@@ -91,13 +102,19 @@ pub struct DisplayList {
     pub height: f32,
     pub background: Color,
     pub items: Vec<Item>,
+    /// Set when any [`Item::Scene3D`] is present; lets the renderer skip all 3D
+    /// work (no store lock, no depth texture) on pure-2D frames.
+    pub has_3d: bool,
 }
 
 impl DisplayList {
     pub fn new(width: f32, height: f32, background: Color) -> Self {
-        DisplayList { width, height, background, items: Vec::new() }
+        DisplayList { width, height, background, items: Vec::new(), has_3d: false }
     }
     pub fn push(&mut self, item: Item) {
+        if matches!(item, Item::Scene3D(_)) {
+            self.has_3d = true;
+        }
         self.items.push(item);
     }
 }

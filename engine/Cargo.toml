@@ -27,6 +27,7 @@ rquickjs = { version = "=0.14.0", features = ["loader", "futures"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+glam = "0.34"
 
 rendrix-css = { path = "crates/rendrix-css" }
 rendrix-dom = { path = "crates/rendrix-dom" }

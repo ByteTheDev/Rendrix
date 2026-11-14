@@ -447,3 +447,31 @@ fn shadows_and_overflow_keep_partially_offscreen_boxes_alive() {
     assert!(e.display_list().items.iter().any(|i| matches!(i, Item::Shadow(_))), "a box above the viewport whose shadow reaches in is still painted");
     assert!(e.display_list().items.iter().any(|i| matches!(i, Item::Rect(r) if r.rect[3] == 20.0)), "overflowing child of an offscreen parent is still painted");
 }
+
+#[test]
+fn scene_hosts_emit_scene3d_items_with_border_box_rects() {
+    use rendrix_gfx::Item;
+    let e = engine(
+        r#"<rendrix-scene id="s"></rendrix-scene><canvas id="c" data-3d width="300" height="150"></canvas><canvas id="plain" width="10" height="10"></canvas><div id="d"></div>"#,
+        "body{margin:0} #s{width:200px;height:100px} #c{width:300px;height:150px}",
+        800.0,
+        600.0,
+    );
+    let list = e.display_list();
+    assert!(list.has_3d, "scene hosts set the 3D flag");
+    let scenes: Vec<_> = list.items.iter().filter_map(|i| if let Item::Scene3D(s) = i { Some(s) } else { None }).collect();
+    assert_eq!(scenes.len(), 2, "one per scene host, got {}", scenes.len());
+    let s = scenes.iter().find(|s| s.scene_id == by_id(&e, "s") as u64).expect("rendrix-scene item");
+    assert!(near(s.rect[2], 200.0) && near(s.rect[3], 100.0), "border-box rect: {:?}", s.rect);
+    assert!(scenes.iter().any(|s| s.scene_id == by_id(&e, "c") as u64), "canvas data-3d item");
+    // The data-3d canvas is taken over by its scene: no 2D bitmap composite for it,
+    // while the plain canvas keeps the existing Image path.
+    let images: Vec<_> = list.items.iter().filter_map(|i| if let Item::Image(im) = i { Some(im.image) } else { None }).collect();
+    assert!(!images.contains(&rendrix_gfx::canvas_image_id(by_id(&e, "c"))), "data-3d canvas emits no Image");
+    assert!(images.contains(&rendrix_gfx::canvas_image_id(by_id(&e, "plain"))), "plain canvas keeps the Image path");
+
+    // No 3D element anywhere: identical 2D behavior, flag clear.
+    let e2 = engine(r#"<div id="d"></div><canvas id="plain" width="10" height="10"></canvas>"#, "body{margin:0}", 800.0, 600.0);
+    assert!(!e2.display_list().has_3d);
+    assert!(e2.display_list().items.iter().all(|i| !matches!(i, Item::Scene3D(_))));
+}

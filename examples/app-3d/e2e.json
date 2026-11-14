@@ -1,0 +1,9 @@
+[
+  { "type": "expect", "js": "typeof RendrixScene.createScene", "equals": "function" },
+  { "type": "expect", "js": "document.getElementById('scene').getContext('webgl2') !== null", "equals": "true" },
+  { "type": "expect", "js": "document.querySelector('#status').textContent.includes('mesh')", "equals": "true" },
+  { "type": "wait", "ms": 600 },
+  { "type": "expect", "js": "RendrixScene.getScene('scene').meshes.length", "equals": "1" },
+  { "type": "screenshot", "path": "cube.png" },
+  { "type": "expect", "js": "(() => { const d = document.getElementById('scene').getContext('2d').getImageData(235, 155, 1, 1).data; return d[2] > 100 && d[3] === 255; })()", "equals": "true" }
+]

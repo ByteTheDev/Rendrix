@@ -64,7 +64,7 @@ impl<'a> Builder<'a> {
     }
 
     fn is_replaced(tag: &str) -> bool {
-        matches!(tag, "img" | "canvas" | "video" | "svg" | "iframe" | "object" | "embed")
+        matches!(tag, "img" | "canvas" | "video" | "svg" | "iframe" | "object" | "embed" | "rendrix-scene")
     }
 
     fn is_box_like(s: &ComputedStyle) -> bool {
@@ -148,7 +148,9 @@ impl<'a> Builder<'a> {
                     let natural = engine.doc.get_attr(id, "src").and_then(|src| engine.image_entry(src));
                     natural.map(|e| (e.width as f32, e.height as f32)).unwrap_or((0.0, 0.0))
                 }
-                "canvas" | "svg" | "iframe" | "video" | "object" | "embed" => (300.0, 150.0),
+                // 3D scene host (`<rendrix-scene>`): a layout box with a scene viewport,
+                // same intrinsic size as other replaced elements without natural size.
+                "canvas" | "svg" | "iframe" | "video" | "object" | "embed" | "rendrix-scene" => (300.0, 150.0),
                 _ => (0.0, 0.0),
             };
             if let Some(a) = attr_px("width") {

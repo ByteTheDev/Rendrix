@@ -5,7 +5,7 @@ use crate::Engine;
 use rendrix_css::animation::{mat_apply, mat_invert, mat_mul, transform_matrix, Matrix, IDENTITY};
 use rendrix_css::{BackgroundImage, BackgroundRepeat, BackgroundSize, BorderStyle, Color, ComputedStyle, Dim, ObjectFit, Overflow, PointerEvents, Visibility};
 use rendrix_dom::NodeId;
-use rendrix_gfx::{canvas_image_id, DisplayList, Fill, ImageItem, Item, RectItem, ShadowItem, TextItem};
+use rendrix_gfx::{canvas_image_id, DisplayList, Fill, ImageItem, Item, RectItem, Scene3DItem, ShadowItem, TextItem};
 use rendrix_layout::{BoxLayout, LayoutKind, LayoutNode, LayoutResult};
 
 #[derive(Debug, Clone)]
@@ -368,11 +368,21 @@ impl<'a> Painter<'a> {
                         }
                     }
                 }
+                // 3D scene viewport (R6.2 v1): `<rendrix-scene>` or `<canvas data-3d>`
+                // hosts the GPU scene registered under this node's id. The scene takes
+                // over the surface (no 2D bitmap composite for data-3d canvases) and
+                // composites into the border-box rect.
+                let is_scene = engine.doc.tag(tag) == Some("rendrix-scene")
+                    || (engine.doc.tag(tag) == Some("canvas") && engine.doc.has_attr(tag, "data-3d"));
+                if is_scene {
+                    if rect[2] > 0.0 && rect[3] > 0.0 {
+                        self.list.push(Item::Scene3D(Scene3DItem { scene_id: tag as u64, rect }));
+                    }
                 // Canvas 2D (A3): composite the GPU target as a plain textured quad. Clips,
                 // transforms and opacity apply through the shared flatten path; the intrinsic
                 // size comes from the width/height attributes (default 300x150). Zero-area
                 // canvases emit nothing and own no texture.
-                if engine.doc.tag(tag) == Some("canvas") {
+                } else if engine.doc.tag(tag) == Some("canvas") {
                     let dim = |name: &str, def: f32| {
                         engine
                             .doc

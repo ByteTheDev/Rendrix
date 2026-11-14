@@ -18,6 +18,18 @@ export namespace JSX {
       id?: string;
       [attr: string]: unknown;
     };
+    /** 3D scene host (API-compatible with `<canvas>` scenes; compositing needs `<canvas>` in v1). */
+    "rendrix-scene": {
+      children?: Child;
+      id?: string;
+      width?: number | string;
+      height?: number | string;
+      class?: string | string[];
+      className?: string;
+      style?: string | Record<string, string | number>;
+      ref?: ((el: any) => void) | { current: any };
+      [attr: string]: unknown;
+    };
   }
 }
 export const Fragment: unique symbol;

@@ -5,6 +5,7 @@ pub mod engine_trait;
 pub mod host;
 pub mod quickjs;
 pub mod runtime;
+pub mod scene3d;
 pub mod sourcemap;
 pub mod canvas_ops;
 
