@@ -852,6 +852,15 @@ pub struct CanvasUpload {
 
 pub fn take_canvas_uploads(engine: &rendrix_core::Engine) -> Vec<CanvasUpload> {
     let key = (&engine.doc as *const rendrix_dom::Document) as usize;
+    // The canvas and scene stores are process-global and keyed by document
+    // address. A fresh Engine can reuse a freed one's address, so drop entries
+    // for nodes that are not live canvases in THIS document first: otherwise a
+    // stale dirty bitmap — or a stale scene repainting one — from an earlier
+    // document uploads here as a phantom extra upload. Observed as a flaky
+    // `first.len() == 2` with a single <canvas> on macOS CI.
+    let live_canvas = |n: u32| engine.doc.is_alive(n) && engine.doc.tag(n) == Some("canvas");
+    canvas::prune(key, live_canvas);
+    crate::scene3d::prune_stale(key, live_canvas);
     // 3D scenes render into their canvas bitmaps first, so the drain below uploads 3D
     // content through the existing canvas texture path (windowed + headless screenshots).
     crate::scene3d::flush_scenes(engine);

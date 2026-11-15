@@ -565,6 +565,14 @@ pub fn sync_scenes(engine: &mut rendrix_core::Engine) {
     }
 }
 
+/// Drop scenes hosted by nodes that fail `keep`. The scene store is process-global
+/// and keyed by document address (see `doc_key_of`), so a fresh document can reuse
+/// a freed one's address: without pruning, a stale scene from a dead document could
+/// repaint into the new one. Called from `take_canvas_uploads` before flushing.
+pub fn prune_stale(doc: usize, keep: impl Fn(u32) -> bool) {
+    store().lock().unwrap().retain(|(d, n), _| *d != doc || keep(*n));
+}
+
 /// Render every dirty scene into its canvas bitmap. Called at the top of
 /// `take_canvas_uploads`, so both the window driver and headless screenshots pick up 3D
 /// content through the existing canvas texture path.
