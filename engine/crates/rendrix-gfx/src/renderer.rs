@@ -1446,18 +1446,35 @@ mod tests {
 
     #[test]
     fn atlas_overflow_recovers_without_stale_frames() {
+        use read_fonts::{FontRef, TableProvider};
         use rendrix_css::ComputedStyle;
         use rendrix_layout::{InlineContent, InlineRun};
         use std::sync::Arc;
+        /// Distinct codepoints covered by the bundled Inter Regular, in cmap order.
+        /// The old version used CJK codepoints resolved through per-OS fallback
+        /// fonts; advances/rasters differ per platform, so atlas packing (and the
+        /// exact post-recycle instance count) differed on macOS vs Windows.
+        /// Inter ships in-repo, so metrics — and packing — are identical everywhere.
+        fn inter_codepoints(n: usize) -> Vec<char> {
+            let bytes = include_bytes!("../fonts/Inter_400Regular.ttf");
+            let font = FontRef::new(&bytes[..]).expect("bundled Inter parses");
+            let cmap = font.cmap().expect("bundled Inter has a cmap");
+            let (_, _, sub) = cmap.best_subtable().expect("Inter has a Unicode subtable");
+            let cps: Vec<char> = sub.iter().filter_map(|(cp, _)| char::from_u32(cp)).take(n).collect();
+            assert_eq!(cps.len(), n, "bundled Inter covers {n} distinct codepoints");
+            cps
+        }
         let Some(ctx) = GpuContext::headless().ok() else { return };
-        // A tiny atlas forces evictions with a modest glyph set.
+        // A tiny atlas forces evictions with a modest glyph set. Every glyph
+        // comes from Inter, so each needs its own atlas slot on every OS.
+        let cps = inter_codepoints(500);
+        let text: String = cps.iter().collect();
         let mut r = Renderer::with_atlas_size(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm, 256);
         let mut t = TextSystem::new();
-        // Distinct CJK codepoints: every glyph needs its own atlas slot (a .notdef
-        // box still occupies one, so missing fonts cannot hide the overflow).
-        let text: String = (0..500).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        t.load_font(include_bytes!("../fonts/Inter_400Regular.ttf").to_vec());
         let mut s = ComputedStyle::default();
         s.font_size = 32.0;
+        s.font_family = Arc::from(vec!["Inter".to_string()]);
         s.color = Color::BLACK;
         let s = Arc::new(s);
         let content = Arc::new(InlineContent::new(vec![InlineRun { text, style: s.clone(), node: 1, is_break: false }], s));
@@ -1481,9 +1498,10 @@ mod tests {
         // LRU retention: the hot head glyphs survived the recycle, so drawing
         // only them faults nothing new in.
         assert!(r.atlas_generation() >= 1, "recycle bumped the generation");
-        let head: String = (0..20).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        let head: String = cps[..20].iter().collect();
         let mut hs = ComputedStyle::default();
         hs.font_size = 32.0;
+        hs.font_family = Arc::from(vec!["Inter".to_string()]);
         hs.color = Color::BLACK;
         let hs = Arc::new(hs);
         let head_content =

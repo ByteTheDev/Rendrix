@@ -2840,6 +2840,7 @@ dependencies = [
  "glam",
  "image",
  "pollster 0.4.0",
+ "read-fonts",
  "rendrix-css",
  "rendrix-layout",
  "serde",
