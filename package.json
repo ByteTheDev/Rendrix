@@ -14,6 +14,7 @@
     "example": "node packages/cli/bin/rendrix.mjs dev examples/app-counter",
     "example:build": "node packages/cli/bin/rendrix.mjs build examples/app-counter",
     "e2e": "node scripts/e2e.mjs",
+    "wpt": "node scripts/wpt.mjs",
     "test": "cargo test --workspace --manifest-path engine/Cargo.toml && node --test packages/cli/test/*.test.mjs",
     "test:cli": "node --test packages/cli/test/*.test.mjs",
     "bench": "cargo run --release -p rendrix-runtime --manifest-path engine/Cargo.toml -- bench 1000",

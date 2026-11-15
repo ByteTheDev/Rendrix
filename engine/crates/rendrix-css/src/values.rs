@@ -7,6 +7,9 @@ pub enum Dim {
     Auto,
     Px(f32),
     Percent(f32),
+    /// Mixed `calc()` result: `percent%` of the containing block plus an absolute `px` offset.
+    /// `px` is already resolved (em/rem/vw/... baked via [`LengthContext`]).
+    Calc(f32, f32),
 }
 
 impl Dim {
@@ -21,7 +24,12 @@ impl Dim {
             Dim::Auto => None,
             Dim::Px(v) => Some(v),
             Dim::Percent(p) => Some(basis * p / 100.0),
+            Dim::Calc(p, px) => Some(basis * p / 100.0 + px),
         }
+    }
+    /// True when this value came from a mixed `calc()` and needs a containing-block basis.
+    pub fn is_calc(self) -> bool {
+        matches!(self, Dim::Calc(..))
     }
 }
 
@@ -163,14 +171,37 @@ pub fn strip_func<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     }
 }
 
-/// `calc()` is evaluated when all operands share a kind (all absolute lengths, or all percentages).
-/// Mixed `100% - 20px` cannot be represented in `Dim` and returns `None` (documented limitation).
+/// `calc()` over absolute lengths, percentages and their mixture.
+/// Pure-absolute and pure-percent expressions collapse to [`Dim::Px`]/[`Dim::Percent`];
+/// mixed `100% - 20px` is kept as [`Dim::Calc`] (percent + absolute offset) and resolved
+/// later against the containing-block basis via [`Dim::resolve`]. Viewport units are
+/// baked to px here via [`LengthContext`].
 fn calc(expr: &str, cx: &LengthContext) -> Option<Dim> {
     #[derive(Clone, Copy)]
     enum V {
         Abs(f32),
         Pct(f32),
         Num(f32),
+        Mixed { pct: f32, abs: f32 },
+    }
+    impl V {
+        fn pct_part(self) -> Option<f32> {
+            match self {
+                V::Pct(p) => Some(p),
+                V::Mixed { pct, .. } => Some(pct),
+                _ => None,
+            }
+        }
+        fn abs_part(self) -> Option<f32> {
+            match self {
+                V::Abs(a) => Some(a),
+                V::Mixed { abs, .. } => Some(abs),
+                _ => None,
+            }
+        }
+        fn is_length(self) -> bool {
+            matches!(self, V::Abs(_) | V::Pct(_) | V::Mixed { .. })
+        }
     }
     fn tokenize(e: &str) -> Vec<String> {
         let mut toks = Vec::new();
@@ -220,6 +251,7 @@ fn calc(expr: &str, cx: &LengthContext) -> Option<Dim> {
             return match calc(inner, cx)? {
                 Dim::Px(v) => Some(V::Abs(v)),
                 Dim::Percent(p) => Some(V::Pct(p)),
+                Dim::Calc(p, a) => Some(V::Mixed { pct: p, abs: a }),
                 Dim::Auto => None,
             };
         }
@@ -232,18 +264,56 @@ fn calc(expr: &str, cx: &LengthContext) -> Option<Dim> {
     }
     fn combine(a: V, b: V, op: &str) -> Option<V> {
         use V::*;
+        // Addition/subtraction: lengths combine; pure + mixed yields mixed.
+        if matches!(op, "+" | "-") {
+            let s = if op == "+" { 1.0 } else { -1.0 };
+            match (a, b) {
+                (Abs(x), Abs(y)) => return Some(Abs(x + s * y)),
+                (Pct(x), Pct(y)) => return Some(Pct(x + s * y)),
+                (Num(x), Num(y)) => return Some(Num(x + s * y)),
+                _ if a.is_length() && b.is_length() => {
+                    let ap = a.pct_part().unwrap_or(0.0);
+                    let bp = b.pct_part().unwrap_or(0.0);
+                    let aa = a.abs_part().unwrap_or(0.0);
+                    let ba = b.abs_part().unwrap_or(0.0);
+                    let (pct, abs) = (ap + s * bp, aa + s * ba);
+                    return Some(if pct == 0.0 {
+                        Abs(abs)
+                    } else if abs == 0.0 {
+                        Pct(pct)
+                    } else {
+                        Mixed { pct, abs }
+                    });
+                }
+                _ => return None,
+            }
+        }
         Some(match (a, b, op) {
-            (Abs(x), Abs(y), "+") => Abs(x + y),
-            (Abs(x), Abs(y), "-") => Abs(x - y),
-            (Pct(x), Pct(y), "+") => Pct(x + y),
-            (Pct(x), Pct(y), "-") => Pct(x - y),
-            (Num(x), Num(y), "+") => Num(x + y),
-            (Num(x), Num(y), "-") => Num(x - y),
             (Abs(x), Num(y), "*") | (Num(y), Abs(x), "*") => Abs(x * y),
             (Pct(x), Num(y), "*") | (Num(y), Pct(x), "*") => Pct(x * y),
+            (Mixed { pct, abs }, Num(y), "*") | (Num(y), Mixed { pct, abs }, "*") => {
+                let (p, v) = (pct * y, abs * y);
+                if p == 0.0 {
+                    Abs(v)
+                } else if v == 0.0 {
+                    Pct(p)
+                } else {
+                    Mixed { pct: p, abs: v }
+                }
+            }
             (Num(x), Num(y), "*") => Num(x * y),
             (Abs(x), Num(y), "/") if y != 0.0 => Abs(x / y),
             (Pct(x), Num(y), "/") if y != 0.0 => Pct(x / y),
+            (Mixed { pct, abs }, Num(y), "/") if y != 0.0 => {
+                let (p, v) = (pct / y, abs / y);
+                if p == 0.0 {
+                    Abs(v)
+                } else if v == 0.0 {
+                    Pct(p)
+                } else {
+                    Mixed { pct: p, abs: v }
+                }
+            }
             (Num(x), Num(y), "/") if y != 0.0 => Num(x / y),
             _ => return None,
         })
@@ -280,6 +350,13 @@ fn calc(expr: &str, cx: &LengthContext) -> Option<Dim> {
     match acc {
         V::Abs(v) => Some(Dim::Px(v)),
         V::Pct(p) => Some(Dim::Percent(p)),
+        V::Mixed { pct, abs } => Some(if pct == 0.0 {
+            Dim::Px(abs)
+        } else if abs == 0.0 {
+            Dim::Percent(pct)
+        } else {
+            Dim::Calc(pct, abs)
+        }),
         V::Num(v) if v == 0.0 => Some(Dim::Px(0.0)),
         V::Num(_) => None,
     }
@@ -293,7 +370,7 @@ fn calc(expr: &str, cx: &LengthContext) -> Option<Dim> {
 /// so identifiers that merely contain those letters (font names, URLs) do not trip it.
 pub fn value_uses_viewport_units(v: &str) -> bool {
     let lower = v.to_ascii_lowercase();
-    if lower.contains("var(") {
+    if lower.contains("var(") || lower.contains("env(") {
         return true;
     }
     let b = lower.as_bytes();
@@ -322,6 +399,59 @@ pub fn parse_time(s: &str) -> Option<f32> {
         "ms" => Some(n / 1000.0),
         _ => None,
     }
+}
+
+/// Resolve `env(name, fallback)` references (safe-area insets, keyboard height). Unknown names use
+/// the fallback; with no fallback the declaration is invalid (`None`), as in CSS.
+pub fn substitute_env(value: &str, safe_area: [f32; 4], keyboard_h: f32) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(pos) = rest.find("env(") {
+        // `env(` must not be the tail of another identifier (e.g. `xenv(`).
+        if rest[..pos].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            out.push_str(&rest[..pos + 4]);
+            rest = &rest[pos + 4..];
+            continue;
+        }
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 4..];
+        let mut level = 1;
+        let mut end = None;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => level += 1,
+                ')' => {
+                    level -= 1;
+                    if level == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let inner = &after[..end];
+        let (name, fallback) = match inner.find(',') {
+            Some(c) => (inner[..c].trim(), Some(inner[c + 1..].trim())),
+            None => (inner.trim(), None),
+        };
+        let px = match name.to_ascii_lowercase().as_str() {
+            "safe-area-inset-top" => Some(safe_area[0]),
+            "safe-area-inset-right" => Some(safe_area[1]),
+            "safe-area-inset-bottom" => Some(safe_area[2]),
+            "safe-area-inset-left" => Some(safe_area[3]),
+            "keyboard-inset-height" => Some(keyboard_h),
+            _ => None,
+        };
+        match px {
+            Some(v) => out.push_str(&format!("{v}px")),
+            None => out.push_str(fallback?),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// Resolve all `var(--x, fallback)` references. Returns `None` if a variable is undefined with no fallback.
@@ -379,6 +509,16 @@ mod tests {
     }
 
     #[test]
+    fn env_substitution() {
+        let sa = [44.0, 0.0, 34.0, 8.0];
+        assert_eq!(substitute_env("env(safe-area-inset-top)", sa, 0.0).unwrap(), "44px");
+        assert_eq!(substitute_env("calc(10px + env(safe-area-inset-bottom, 0px))", sa, 0.0).unwrap(), "calc(10px + 34px)");
+        assert_eq!(substitute_env("env(nope, 7px) env(keyboard-inset-height)", sa, 300.0).unwrap(), "7px 300px");
+        assert!(substitute_env("env(nope)", sa, 0.0).is_none());
+        assert_eq!(substitute_env("10px", sa, 0.0).unwrap(), "10px");
+    }
+
+    #[test]
     fn units() {
         assert_eq!(parse_length("2em", &cx()), Some(Dim::Px(40.0)));
         assert_eq!(parse_length("2rem", &cx()), Some(Dim::Px(32.0)));
@@ -396,7 +536,24 @@ mod tests {
         assert_eq!(parse_length("calc(10px + 2em)", &cx()), Some(Dim::Px(50.0)));
         assert_eq!(parse_length("calc(100% / 4)", &cx()), Some(Dim::Percent(25.0)));
         assert_eq!(parse_length("calc(2 * (3px + 1px))", &cx()), Some(Dim::Px(8.0)));
-        assert_eq!(parse_length("calc(100% - 20px)", &cx()), None);
+    }
+
+    #[test]
+    fn calc_mixed_units() {
+        // Mixed percent + absolute is preserved as Calc and resolved against a basis.
+        assert_eq!(parse_length("calc(100% - 20px)", &cx()), Some(Dim::Calc(100.0, -20.0)));
+        assert_eq!(parse_length("calc(100% - 20px)", &cx()).unwrap().resolve(400.0), Some(380.0));
+        assert_eq!(parse_length("calc(50% + 10px)", &cx()).unwrap().resolve(200.0), Some(110.0));
+        // Pure kinds still collapse; viewport units bake to px before mixing.
+        assert_eq!(parse_length("calc(50% + 50%)", &cx()), Some(Dim::Percent(100.0)));
+        assert_eq!(parse_length("calc(10px + 2em)", &cx()), Some(Dim::Px(50.0)));
+        assert_eq!(parse_length("calc((100% - 20px) / 2)", &cx()).unwrap().resolve(400.0), Some(190.0));
+        assert_eq!(parse_length("calc(2 * (100% - 20px))", &cx()).unwrap().resolve(400.0), Some(760.0));
+        assert_eq!(parse_length("calc(10vw + 10%)", &cx()), Some(Dim::Calc(10.0, 100.0)));
+        assert_eq!(parse_length("calc(100% - 20px)", &cx()).unwrap().resolve(1000.0), Some(980.0));
+        // Invalid: length * length, or bare numbers.
+        assert_eq!(parse_length("calc(10px * 20px)", &cx()), None);
+        assert_eq!(parse_length("calc(10 + 20)", &cx()), None);
     }
 
     #[test]

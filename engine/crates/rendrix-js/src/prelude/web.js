@@ -452,18 +452,21 @@ function fetch(input, init) {
 }
 function fetchDone(id, status, statusText, headersFlat, bodyB64, err) {
   // Async host completions share one pipe; system events are tagged and routed first.
-  if (typeof statusText === 'string' && statusText.startsWith('rendrix:')) return systemDone(id, status, statusText, bodyB64);
+  if (typeof statusText === 'string' && statusText.startsWith('rendrix:')) return systemDone(id, status, statusText, bodyB64, err);
   const f = pendingFetches.get(id); if (!f) return; pendingFetches.delete(id);
   if (err) { f.reject(new TypeError('Failed to fetch: ' + err)); return; }
   const h = new Headers(); for (let i = 0; i < headersFlat.length; i += 2) h.append(headersFlat[i], headersFlat[i + 1]);
   f.resolve(new Response(b64ToBytes(bodyB64 || ''), { status, statusText, headers: h, url: f.req.url }));
 }
 
-function systemDone(id, status, tag, bodyB64) {
+function systemDone(id, status, tag, bodyB64, err) {
   const bytes = b64ToBytes(bodyB64 || '');
   const text = new TextDecoder().decode(bytes);
   if (tag === 'rendrix:dialog') {
     const f = pendingDialogs.get(id); if (!f) return; pendingDialogs.delete(id);
+    // Native completions never carry an error here; the web target rejects actionably instead of
+    // resolving `null` (which would look like a user cancel).
+    if (err) { f.reject(new Error(String(err))); return; }
     try { f.resolve(JSON.parse(text)); } catch (_) { f.resolve(null); }
     return;
   }
@@ -540,24 +543,180 @@ function deliverMutations() {
 
 const resizeObservers = new Set();
 class ResizeObserver {
-  constructor(cb) { this._cb = cb; this._targets = new Map(); }
-  observe(el) { this._targets.set(el, null); resizeObservers.add(this); N('raf_request'); }
-  unobserve(el) { this._targets.delete(el); }
+  constructor(cb) {
+    if (typeof cb !== 'function') throw new TypeError("Failed to construct 'ResizeObserver': parameter 1 is not of type 'Function'.");
+    this._cb = cb; this._targets = new Map();
+  }
+  observe(el, opts) {
+    if (!el || el[ID] === undefined) throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+    let box = 'content-box';
+    if (opts !== undefined && opts !== null) {
+      const b = opts.box !== undefined ? String(opts.box) : 'content-box';
+      if (b !== 'content-box' && b !== 'border-box' && b !== 'device-pixel-content-box') throw new TypeError(`Failed to execute 'observe' on 'ResizeObserver': The provided value '${b}' is not a valid enum value of type ResizeObserverBoxOptions.`);
+      box = b;
+    }
+    const prev = this._targets.get(el);
+    this._targets.set(el, { box, last: prev ? prev.last : null });
+    resizeObservers.add(this); N('raf_request');
+  }
+  unobserve(el) { this._targets.delete(el); if (!this._targets.size) resizeObservers.delete(this); }
   disconnect() { this._targets.clear(); resizeObservers.delete(this); }
 }
 function checkResize() {
+  if (!resizeObservers.size) return;
+  let dpr = 1;
+  try { const vp = N('viewport'); if (vp && vp[2]) dpr = vp[2]; } catch (_) {}
   for (const obs of [...resizeObservers]) {
+    if (!obs._targets.size) { resizeObservers.delete(obs); continue; }
     const entries = [];
-    for (const [el, last] of obs._targets) {
-      const s = N('layout_size', el[ID]); if (!s) continue;
-      if (!last || last[0] !== s[0] || last[1] !== s[1]) {
-        obs._targets.set(el, s);
-        entries.push({ target: el, contentRect: new DOMRect(0, 0, s[0], s[1]), contentBoxSize: [{ inlineSize: s[0], blockSize: s[1] }], borderBoxSize: [{ inlineSize: s[0], blockSize: s[1] }], devicePixelContentBoxSize: [{ inlineSize: s[0], blockSize: s[1] }] });
+    for (const [el, rec] of obs._targets) {
+      let s = null;
+      try { s = N('box_sizes', el[ID]); } catch (_) { continue; }
+      if (!s) continue;
+      const [bw, bh, cw, ch] = s;
+      let cur;
+      if (rec.box === 'border-box') cur = [bw, bh];
+      else if (rec.box === 'device-pixel-content-box') cur = [cw * dpr, ch * dpr];
+      else cur = [cw, ch];
+      const last = rec.last;
+      if (!last || last[0] !== cur[0] || last[1] !== cur[1]) {
+        rec.last = cur;
+        const dprW = cw * dpr, dprH = ch * dpr;
+        entries.push({ target: el, contentRect: new DOMRect(0, 0, cw, ch), contentBoxSize: [{ inlineSize: cw, blockSize: ch }], borderBoxSize: [{ inlineSize: bw, blockSize: bh }], devicePixelContentBoxSize: [{ inlineSize: dprW, blockSize: dprH }] });
       }
     }
     if (entries.length) { try { obs._cb.call(obs, entries, obs); } catch (e) { reportError(e); } }
   }
 }
+
+const intersectionObservers = new Set();
+function parseRootMargin(margin) {
+  const s = margin === undefined || margin === null ? '0px' : String(margin).trim();
+  const parts = s === '' ? [] : s.split(/\s+/);
+  if (parts.length < 1 || parts.length > 4) throw new TypeError(`Failed to construct 'IntersectionObserver': Failed to parse rootMargin '${margin}'.`);
+  const parsed = parts.map(p => {
+    const m = /^(-?\d*\.?\d+)(px|%)$/.exec(p);
+    if (!m) throw new TypeError(`Failed to construct 'IntersectionObserver': Failed to parse rootMargin '${margin}'.`);
+    return { value: parseFloat(m[1]), isPercent: m[2] === '%' };
+  });
+  // Expand to [top, right, bottom, left] per CSS shorthand rules.
+  let top, right, bottom, left;
+  if (parsed.length === 1) top = right = bottom = left = parsed[0];
+  else if (parsed.length === 2) { top = bottom = parsed[0]; right = left = parsed[1]; }
+  else if (parsed.length === 3) { top = parsed[0]; right = left = parsed[1]; bottom = parsed[2]; }
+  else { [top, right, bottom, left] = parsed; }
+  return [top, right, bottom, left];
+}
+function normalizeThresholds(t) {
+  if (t === undefined) return [0];
+  const list = Array.isArray(t) ? t.slice() : [t];
+  const out = list.map(x => {
+    const n = Number(x);
+    if (!Number.isFinite(n) || n < 0 || n > 1) throw new TypeError("Failed to construct 'IntersectionObserver': threshold values must be numbers between 0 and 1.");
+    return n;
+  });
+  out.sort((a, b) => a - b);
+  return [...new Set(out)];
+}
+class IntersectionObserver {
+  constructor(cb, opts = {}) {
+    if (typeof cb !== 'function') throw new TypeError("Failed to construct 'IntersectionObserver': parameter 1 is not of type 'Function'.");
+    if (opts !== null && typeof opts !== 'object') throw new TypeError("Failed to construct 'IntersectionObserver': parameter 2 is not of type 'object'.");
+    opts = opts || {};
+    this._cb = cb;
+    this._targets = new Map();
+    this._thresholds = normalizeThresholds(opts.threshold !== undefined ? opts.threshold : (opts.thresholds !== undefined ? opts.thresholds : undefined));
+    if (opts.root !== undefined && opts.root !== null && !(opts.root instanceof Element)) throw new TypeError("Failed to construct 'IntersectionObserver': root must be an Element or null.");
+    this._root = opts.root === undefined ? null : opts.root;
+    this._rootMargin = parseRootMargin(opts.rootMargin);
+    // Delay margin (not implemented): accepted syntactically for compat.
+    this._delay = opts.delay === undefined ? 0 : Math.max(0, Math.min(1000, Number(opts.delay) || 0));
+  }
+  observe(el) {
+    if (!el || el[ID] === undefined) throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+    if (!this._targets.has(el)) this._targets.set(el, { lastRatio: null, lastIntersecting: null });
+    intersectionObservers.add(this); N('raf_request');
+  }
+  unobserve(el) { this._targets.delete(el); if (!this._targets.size) intersectionObservers.delete(this); }
+  disconnect() { this._targets.clear(); intersectionObservers.delete(this); }
+  takeRecords() { const q = this._queue || []; this._queue = []; return q; }
+}
+function checkIntersections() {
+  if (!intersectionObservers.size) return;
+  let vw = 0, vh = 0;
+  try { const vp = N('viewport'); vw = vp[0]; vh = vp[1]; } catch (_) { return; }
+  for (const obs of [...intersectionObservers]) {
+    if (!obs._targets.size) { intersectionObservers.delete(obs); continue; }
+    let clip;
+    if (obs._root) {
+      let r = null;
+      try { r = N('rect', obs._root[ID]); } catch (_) { continue; }
+      if (!r) continue;
+      const m = obs._rootMargin;
+      const top = m[0].isPercent ? m[0].value / 100 * r[3] : m[0].value;
+      const right = m[1].isPercent ? m[1].value / 100 * r[2] : m[1].value;
+      const bottom = m[2].isPercent ? m[2].value / 100 * r[3] : m[2].value;
+      const left = m[3].isPercent ? m[3].value / 100 * r[2] : m[3].value;
+      clip = { x: r[0] - left, y: r[1] - top, w: r[2] + left + right, h: r[3] + top + bottom };
+    } else {
+      const m = obs._rootMargin;
+      const top = m[0].isPercent ? m[0].value / 100 * vh : m[0].value;
+      const right = m[1].isPercent ? m[1].value / 100 * vw : m[1].value;
+      const bottom = m[2].isPercent ? m[2].value / 100 * vh : m[2].value;
+      const left = m[3].isPercent ? m[3].value / 100 * vw : m[3].value;
+      clip = { x: 0 - left, y: 0 - top, w: vw + left + right, h: vh + top + bottom };
+    }
+    const rootBounds = new DOMRect(clip.x, clip.y, Math.max(0, clip.w), Math.max(0, clip.h));
+    const entries = [];
+    for (const [el, state] of obs._targets) {
+      let b = null;
+      try { b = N('rect', el[ID]); } catch (_) { continue; }
+      let boundingClientRect, intersectionRect, ratio, isIntersecting;
+      if (!b) {
+        boundingClientRect = new DOMRect(0, 0, 0, 0);
+        intersectionRect = new DOMRect(0, 0, 0, 0);
+        ratio = 0; isIntersecting = false;
+      } else {
+        boundingClientRect = new DOMRect(b[0], b[1], b[2], b[3]);
+        if (b[2] <= 0 || b[3] <= 0) {
+          const inside = b[0] >= clip.x && b[0] <= clip.x + clip.w && b[1] >= clip.y && b[1] <= clip.y + clip.h;
+          isIntersecting = inside;
+          ratio = inside ? 1 : 0;
+          intersectionRect = inside ? new DOMRect(b[0], b[1], 0, 0) : new DOMRect(0, 0, 0, 0);
+        } else {
+          const ix0 = Math.max(b[0], clip.x), iy0 = Math.max(b[1], clip.y);
+          const ix1 = Math.min(b[0] + b[2], clip.x + clip.w), iy1 = Math.min(b[1] + b[3], clip.y + clip.h);
+          const iw = Math.max(0, ix1 - ix0), ih = Math.max(0, iy1 - iy0);
+          intersectionRect = (iw > 0 && ih > 0) ? new DOMRect(ix0, iy0, iw, ih) : new DOMRect(0, 0, 0, 0);
+          const targetArea = b[2] * b[3];
+          ratio = targetArea > 0 ? (iw * ih) / targetArea : 0;
+          // Clamp tiny floating noise to exact 0/1 so threshold edges are stable.
+          if (ratio < 1e-9) ratio = 0; else if (ratio > 1 - 1e-9) ratio = 1;
+          isIntersecting = iw > 0 && ih > 0;
+        }
+      }
+      let fire = false;
+      if (state.lastRatio === null || state.lastRatio === undefined) fire = true;
+      else if (state.lastIntersecting !== isIntersecting) fire = true;
+      else {
+        for (const t of obs._thresholds) {
+          const wasBelow = state.lastRatio < t;
+          const nowBelow = ratio < t;
+          // Equality counts as "at/above": crossing either direction fires.
+          if (wasBelow !== nowBelow || (state.lastRatio === t) !== (ratio === t)) { fire = true; break; }
+          if (state.lastRatio === t && ratio !== t) { fire = true; break; }
+        }
+      }
+      if (fire) {
+        state.lastRatio = ratio;
+        state.lastIntersecting = isIntersecting;
+        entries.push({ target: el, isIntersecting, intersectionRatio: ratio, intersectionRect, boundingClientRect, rootBounds, time: performance.now() });
+      }
+    }
+    if (entries.length) { try { obs._cb.call(obs, entries, obs); } catch (e) { reportError(e); } }
+  }
+}
+function checkObservers() { checkResize(); checkIntersections(); }
 
 // ----- drag and drop -------------------------------------------------------------------------------
 
@@ -582,6 +741,46 @@ class DragEvent extends MouseEvent {
     super(type, init);
     this.dataTransfer = init.dataTransfer instanceof DataTransfer ? init.dataTransfer : new DataTransfer(init.dataTransfer);
   }
+}
+
+
+// ----- Touch + Gamepad (mobile / controller input) -----------------------------------------------
+
+class Touch {
+  constructor(init = {}) {
+    this.identifier = init.identifier || 0; this.target = init.target || null;
+    this.clientX = init.clientX || 0; this.clientY = init.clientY || 0;
+    this.pageX = init.pageX !== undefined ? init.pageX : this.clientX; this.pageY = init.pageY !== undefined ? init.pageY : this.clientY;
+    this.screenX = init.screenX !== undefined ? init.screenX : this.clientX; this.screenY = init.screenY !== undefined ? init.screenY : this.clientY;
+    this.radiusX = init.radiusX || 1; this.radiusY = init.radiusY || 1; this.rotationAngle = init.rotationAngle || 0; this.force = init.force === undefined ? 1 : init.force;
+  }
+}
+class TouchEvent extends UIEvent {
+  constructor(type, init = {}) {
+    super(type, init);
+    const list = a => Object.freeze((a || []).map(t => t instanceof Touch ? t : new Touch(t)));
+    this.touches = list(init.touches); this.targetTouches = list(init.targetTouches); this.changedTouches = list(init.changedTouches);
+    this.ctrlKey = !!init.ctrlKey; this.shiftKey = !!init.shiftKey; this.altKey = !!init.altKey; this.metaKey = !!init.metaKey;
+  }
+}
+class Gamepad {
+  constructor(d) {
+    this.index = d.index; this.id = d.id; this.connected = d.connected !== false; this.mapping = d.mapping || 'standard'; this.timestamp = d.timestamp || 0;
+    this.axes = Object.freeze([...(d.axes || [])]);
+    this.buttons = Object.freeze((d.buttons || []).map(v => Object.freeze({ pressed: v > 0.5, touched: v > 0, value: v })));
+    this.vibrationActuator = null;
+  }
+}
+class GamepadEvent extends Event {
+  constructor(type, init = {}) { super(type, init); this.gamepad = init.gamepad || null; }
+}
+function readGamepads() {
+  let list = [];
+  try { list = JSON.parse(N('gamepads') || '[]'); } catch (_) {}
+  const out = [];
+  for (const d of list) out[d.index] = new Gamepad(d);
+  for (let i = 0; i < out.length; i++) if (out[i] === undefined) out[i] = null;
+  return out;
 }
 
 // ----- WebSocket client (A5) ---------------------------------------------------------------------
@@ -894,7 +1093,7 @@ function updateLocation(url) {
 
 const navigatorObj = {
   userAgent: 'Mozilla/5.0 (Rendrix) Rendrix/0.5', appName: 'Rendrix', appVersion: '0.5', vendor: 'Rendrix', platform: 'Rendrix', product: 'Gecko',
-  language: 'en-US', languages: ['en-US', 'en'], onLine: true, cookieEnabled: false, hardwareConcurrency: 4, maxTouchPoints: 0, webdriver: false,
+  language: 'en-US', languages: ['en-US', 'en'], onLine: true, cookieEnabled: false, hardwareConcurrency: 4, get maxTouchPoints() { return N('touch_points') | 0; }, webdriver: false, getGamepads() { return readGamepads(); },
   clipboard: { writeText: t => { N('clipboard_write', String(t)); return Promise.resolve(); }, readText: () => Promise.resolve(N('clipboard_read')) },
 };
 
@@ -983,9 +1182,10 @@ const EVENT_CLASSES = {
   pointerdown: PointerEvent, pointerup: PointerEvent, pointermove: PointerEvent, pointerover: PointerEvent, pointerout: PointerEvent, pointerenter: PointerEvent, pointerleave: PointerEvent, pointercancel: PointerEvent,
   wheel: WheelEvent, keydown: KeyboardEvent, keyup: KeyboardEvent, keypress: KeyboardEvent, input: InputEvent, beforeinput: InputEvent, focus: FocusEvent, blur: FocusEvent, focusin: FocusEvent, focusout: FocusEvent,
   dragstart: DragEvent, drag: DragEvent, dragenter: DragEvent, dragover: DragEvent, dragleave: DragEvent, drop: DragEvent, dragend: DragEvent,
+  touchstart: TouchEvent, touchmove: TouchEvent, touchend: TouchEvent, touchcancel: TouchEvent, gamepadconnected: GamepadEvent, gamepaddisconnected: GamepadEvent,
 };
-const BUBBLES = new Set(['click', 'dblclick', 'auxclick', 'contextmenu', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout', 'pointerdown', 'pointerup', 'pointermove', 'pointerover', 'pointerout', 'wheel', 'keydown', 'keyup', 'keypress', 'input', 'beforeinput', 'focusin', 'focusout', 'dragstart', 'drag', 'dragenter', 'dragover', 'dragleave', 'drop', 'dragend']);
-const NON_CANCELABLE = new Set(['mouseenter', 'mouseleave', 'pointerenter', 'pointerleave', 'focus', 'blur', 'focusin', 'focusout', 'input']);
+const BUBBLES = new Set(['click', 'dblclick', 'auxclick', 'contextmenu', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout', 'pointerdown', 'pointerup', 'pointermove', 'pointerover', 'pointerout', 'wheel', 'keydown', 'keyup', 'keypress', 'input', 'beforeinput', 'focusin', 'focusout', 'dragstart', 'drag', 'dragenter', 'dragover', 'dragleave', 'drop', 'dragend', 'touchstart', 'touchmove', 'touchend', 'touchcancel']);
+const NON_CANCELABLE = new Set(['gamepadconnected', 'gamepaddisconnected', 'mouseenter', 'mouseleave', 'pointerenter', 'pointerleave', 'focus', 'blur', 'focusin', 'focusout', 'input']);
 
 // Called by the platform layer: dispatch a trusted event; returns true if default is NOT prevented.
 function rendrixDispatch(type, targetId, initJson) {
@@ -994,6 +1194,12 @@ function rendrixDispatch(type, targetId, initJson) {
   if (!target) return true;
   if (type === 'click' && target instanceof Element) return dispatchClick(target, { ...init, trusted: true });
   const Cls = EVENT_CLASSES[type] || Event;
+  if (type.startsWith('touch')) {
+    const conv = a => (a || []).map(t => new Touch({ ...t, target: t.targetId === undefined || t.targetId === null ? target : (wrap(t.targetId) || target) }));
+    init.touches = conv(init.touches); init.targetTouches = conv(init.targetTouches); init.changedTouches = conv(init.changedTouches);
+  } else if (type.startsWith('gamepad') && init.gamepad) {
+    init.gamepad = new Gamepad(init.gamepad);
+  }
   const ev = new Cls(type, { bubbles: BUBBLES.has(type), cancelable: !NON_CANCELABLE.has(type), composed: true, ...init });
   if (init.relatedId !== undefined && init.relatedId !== null) ev.relatedTarget = wrap(init.relatedId);
   ev.isTrusted = true;
@@ -1035,7 +1241,7 @@ function runTimer(id) {
 function runRaf(ts) {
   const q = rafQueue; rafQueue = new Map();
   for (const [, cb] of q) { try { cb(ts); } catch (e) { reportError(e); } }
-  checkResize();
+  checkObservers();
   return rafQueue.size > 0;
 }
 
@@ -1052,9 +1258,9 @@ for (const [k, v] of Object.entries({
   Node, CharacterData, Text, Comment, DocumentFragment, Element, HTMLElement, Document, NodeList, HTMLCollection, DOMRect, DOMTokenList, CSSStyleDeclaration,
   HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement, HTMLFormElement, HTMLAnchorElement, HTMLLabelElement, HTMLImageElement, HTMLCanvasElement, HTMLStyleElement, HTMLLinkElement, HTMLScriptElement,
   WebGLRenderingContext, WebGL2RenderingContext, RendrixScene, Rendrix3D, RendrixSceneElement, RendrixSceneHandle,
-  MutationObserver, ResizeObserver, MediaQueryList,
+  MutationObserver, ResizeObserver, IntersectionObserver, MediaQueryList,
   URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, AbortSignal, Headers, Request, Response, Blob, File, FormData, Storage,
-  WebSocket, CloseEvent, DragEvent, DataTransfer, Worker,
+  WebSocket, CloseEvent, DragEvent, DataTransfer, Worker, Touch, TouchEvent, Gamepad, GamepadEvent,
   setTimeout, setInterval, clearTimeout, clearInterval: clearTimeout, setImmediate, clearImmediate: clearTimeout, requestAnimationFrame, cancelAnimationFrame, requestIdleCallback, cancelIdleCallback: clearTimeout, queueMicrotask,
   fetch, atob, btoa, getComputedStyle, matchMedia, reportError,
   structuredClone: v => structuredCloneImpl(v),
@@ -1113,7 +1319,7 @@ for (const type of ON_EVENTS) {
 // Entry points for the Rust side.
 const rendrixApi = { dispatch: rendrixDispatch, timer: runTimer, raf: runRaf, afterTask, fetchDone, viewportChanged, boot, unhandledRejection,
   focus: id => setFocus(id === null ? null : wrap(id)), fireInput: (id, type, data) => fireInputEvents(wrap(id), type, data),
-  checkResize,
+  checkResize, checkIntersections, checkObservers,
   submitForm: id => { const f = wrap(id).closest('form'); if (f) f.requestSubmit(); } };
 for (const [k, v] of Object.entries(rendrixApi)) Object.defineProperty(global, '__rendrix_' + k, { value: v, configurable: true, enumerable: false, writable: false });
 

@@ -1,7 +1,7 @@
 //! The display list: what to draw, in paint order, independent of how the GPU draws it.
 
 use rendrix_css::animation::Matrix;
-use rendrix_css::Color;
+use rendrix_css::{Color, FilterOp};
 use rendrix_layout::InlineContent;
 use std::sync::Arc;
 
@@ -86,6 +86,9 @@ pub enum Item {
     Scene3D(Scene3DItem),
     /// Clip subsequent items to a rounded rectangle until the matching `PopClip`.
     PushClip { rect: [f32; 4], radius: f32 },
+    /// Clip subsequent items to the ellipse inscribed in `rect` until `PopClip`.
+    /// (`clip-path: circle()` / `ellipse()`; paint resolves centres/radii to a box.)
+    PushEllipseClip { rect: [f32; 4] },
     PopClip,
     /// Multiply the current transform (logical pixels) until `PopTransform`.
     PushTransform(Matrix),
@@ -93,6 +96,16 @@ pub enum Item {
     /// Multiply alpha of everything drawn until `PopOpacity` (per-item, not an offscreen group).
     PushOpacity(f32),
     PopOpacity,
+    /// Apply `filter` functions to subsequent items until `PopFilter`. Brightness and
+    /// grayscale are exact pointwise factors; `blur()` is expanded into offset copies
+    /// (a box-blur approximation — true backdrop-independent blur needs an offscreen pass).
+    PushFilter(Vec<FilterOp>),
+    PopFilter,
+    /// `backdrop-filter` marker until `PopBackdrop`. Parsed and stacking-context creating,
+    /// but with no visual effect yet: sampling the backdrop needs an offscreen feedback
+    /// pass the single-draw-call renderer does not have.
+    PushBackdrop(Vec<FilterOp>),
+    PopBackdrop,
 }
 
 #[derive(Debug, Clone)]

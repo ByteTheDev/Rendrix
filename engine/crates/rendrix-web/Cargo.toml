@@ -1,0 +1,29 @@
+[package]
+name = "rendrix-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rendrix for the browser: the engine compiled to WebAssembly, drawing to a WebGPU/WebGL2 canvas"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+rendrix-core.workspace = true
+rendrix-js.workspace = true
+rendrix-gfx.workspace = true
+rendrix-css.workspace = true
+rendrix-dom.workspace = true
+rendrix-runtime = { path = "../rendrix-runtime" }
+wgpu.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["OffscreenCanvas"] }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

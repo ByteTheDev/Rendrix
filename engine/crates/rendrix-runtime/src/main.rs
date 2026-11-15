@@ -4,24 +4,41 @@
 //! rendrix-runtime [run] <dir | app.rdxapp> [--headless] [--screenshot out.png] [--script steps.json] [--size WxH] [--scale S]
 //! rendrix-runtime pack <dir | app.rdxapp> --out app.exe [--runtime path/to/rendrix-runtime.exe]
 //! rendrix-runtime                         (runs the bundle attached to this executable)
+//!
+//! Render outputs (headless only): `--screenshot out.png` (single PNG), `--pdf out.pdf`
+//! (one-page PDF), `--frame-dir dir [--frames N] [--frame-ms MS]` (PNG sequence for /video).
+//! mp4 encoding belongs to /video and is intentionally absent here.
 //! ```
 
+/// Native-only CLI: on wasm32 the app is driven by `rendrix-web`, not this binary.
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 use rendrix_runtime::{bundle::AppBundle, headless::Headless, window};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  rendrix-runtime [run] <dir | app.rdxapp> [--headless] [--screenshot out.png] [--script steps.json] [--size WxH] [--scale S]\n  rendrix-runtime pack <dir | app.rdxapp> --out app[.exe] [--runtime path]\n  rendrix-runtime            (run the bundle attached to this executable)"
+        "usage:\n  rendrix-runtime [run] <dir | app.rdxapp> [--headless] [--screenshot out.png] [--script steps.json] [--size WxH] [--scale S]\n  rendrix-runtime [run] <dir | app.rdxapp> --headless --pdf out.pdf [--size WxH]\n  rendrix-runtime [run] <dir | app.rdxapp> --headless --frame-dir dir [--frames N] [--frame-ms MS] [--size WxH]\n  rendrix-runtime pack <dir | app.rdxapp> --out app[.exe] [--runtime path]\n  rendrix-runtime            (run the bundle attached to this executable)"
     );
     std::process::exit(2);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Args {
     cmd: String,
     path: Option<PathBuf>,
     headless: bool,
     screenshot: Option<PathBuf>,
+    pdf: Option<PathBuf>,
+    frame_dir: Option<PathBuf>,
+    frames: usize,
+    frame_ms: u64,
     script: Option<PathBuf>,
     inspect: Option<PathBuf>,
     size: Option<(u32, u32)>,
@@ -30,9 +47,10 @@ struct Args {
     runtime: Option<PathBuf>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse() -> Args {
     let mut it = std::env::args().skip(1).peekable();
-    let mut a = Args { cmd: "run".into(), path: None, headless: false, screenshot: None, script: None, inspect: None, size: None, scale: 1.0, out: None, runtime: None };
+    let mut a = Args { cmd: "run".into(), path: None, headless: false, screenshot: None, pdf: None, frame_dir: None, frames: 60, frame_ms: 50, script: None, inspect: None, size: None, scale: 1.0, out: None, runtime: None };
     if let Some(first) = it.peek() {
         if first == "run" || first == "pack" || first == "doctor" || first == "bench" {
             a.cmd = it.next().unwrap();
@@ -42,6 +60,10 @@ fn parse() -> Args {
         match arg.as_str() {
             "--headless" => a.headless = true,
             "--screenshot" => a.screenshot = it.next().map(PathBuf::from),
+            "--pdf" => a.pdf = it.next().map(PathBuf::from),
+            "--frame-dir" => a.frame_dir = it.next().map(PathBuf::from),
+            "--frames" => a.frames = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
+            "--frame-ms" => a.frame_ms = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
             "--script" => a.script = it.next().map(PathBuf::from),
             "--inspect" => a.inspect = it.next().map(PathBuf::from),
             "--out" => a.out = it.next().map(PathBuf::from),
@@ -60,6 +82,7 @@ fn parse() -> Args {
     a
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let args = parse();
     if let Err(e) = real_main(args) {
@@ -68,6 +91,7 @@ fn main() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn doctor() -> Result<(), String> {
     println!("Runtime: rendrix-runtime {}", env!("CARGO_PKG_VERSION"));
     println!("JavaScript engine: QuickJS (ES modules, async/await, promises)");
@@ -81,6 +105,7 @@ fn doctor() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn real_main(args: Args) -> Result<(), String> {
     if args.cmd == "doctor" {
         return doctor();
@@ -100,7 +125,7 @@ fn real_main(args: Args) -> Result<(), String> {
         println!("packed '{}' -> {}", bundle.name, out.display());
         return Ok(());
     }
-    if args.headless || args.screenshot.is_some() || args.script.is_some() || args.inspect.is_some() {
+    if args.headless || args.screenshot.is_some() || args.pdf.is_some() || args.frame_dir.is_some() || args.script.is_some() || args.inspect.is_some() {
         let size = args.size.unwrap_or((bundle.width, bundle.height));
         let mut h = Headless::new(&bundle, size, args.scale)?;
         eprintln!("[rendrix] headless on {}", h.adapter);
@@ -121,6 +146,15 @@ fn real_main(args: Args) -> Result<(), String> {
             h.settle(Duration::from_secs(1));
             h.screenshot().save_png(path)?;
             println!("[screenshot] {}", path.display());
+        }
+        if let Some(path) = &args.pdf {
+            h.settle(Duration::from_secs(1));
+            h.screenshot().save_pdf(path)?;
+            println!("[pdf] {}", path.display());
+        }
+        if let Some(dir) = &args.frame_dir {
+            let paths = h.save_frames(dir, args.frames, args.frame_ms)?;
+            println!("[frames] {} frames → {}", paths.len(), dir.display());
         }
         return Ok(());
     }

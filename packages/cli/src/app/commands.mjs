@@ -1,9 +1,10 @@
-// `rendrix` commands for application projects: init, check, build, run, dev, package, doctor.
+// `rendrix` commands for application projects: init, check, build, run, dev, package, doctor, render.
 
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, watch, statSync } from 'node:fs';
-import { readFile, writeFile, mkdir, readdir, copyFile, chmod } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, readdir, copyFile, rm, stat, chmod } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { buildApp, writeBundle, bundleStats, typeCheck, loadProject, BuildError, BUNDLE_FORMAT } from './build.mjs';
 import { writeManifest, resolveSignCommand, signArtifact, notarizeArtifact, findSigntool, findCodesign } from '../signing.mjs';
@@ -332,6 +333,167 @@ export async function doctor(dir) {
   } catch (e) { row(true, 'project', 'no rendrix.json here (fine outside a project)'); void e; }
   console.log(bad ? `\n${bad} problem${bad === 1 ? '' : 's'} found.` : '\nEverything looks good.');
   return bad ? 1 : 0;
+}
+
+// ----- render ---------------------------------------------------------------------------------
+//
+// `rendrix render page.html -o out.png|out.pdf|frames/` renders a single HTML page (or a
+// directory holding one) headlessly: PNG, one-page PDF, or a PNG frame sequence that the
+// /video pipeline consumes for mp4. The page is staged into a temp project (only the page
+// plus the files it references) and built with typechecking off; the runtime does the
+// pixels through the same headless path as `--screenshot`.
+
+/** Classify `-o`: `.png` → screenshot, `.pdf` → PDF, anything else → frame directory. */
+export function renderTarget(out) {
+  const o = String(out || '');
+  if (/\.png$/i.test(o)) return { kind: 'png' };
+  if (/\.pdf$/i.test(o)) return { kind: 'pdf' };
+  return { kind: 'frames' };
+}
+
+function parseRenderSize(size) {
+  const m = /^(\d+)x(\d+)$/.exec(String(size || '1280x720'));
+  const w = m ? Number(m[1]) : NaN, h = m ? Number(m[2]) : NaN;
+  if (!Number.isInteger(w) || !Number.isInteger(h) || w < 100 || h < 100 || w > 8192 || h > 8192) {
+    throw new BuildError(`render: --size must be WxH like 1280x720 (got '${size}')`);
+  }
+  return { w, h };
+}
+
+const RENDER_SKIP_DIRS = new Set(['node_modules', 'dist', '.git', '.rendrix', 'target']);
+const RENDER_MAX_FILE = 8 * 1024 * 1024;
+
+function isRemote(ref) {
+  return /^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith('data:') || ref.startsWith('#');
+}
+
+function cleanRef(ref) {
+  return ref.split('#')[0].split('?')[0].trim();
+}
+
+/** Relative file references out of an HTML / CSS / JS source (first pass, regex-based). */
+function scanRefs(kind, text) {
+  const out = new Set();
+  const push = r => {
+    let c = cleanRef(r);
+    if (!c || isRemote(c)) return;
+    if (c.startsWith('/')) c = c.replace(/^\/+/, ''); // site-rooted: resolve against the page directory, like buildApp
+    if (c) out.add(c);
+  };
+  if (kind === 'html') {
+    for (const m of text.matchAll(/(?:src|href)\s*=\s*"([^"]+)"|(?:src|href)\s*=\s*'([^']+)'/gi)) push(m[1] ?? m[2]);
+  } else if (kind === 'css') {
+    for (const m of text.matchAll(/url\(\s*"([^"]+)"\s*\)|url\(\s*'([^']+)'\s*\)|url\(\s*([^"'()\s][^()\s]*)\s*\)/gi)) push(m[1] ?? m[2] ?? m[3]);
+  } else {
+    for (const m of text.matchAll(/(?:import\s+(?:[^'"]*?\s+from\s+)?|export\s+[^'"]*?\s+from\s+|import\()\s*["']([^"']+)["']/g)) push(m[1]);
+  }
+  return out;
+}
+
+/**
+ * Stage a single page plus the files it references into `dst`.
+ * `srcDir` is the page's directory (references resolve against it and must stay inside it).
+ */
+async function stagePage(srcDir, entryRel, dst, warnings) {
+  const seen = new Set();
+  async function stage(rel) {
+    const norm = path.normalize(rel);
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    const abs = path.resolve(srcDir, norm);
+    const under = path.relative(srcDir, abs);
+    if (under.startsWith('..') || path.isAbsolute(under)) { warnings.push(`render: reference '${rel}' escapes the page directory and was skipped`); return; }
+    let bytes;
+    try {
+      const info = await stat(abs);
+      if (info.isDirectory()) return;
+      if (info.size > RENDER_MAX_FILE) { warnings.push(`render: '${rel}' is larger than 8 MB and was skipped`); return; }
+      bytes = await readFile(abs);
+    } catch { warnings.push(`render: referenced file '${rel}' was not found and was skipped`); return; }
+    await mkdir(path.dirname(path.join(dst, under)), { recursive: true });
+    await writeFile(path.join(dst, under), bytes);
+    const text = bytes.toString('utf8');
+    const kind = /\.css$/i.test(under) ? 'css' : /\.(m?[jt]sx?)$/i.test(under) ? 'js' : null;
+    if (kind && !text.includes('\uFFFD')) {
+      for (const r of scanRefs(kind, text)) await stage(path.join(path.dirname(under), r).replace(/\\/g, '/'));
+    }
+  }
+  const html = await readFile(path.resolve(srcDir, entryRel), 'utf8');
+  for (const r of scanRefs('html', html)) await stage(r);
+}
+
+/** Copy a whole page directory minus tool output dirs and oversized files. */
+async function stageDir(srcDir, dst, warnings) {
+  async function walk(dir) {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      if (e.name.startsWith('.') || RENDER_SKIP_DIRS.has(e.name)) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { await walk(full); continue; }
+      const rel = path.relative(srcDir, full);
+      const info = await stat(full);
+      if (info.size > RENDER_MAX_FILE) { warnings.push(`render: '${rel}' is larger than 8 MB and was skipped`); continue; }
+      await mkdir(path.dirname(path.join(dst, rel)), { recursive: true });
+      await copyFile(full, path.join(dst, rel));
+    }
+  }
+  await walk(srcDir);
+}
+
+export async function render(input, opts = {}) {
+  const { w, h } = parseRenderSize(opts.size);
+  const scale = Number(opts.scale ?? 1);
+  if (!(scale > 0) || scale > 4) throw new BuildError(`render: --scale must be between 0 and 4 (got '${opts.scale}')`);
+  const target = renderTarget(opts.out || 'frames/');
+  if (/\.mp4$/i.test(String(opts.out || ''))) {
+    throw new BuildError('render: mp4 output belongs to the /video pipeline (`rendrix render` writes PNG, PDF or a PNG frame sequence for it to consume)');
+  }
+  const src = path.resolve(input);
+  const st = existsSync(src) ? statSync(src) : null;
+  if (!st) throw new BuildError(`render: '${input}' does not exist`);
+  if (st.isFile() && !/\.html?$/i.test(src)) throw new BuildError(`render: '${input}' is not an HTML file (pass a .html page or a directory)`);
+  const rt = needRuntime();
+  const out = path.resolve(opts.out || 'frames/');
+  const frames = Math.max(1, Math.min(3600, Number(opts.frames ?? 60) || 60));
+  const frameMs = Math.max(0, Math.min(10_000, Number(opts.frameMs ?? opts.frame_ms ?? 50) || 0));
+
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'rendrix-render-'));
+  try {
+    const warnings = [];
+    let entry = 'index.html';
+    if (st.isDirectory()) {
+      await stageDir(src, tmp, warnings);
+      if (!existsSync(path.join(tmp, 'index.html'))) {
+        const htmls = (await readdir(tmp)).filter(f => /\.html?$/i.test(f)).sort();
+        if (!htmls.length) throw new BuildError(`render: no .html file in '${input}'`);
+        entry = htmls[0];
+      }
+    } else {
+      if (!/\.html?$/i.test(src)) throw new BuildError(`render: '${input}' is not an HTML file (pass a .html page or a directory)`);
+      const dir = path.dirname(src);
+      await stagePage(dir, path.basename(src), tmp, warnings);
+      await copyFile(src, path.join(tmp, 'index.html'));
+    }
+    await writeFile(path.join(tmp, 'rendrix.json'), JSON.stringify({ name: 'render', window: { width: w, height: h }, entry }));
+    const { bundle, warnings: buildWarnings } = await buildApp(tmp, { typecheck: false });
+    for (const warnText of [...warnings, ...buildWarnings]) warn(warnText);
+    const bundlePath = path.join(tmp, 'page.rdxapp');
+    await writeBundle(bundle, bundlePath);
+    const args = ['run', bundlePath, '--headless', '--size', `${w}x${h}`, '--scale', String(scale)];
+    if (opts.script) args.push('--script', path.resolve(opts.script));
+    if (target.kind === 'png') args.push('--screenshot', out);
+    else if (target.kind === 'pdf') args.push('--pdf', out);
+    else {
+      await mkdir(out, { recursive: true });
+      args.push('--frame-dir', out, '--frames', String(frames), '--frame-ms', String(frameMs));
+    }
+    const r = spawnSync(rt, args, { stdio: 'inherit' });
+    if (r.status !== 0) throw new BuildError(`render failed (runtime exit ${r.status ?? 'unknown'})`);
+    if (target.kind === 'frames') ok(`rendered ${frames} frame${frames === 1 ? '' : 's'} (${w}x${h}@${scale}x) → ${path.relative(process.cwd(), out) || '.'}`);
+    else ok(`rendered ${w}x${h}@${scale}x → ${path.relative(process.cwd(), out)}`);
+    return { out, kind: target.kind };
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
 }
 
 export { BUNDLE_FORMAT };

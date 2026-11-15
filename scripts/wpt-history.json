@@ -1,0 +1,84 @@
+[
+  {
+    "date": "2026-11-15",
+    "pass": 15,
+    "total": 15,
+    "cases": [
+      {
+        "name": "table-2x2-grid",
+        "pass": true,
+        "detail": "4/4"
+      },
+      {
+        "name": "table-sections-caption-col",
+        "pass": true,
+        "detail": "4/4"
+      },
+      {
+        "name": "table-explicit-roles",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "table-ua-defaults",
+        "pass": true,
+        "detail": "3/3"
+      },
+      {
+        "name": "float-left-pin",
+        "pass": true,
+        "detail": "3/3"
+      },
+      {
+        "name": "float-right-pin",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "clear-below-float",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "float-clear-computed",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "multicol-count-2",
+        "pass": true,
+        "detail": "5/5"
+      },
+      {
+        "name": "multicol-span-all",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "multicol-columns-shorthand",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "guard-flex-row",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "guard-grid-columns",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "guard-block-percent-padding",
+        "pass": true,
+        "detail": "2/2"
+      },
+      {
+        "name": "guard-absolute-position",
+        "pass": true,
+        "detail": "2/2"
+      }
+    ]
+  }
+]

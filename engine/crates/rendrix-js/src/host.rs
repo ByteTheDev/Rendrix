@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Instant;
+use web_time::Instant;
 
 #[derive(Debug, Clone, Default)]
 pub struct Permissions {
@@ -68,6 +68,19 @@ pub const TAG_UPDATE: &str = "rendrix:update";
 /// Maximum WebSocket messages delivered to script per frame; the rest wait for the next tick.
 pub const WS_MAX_PER_TICK: usize = 16;
 
+/// One outbound HTTP request handed to a platform backend (see `DomHost::http_backend`). The backend
+/// completes it by sending exactly one `FetchResult` (with `releases_slot: true`) on `reply`.
+pub struct HttpRequest {
+    pub id: u32,
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub reply: Sender<FetchResult>,
+}
+
+pub type HttpBackend = Rc<dyn Fn(HttpRequest)>;
+
 #[derive(Default)]
 struct Storage {
     local: BTreeMap<String, String>,
@@ -84,11 +97,20 @@ impl Storage {
         }
     }
     fn persist(&self) {
-        if let Some(p) = &self.path {
-            if let Some(dir) = p.parent() {
-                let _ = std::fs::create_dir_all(dir);
+        // The web target keeps storage in memory only (a browser-localStorage hook is follow-up
+        // work); the file write below is native-only.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(p) = &self.path {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(p, serde_json::to_string(&self.local).unwrap_or_default());
             }
-            let _ = std::fs::write(p, serde_json::to_string(&self.local).unwrap_or_default());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = &self.path;
         }
     }
 }
@@ -116,6 +138,16 @@ pub struct DomHost {
     /// `window.close()` on a secondary window (main-window close still uses `WindowCommand::Close`).
     pub window_close_requests: Vec<u32>,
     pub clipboard: String,
+    /// Connected gamepads as a JSON array in Gamepad-API shape (`index`, `id`, `axes`, `buttons`); read by `navigator.getGamepads()`.
+    pub gamepads_json: String,
+    /// `navigator.maxTouchPoints` (0 on devices without a touch screen).
+    pub max_touch_points: u32,
+    /// Browser/platform HTTP implementation (wasm has no threads or sockets); native builds use `ureq`.
+    pub http_backend: Option<HttpBackend>,
+    /// Randomness source for `crypto.getRandomValues` where the OS RNG is not reachable from Rust (wasm).
+    pub rng: Option<Box<dyn FnMut() -> f64>>,
+    /// `rendrix.shell.openExternal(url)` requests the platform shell should open (wasm; native spawns the OS handler directly).
+    pub external_urls: Vec<String>,
     pub quit_requested: bool,
     pub app_name: String,
     /// Test seam: when set, `dialog_open`/`dialog_save` resolve immediately with this value
@@ -224,18 +256,24 @@ impl DomHost {
     pub fn new(engine: Rc<RefCell<Engine>>, app_name: &str, permissions: Permissions) -> DomHost {
         let (fetch_tx, fetch_rx) = channel();
         let (cookie_tx, cookie_rx) = channel();
+        // `mut` is needed only where the file-backed store is wired up (native).
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut storage = Storage::default();
-        // localStorage lives in the per-user data directory, keyed by app name.
-        let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("XDG_DATA_HOME")).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-        if let Some(base) = base {
-            let safe: String = app_name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-            let p = base.join("Rendrix").join(safe).join("localStorage.json");
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Ok(m) = serde_json::from_str(&text) {
-                    storage.local = m;
+        // Native-only: localStorage lives in the per-user data directory, keyed by app name. The
+        // web target keeps storage in memory (browser-localStorage hook is follow-up work).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("XDG_DATA_HOME")).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+            if let Some(base) = base {
+                let safe: String = app_name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+                let p = base.join("Rendrix").join(safe).join("localStorage.json");
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    if let Ok(m) = serde_json::from_str(&text) {
+                        storage.local = m;
+                    }
                 }
+                storage.path = Some(p);
             }
-            storage.path = Some(p);
         }
         DomHost {
             engine,
@@ -256,6 +294,11 @@ impl DomHost {
             window_open_requests: Vec::new(),
             window_close_requests: Vec::new(),
             clipboard: String::new(),
+            gamepads_json: "[]".to_string(),
+            max_touch_points: 0,
+            http_backend: None,
+            rng: None,
+            external_urls: Vec::new(),
             quit_requested: false,
             app_name: app_name.to_string(),
             dialog_mock: None,
@@ -345,6 +388,15 @@ impl DomHost {
     }
 
     /// A uniform f64 in [0, 1) from the operating system's CSPRNG (backs `crypto.getRandomValues`).
+    #[cfg(target_arch = "wasm32")]
+    fn rand(&mut self) -> f64 {
+        match self.rng.as_mut() {
+            Some(f) => f(),
+            None => panic!("no random number source installed for this platform"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn rand(&mut self) -> f64 {
         let mut buf = [0u8; 8];
         if getrandom::getrandom(&mut buf).is_err() {
@@ -400,6 +452,18 @@ impl DomHost {
                 }
             }
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (&cookie_tx, &req_host);
+            match self.http_backend.clone() {
+                Some(backend) => backend(HttpRequest { id: fid, url, method, headers, body, reply: tx }),
+                None => {
+                    self.pending_fetches = self.pending_fetches.saturating_sub(1);
+                    self.immediate_fetches.push(fail(fid, "no network backend is available on this platform".into()));
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn(move || {
             let mut req = ureq::request(&method, &url).timeout(std::time::Duration::from_secs(60));
             for (k, v) in &headers {
@@ -434,12 +498,21 @@ impl DomHost {
     }
 
     fn fs_allowed(list: &[PathBuf], path: &str) -> Option<PathBuf> {
-        let p = std::fs::canonicalize(path).ok().or_else(|| {
-            // For writes to new files: canonicalise the parent.
-            let pb = PathBuf::from(path);
-            pb.parent().and_then(|d| std::fs::canonicalize(d).ok()).map(|d| d.join(pb.file_name().unwrap_or_default()))
-        })?;
-        list.iter().any(|root| std::fs::canonicalize(root).map(|r| p.starts_with(r)).unwrap_or(false)).then_some(p)
+        // No filesystem on the web target: every fs op fails with the permission error below.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (list, path);
+            return None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let p = std::fs::canonicalize(path).ok().or_else(|| {
+                // For writes to new files: canonicalise the parent.
+                let pb = PathBuf::from(path);
+                pb.parent().and_then(|d| std::fs::canonicalize(d).ok()).map(|d| d.join(pb.file_name().unwrap_or_default()))
+            })?;
+            list.iter().any(|root| std::fs::canonicalize(root).map(|r| p.starts_with(r)).unwrap_or(false)).then_some(p)
+        }
     }
 
     // ------------------------------------------------------------------------------------
@@ -498,6 +571,15 @@ impl DomHost {
                     .collect()
             })
             .unwrap_or_default();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (&title, &default_path, directory, multiple, &filters, save);
+            // No OS dialog hook on the web target: reject actionably (the prelude resolves `null`
+            // only when no error is attached) instead of pretending the user cancelled.
+            self.immediate_fetches.push(FetchResult { id, status: 0, status_text: TAG_DIALOG.into(), headers: vec![], body: b"null".to_vec(), error: Some("file dialogs are not available on the web target (use an <input type=file> element instead)".into()), releases_slot: false });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
         self.pending_fetches += 1;
         let tx = self.fetch_tx.clone();
         std::thread::spawn(move || {
@@ -523,11 +605,23 @@ impl DomHost {
             let body = serde_json::to_vec(&paths).unwrap_or_default();
             let _ = tx.send(FetchResult { id, status: 0, status_text: TAG_DIALOG.into(), headers: vec![], body, error: None, releases_slot: true });
         });
+        }
     }
 
     /// Open a URL in the OS default handler (browser, mail client). Fire-and-forget: the child
     /// process is spawned detached and never blocks the frame loop.
-    fn open_external(url: &str) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    fn open_external(&mut self, url: &str) -> Result<(), String> {
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")) {
+            return Err("openExternal only supports http(s) and mailto URLs".to_string());
+        }
+        self.external_urls.push(url.to_string());
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_external(&mut self, url: &str) -> Result<(), String> {
         let lower = url.to_ascii_lowercase();
         if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")) {
             return Err("openExternal only supports http(s) and mailto URLs".to_string());
@@ -546,6 +640,12 @@ impl DomHost {
     // completion events (capped at WS_MAX_PER_TICK messages per tick in `poll_fetches`).
     // ------------------------------------------------------------------------------------
 
+    #[cfg(target_arch = "wasm32")]
+    fn start_ws(&mut self, id: u32, _url: String, _protocols: Vec<String>, _origin: Option<String>) {
+        self.immediate_fetches.push(FetchResult { id, status: 1006, status_text: TAG_WS_ERROR.into(), headers: vec![], body: b"WebSocket is not available on the web target yet".to_vec(), error: None, releases_slot: false });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_ws(&mut self, id: u32, url: String, protocols: Vec<String>, origin: Option<String>) {
         // Local echo servers and tests use plain ws://; anything else needs permission.
         let is_local = url_host(&url).is_some_and(|h| h == "localhost" || h == "127.0.0.1" || h == "[::1]" || h == "::1");
@@ -666,6 +766,12 @@ impl DomHost {
     // Minimal update client (S1): manifest check → hashed download → staged install.
     // ------------------------------------------------------------------------------------
 
+    #[cfg(target_arch = "wasm32")]
+    fn start_update_check(&mut self, id: u32, _feed_url: String, _current: String) {
+        self.immediate_fetches.push(FetchResult { id, status: 0, status_text: TAG_UPDATE.into(), headers: vec![], body: br#"{"error":"app updates do not apply to the web target"}"#.to_vec(), error: None, releases_slot: false });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_update_check(&mut self, id: u32, feed_url: String, current: String) {
         if !self.permissions.network {
             self.immediate_fetches.push(FetchResult { id, status: 0, status_text: TAG_UPDATE.into(), headers: vec![], body: br#"{"error":"network access is not permitted for this app"}"#.to_vec(), error: None, releases_slot: false });
@@ -689,6 +795,12 @@ impl DomHost {
         });
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn start_update_download(&mut self, id: u32, _url: String, _sha256: String) {
+        self.immediate_fetches.push(FetchResult { id, status: 0, status_text: TAG_UPDATE.into(), headers: vec![], body: br#"{"error":"app updates do not apply to the web target"}"#.to_vec(), error: None, releases_slot: false });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_update_download(&mut self, id: u32, url: String, sha256: String) {
         if !self.permissions.network {
             self.immediate_fetches.push(FetchResult { id, status: 0, status_text: TAG_UPDATE.into(), headers: vec![], body: br#"{"error":"network access is not permitted for this app"}"#.to_vec(), error: None, releases_slot: false });
@@ -740,6 +852,12 @@ impl DomHost {
         });
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn update_install(&mut self, _staged: &str) -> Result<(), String> {
+        Err("app updates do not apply to the web target".to_string())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn update_install(&mut self, staged: &str) -> Result<(), String> {
         let staged = PathBuf::from(staged);
         if !staged.is_file() {
@@ -1151,6 +1269,20 @@ impl Host for DomHost {
                     None => Val::Null,
                 }
             }
+            "box_sizes" => {
+                let mut e = doc!();
+                e.set_time(self.start.elapsed().as_secs_f64());
+                e.ensure_layout();
+                match e.box_sizes(id(a, 0)?) {
+                    Some((bw, bh, cw, ch)) => Val::List(vec![
+                        Val::Num(bw as f64),
+                        Val::Num(bh as f64),
+                        Val::Num(cw as f64),
+                        Val::Num(ch as f64),
+                    ]),
+                    None => Val::Null,
+                }
+            }
             "scroll_metrics" => {
                 let mut e = doc!();
                 e.set_time(self.start.elapsed().as_secs_f64());
@@ -1189,6 +1321,8 @@ impl Host for DomHost {
                 e.ensure_layout();
                 Val::from_opt_id(e.hit_test(num(a, 0) as f32, num(a, 1) as f32))
             }
+            "gamepads" => Val::Str(self.gamepads_json.clone()),
+            "touch_points" => Val::Num(self.max_touch_points as f64),
             "viewport" => {
                 let e = doc!();
                 Val::List(vec![Val::Num(e.viewport.0 as f64), Val::Num(e.viewport.1 as f64), Val::Num(e.scale as f64)])
@@ -1369,7 +1503,7 @@ impl Host for DomHost {
                 Val::Undefined
             }
             "open_external" => {
-                Self::open_external(&s(a, 0))?;
+                self.open_external(&s(a, 0))?;
                 Val::Undefined
             }
             // ---- multi-window requests (A1): drained by the platform shell, never blocking ----
@@ -1936,8 +2070,9 @@ mod host_tests {
 
     #[test]
     fn open_external_rejects_non_web_schemes() {
-        assert!(DomHost::open_external("file:///etc/passwd").is_err());
-        assert!(DomHost::open_external("javascript:alert(1)").is_err());
+        let mut h = host();
+        assert!(h.open_external("file:///etc/passwd").is_err());
+        assert!(h.open_external("javascript:alert(1)").is_err());
     }
 
     #[test]

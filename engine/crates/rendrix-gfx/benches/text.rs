@@ -13,7 +13,7 @@ fn content(text: &str, size: f32) -> InlineContent {
     let mut s = ComputedStyle::default();
     s.font_size = size;
     let s = Arc::new(s);
-    InlineContent { runs: vec![InlineRun { text: text.into(), style: s.clone(), node: 1, is_break: false }], container: s }
+    InlineContent::new(vec![InlineRun { text: text.into(), style: s.clone(), node: 1, is_break: false }], s)
 }
 
 fn bench_paragraph_hit(c: &mut Criterion) {

@@ -34,7 +34,7 @@ impl Engine {
     }
 
     pub fn style_context(&self) -> StyleContext {
-        StyleContext { viewport_w: self.viewport.0, viewport_h: self.viewport.1, root_font_size: 16.0 }
+        StyleContext { viewport_w: self.viewport.0, viewport_h: self.viewport.1, root_font_size: 16.0, safe_area: self.safe_area, keyboard_h: self.keyboard_h }
     }
 
     /// Re-collect `<style>` and `<link rel=stylesheet>` sheets when they or the media context changed.

@@ -10,11 +10,15 @@ pub struct StyleContext {
     pub viewport_w: f32,
     pub viewport_h: f32,
     pub root_font_size: f32,
+    /// `env(safe-area-inset-top/right/bottom/left)` in CSS px (notches, rounded corners, system bars).
+    pub safe_area: [f32; 4],
+    /// `env(keyboard-inset-height)` in CSS px: the on-screen keyboard overlapping the viewport.
+    pub keyboard_h: f32,
 }
 
 impl Default for StyleContext {
     fn default() -> Self {
-        StyleContext { viewport_w: 800.0, viewport_h: 600.0, root_font_size: 16.0 }
+        StyleContext { viewport_w: 800.0, viewport_h: 600.0, root_font_size: 16.0, safe_area: [0.0; 4], keyboard_h: 0.0 }
     }
 }
 
@@ -37,6 +41,7 @@ pub fn is_inherited_property(name: &str) -> bool {
             | "text-align"
             | "text-transform"
             | "white-space"
+            | "text-shadow"
             | "visibility"
             | "cursor"
             | "caret-color"
@@ -76,6 +81,12 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) -> bo
     }
     match name {
         "display" => cp!(display),
+        "float" => cp!(float),
+        "clear" => cp!(clear),
+        "column-count" => cp!(column_count),
+        "column-width" => cp!(column_width),
+        "column-span" => cp!(column_span_all),
+        "columns" => cp!(column_count, column_width),
         "position" => cp!(position),
         "top" => {
             dst.inset[0] = src.inset[0];
@@ -103,6 +114,7 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) -> bo
         "pointer-events" => cp!(pointer_events),
         "cursor" => cp!(cursor),
         "user-select" => cp!(user_select),
+        "touch-action" => cp!(touch_action),
         "width" => cp!(width),
         "height" => cp!(height),
         "min-width" => cp!(min_width),
@@ -156,17 +168,25 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) -> bo
         "text-transform" => cp!(text_transform),
         "white-space" => cp!(white_space),
         "text-overflow" => cp!(text_overflow_ellipsis),
+        "text-shadow" => cp!(text_shadow),
+        "filter" => cp!(filter),
+        "backdrop-filter" => cp!(backdrop_filter),
+        "clip-path" => cp!(clip_path),
+        "mask-image" | "mask" => cp!(mask_image),
         "caret-color" => cp!(caret_color),
         "list-style" | "list-style-type" => cp!(list_style_none),
         "transition" => cp!(transitions),
         "animation" => cp!(animations),
         "grid-template-columns" => cp!(grid_template_columns),
         "grid-template-rows" => cp!(grid_template_rows),
+        "grid-template-areas" => cp!(grid_template_areas),
+        "grid-template" => cp!(grid_template_columns, grid_template_rows, grid_template_areas),
         "grid-auto-columns" => cp!(grid_auto_columns),
         "grid-auto-rows" => cp!(grid_auto_rows),
         "grid-auto-flow" => cp!(grid_auto_flow),
         "grid-column" => cp!(grid_column),
         "grid-row" => cp!(grid_row),
+        "grid-area" => cp!(grid_area, grid_column, grid_row),
         _ => false,
     }
 }
@@ -239,6 +259,60 @@ fn apply_inner(
 ) -> Option<()> {
     match name {
         "display" => st.display = Display::parse(v)?,
+        "float" => st.float = Float::parse(v)?,
+        "clear" => st.clear = Clear::parse(v)?,
+        "column-count" => {
+            st.column_count = if v.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                Some(v.parse::<u16>().ok().filter(|n| *n >= 1)?)
+            };
+        }
+        "column-width" => {
+            st.column_width = if v.eq_ignore_ascii_case("auto") { Dim::Auto } else { non_negative(parse_length(v, cx)?)? };
+        }
+        "columns" => {
+            // `<column-width> || <column-count>`, either order, `auto` allowed for both.
+            let mut count = Dim::Auto;
+            let mut width = Dim::Auto;
+            let mut seen_count = false;
+            let mut seen_width = false;
+            for tok in split_ws(v) {
+                if tok.eq_ignore_ascii_case("auto") {
+                    continue;
+                } else if let Ok(n) = tok.parse::<u16>() {
+                    if seen_count || n < 1 {
+                        return None;
+                    }
+                    seen_count = true;
+                    count = Dim::Px(n as f32);
+                } else if let Some(d) = parse_length(&tok, cx) {
+                    if seen_width || matches!(d, Dim::Percent(..) | Dim::Calc(..)) {
+                        return None;
+                    }
+                    if matches!(d, Dim::Px(px) if px < 0.0) {
+                        return None;
+                    }
+                    seen_width = true;
+                    width = d;
+                } else {
+                    return None;
+                }
+            }
+            if let Dim::Px(n) = count {
+                st.column_count = Some(n as u16);
+            }
+            if !matches!(width, Dim::Auto) {
+                st.column_width = width;
+            }
+        }
+        "column-span" => {
+            st.column_span_all = match v.to_ascii_lowercase().as_str() {
+                "none" => false,
+                "all" => true,
+                _ => return None,
+            };
+        },
         "position" => st.position = Position::parse(v)?,
         "top" | "right" | "bottom" | "left" => {
             let i = ["top", "right", "bottom", "left"].iter().position(|n| *n == name)?;
@@ -279,6 +353,7 @@ fn apply_inner(
             st.cursor = split_commas(v).iter().find_map(|c| Cursor::parse(c))?;
         }
         "user-select" => st.user_select = UserSelect::parse(v)?,
+        "touch-action" => st.touch_action = parse_touch_action(v)?,
         "width" => st.width = non_negative(parse_length(v, cx)?)?,
         "height" => st.height = non_negative(parse_length(v, cx)?)?,
         "min-width" => st.min_width = non_negative(parse_length(v, cx)?)?,
@@ -498,20 +573,41 @@ fn apply_inner(
         // ----- grid -----
         "grid-template-columns" => st.grid_template_columns = parse_track_list(v, cx)?,
         "grid-template-rows" => st.grid_template_rows = parse_track_list(v, cx)?,
+        "grid-template-areas" => st.grid_template_areas = parse_grid_template_areas(v)?,
         "grid-template" => {
             let (rows, cols) = v.split_once('/')?;
             st.grid_template_rows = parse_track_list(rows, cx)?;
             st.grid_template_columns = parse_track_list(cols, cx)?;
+            st.grid_template_areas = Vec::new();
         }
         "grid-auto-columns" => st.grid_auto_columns = split_ws(v).iter().map(|t| parse_track(t, cx)).collect::<Option<_>>()?,
         "grid-auto-rows" => st.grid_auto_rows = split_ws(v).iter().map(|t| parse_track(t, cx)).collect::<Option<_>>()?,
         "grid-auto-flow" => st.grid_auto_flow = GridAutoFlow::parse(v)?,
-        "grid-column" => st.grid_column = parse_grid_placement(v)?,
-        "grid-row" => st.grid_row = parse_grid_placement(v)?,
-        "grid-column-start" => st.grid_column.0 = parse_grid_line(v)?,
-        "grid-column-end" => st.grid_column.1 = parse_grid_line(v)?,
-        "grid-row-start" => st.grid_row.0 = parse_grid_line(v)?,
-        "grid-row-end" => st.grid_row.1 = parse_grid_line(v)?,
+        "grid-column" => {
+            st.grid_column = parse_grid_placement(v)?;
+            st.grid_area = None;
+        }
+        "grid-row" => {
+            st.grid_row = parse_grid_placement(v)?;
+            st.grid_area = None;
+        }
+        "grid-column-start" => {
+            st.grid_column.0 = parse_grid_line(v)?;
+            st.grid_area = None;
+        }
+        "grid-column-end" => {
+            st.grid_column.1 = parse_grid_line(v)?;
+            st.grid_area = None;
+        }
+        "grid-row-start" => {
+            st.grid_row.0 = parse_grid_line(v)?;
+            st.grid_area = None;
+        }
+        "grid-row-end" => {
+            st.grid_row.1 = parse_grid_line(v)?;
+            st.grid_area = None;
+        }
+        "grid-area" => parse_grid_area(v, st)?,
 
         // ----- paint -----
         "color" => st.color = Color::parse(v, parent.color)?,
@@ -660,6 +756,14 @@ fn apply_inner(
         "white-space" => st.white_space = WhiteSpace::parse(v)?,
         "list-style" | "list-style-type" => st.list_style_none = v.split_whitespace().any(|t| t.eq_ignore_ascii_case("none")),
         "text-overflow" => st.text_overflow_ellipsis = matches!(v.to_ascii_lowercase().as_str(), "ellipsis"),
+        "text-shadow" => st.text_shadow = parse_text_shadows(v, st.color, cx)?,
+        "filter" => st.filter = parse_filter_ops(v, cx)?,
+        "backdrop-filter" | "-webkit-backdrop-filter" => st.backdrop_filter = parse_filter_ops(v, cx)?,
+        "clip-path" => st.clip_path = parse_clip_path(v, cx)?,
+        "mask-image" | "-webkit-mask-image" => {
+            st.mask_image = if v.trim().eq_ignore_ascii_case("none") { None } else { Some(extract_mask_url(v)?) };
+        }
+        "mask" => st.mask_image = extract_mask_url(v),
 
         // ----- motion -----
         "transition" => st.transitions = parse_transitions(v)?,
@@ -756,6 +860,10 @@ fn parse_font_size(v: &str, pcx: &LengthContext, parent_size: f32) -> Option<f32
     match parse_length(v, pcx)? {
         Dim::Px(p) if p >= 0.0 => Some(p),
         Dim::Percent(p) if p >= 0.0 => Some(parent_size * p / 100.0),
+        Dim::Calc(pct, px) => {
+            let r = parent_size * pct / 100.0 + px;
+            (r >= 0.0).then_some(r)
+        }
         _ => None,
     }
 }
@@ -780,6 +888,10 @@ fn parse_line_height(v: &str, cx: &LengthContext) -> Option<LineHeight> {
     match parse_length(v, cx)? {
         Dim::Px(p) if p >= 0.0 => Some(LineHeight::Px(p)),
         Dim::Percent(p) if p >= 0.0 => Some(LineHeight::Px(cx.font_size * p / 100.0)),
+        Dim::Calc(pct, px) => {
+            let r = cx.font_size * pct / 100.0 + px;
+            (r >= 0.0).then_some(LineHeight::Px(r))
+        }
         _ => None,
     }
 }
@@ -816,6 +928,8 @@ fn parse_track(t: &str, cx: &LengthContext) -> Option<TrackSize> {
         Dim::Px(p) => Some(TrackSize::Px(p)),
         Dim::Percent(p) => Some(TrackSize::Percent(p)),
         Dim::Auto => Some(TrackSize::Auto),
+        // Mixed calc() in tracks would need layout-time resolution; reject for now.
+        Dim::Calc(..) => None,
     }
 }
 
@@ -868,6 +982,93 @@ fn parse_grid_placement(v: &str) -> Option<(GridLine, GridLine)> {
     }
 }
 
+fn is_area_ident(s: &str) -> bool {
+    if s.is_empty() || s == "." {
+        return s == ".";
+    }
+    if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("none") {
+        return false;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' || c == '-' || !c.is_ascii() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+}
+
+/// Parse `grid-template-areas`: a sequence of quoted strings, each a whitespace-separated
+/// row of area names (`.` = empty). All rows must have the same column count.
+fn parse_grid_template_areas(v: &str) -> Option<Vec<Vec<String>>> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    let toks = split_ws(v);
+    if toks.is_empty() {
+        return None;
+    }
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for tok in &toks {
+        let t = tok.trim();
+        let inner = if (t.starts_with('"') && t.ends_with('"') || t.starts_with('\'') && t.ends_with('\'')) && t.len() >= 2 {
+            &t[1..t.len() - 1]
+        } else {
+            return None;
+        };
+        let row: Vec<String> = inner.split_whitespace().map(|s| s.to_string()).collect();
+        if row.is_empty() {
+            return None;
+        }
+        for name in &row {
+            if !is_area_ident(name) {
+                return None;
+            }
+        }
+        out.push(row);
+    }
+    let cols = out[0].len();
+    if out.iter().any(|r| r.len() != cols) {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse `grid-area`: either a single area name (`header`) or explicit
+/// `row-start / column-start [/ row-end [/ column-end]]` placement.
+fn parse_grid_area(v: &str, st: &mut ComputedStyle) -> Option<()> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        st.grid_area = None;
+        st.grid_column = (GridLine::Auto, GridLine::Auto);
+        st.grid_row = (GridLine::Auto, GridLine::Auto);
+        return Some(());
+    }
+    if v.contains('/') {
+        let parts: Vec<String> = v.split('/').map(|s| s.trim().to_string()).collect();
+        if parts.len() > 4 || parts.is_empty() {
+            return None;
+        }
+        let lines: Vec<GridLine> = parts.iter().map(|p| parse_grid_line(p)).collect::<Option<_>>()?;
+        let (rs, cs, re, ce) = match lines.len() {
+            1 => (lines[0], GridLine::Auto, GridLine::Auto, GridLine::Auto),
+            2 => (lines[0], lines[1], GridLine::Auto, GridLine::Auto),
+            3 => (lines[0], lines[1], lines[2], GridLine::Auto),
+            _ => (lines[0], lines[1], lines[2], lines[3]),
+        };
+        st.grid_row = (rs, re);
+        st.grid_column = (cs, ce);
+        st.grid_area = None;
+        return Some(());
+    }
+    if !is_area_ident(v) || v == "." {
+        return None;
+    }
+    st.grid_area = Some(v.to_string());
+    st.grid_column = (GridLine::Auto, GridLine::Auto);
+    st.grid_row = (GridLine::Auto, GridLine::Auto);
+    Some(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // backgrounds, shadows, transforms
 // ---------------------------------------------------------------------------------------------
@@ -892,6 +1093,175 @@ fn parse_background_images(v: &str, cur: Color) -> Option<Vec<BackgroundImage>> 
         return Some(Vec::new());
     }
     split_commas(v).iter().map(|l| parse_background_image(l, cur)).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// filter, text-shadow, clip-path, mask (approved subsets)
+// ---------------------------------------------------------------------------------------------
+
+/// Parse a `filter` / `backdrop-filter` value: `none` or a whitespace-separated list of
+/// `blur()` / `brightness()` / `grayscale()` functions. Anything else is invalid.
+fn parse_filter_ops(v: &str, cx: &LengthContext) -> Option<Vec<FilterOp>> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for tok in split_ws(v) {
+        let open = tok.find('(')?;
+        let name = tok[..open].to_ascii_lowercase();
+        let inner = tok[open + 1..].strip_suffix(')')?.trim();
+        out.push(match name.as_str() {
+            "blur" => FilterOp::Blur(parse_px(inner, cx).filter(|b| *b >= 0.0)?),
+            "brightness" => FilterOp::Brightness(parse_factor(inner)?),
+            "grayscale" => FilterOp::Grayscale(parse_factor(inner)?.clamp(0.0, 1.0)),
+            _ => return None,
+        });
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// A bare number or percentage as a filter factor (`50%` = 0.5). Must be finite and ≥ 0.
+fn parse_factor(s: &str) -> Option<f32> {
+    let (n, u) = split_number(s)?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    match u.as_str() {
+        "" => Some(n),
+        "%" => Some(n / 100.0),
+        _ => None,
+    }
+}
+
+/// Parse `text-shadow`: comma-separated `dx dy [blur] [color]` layers (no `inset`, no spread).
+fn parse_text_shadows(v: &str, cur: Color, cx: &LengthContext) -> Option<Vec<Shadow>> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for layer in split_commas(v) {
+        let mut nums = Vec::new();
+        let mut color = None;
+        for t in split_ws(&layer) {
+            if t.eq_ignore_ascii_case("inset") {
+                return None;
+            }
+            if let Some(px) = parse_px(&t, cx) {
+                nums.push(px);
+            } else if let Some(c) = Color::parse(&t, cur) {
+                color = Some(c);
+            } else {
+                return None;
+            }
+        }
+        if nums.len() < 2 || nums.len() > 3 {
+            return None;
+        }
+        out.push(Shadow {
+            dx: nums[0],
+            dy: nums[1],
+            blur: nums.get(2).copied().unwrap_or(0.0).max(0.0),
+            spread: 0.0,
+            color: color.unwrap_or(cur),
+            inset: false,
+        });
+    }
+    Some(out)
+}
+
+/// Parse `clip-path`: `none` or one basic shape (`inset` / `circle` / `ellipse` / `polygon`).
+fn parse_clip_path(v: &str, cx: &LengthContext) -> Option<ClipPath> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("none") {
+        return Some(ClipPath::None);
+    }
+    let open = v.find('(')?;
+    let name = v[..open].trim().to_ascii_lowercase();
+    let inner = v[open + 1..].strip_suffix(')')?.trim();
+    match name.as_str() {
+        "inset" => {
+            // `inset(<1-4 lengths> [round ...])`: the corner radii are accepted and ignored.
+            let shape = inner.split_whitespace().take_while(|t| !t.eq_ignore_ascii_case("round")).collect::<Vec<_>>().join(" ");
+            let d = dims(&shape, cx, false, true).filter(|d| !d.is_empty())?;
+            let d = box4(&d)?;
+            Some(ClipPath::Inset { top: d[0], right: d[1], bottom: d[2], left: d[3] })        }
+        "circle" => {
+            let (r, pos) = match inner.split_once("at") {
+                Some((r, p)) => (r.trim(), Some(p.trim())),
+                None => (inner, None),
+            };
+            let r = parse_length(r.trim(), cx).filter(|d| !matches!(d, Dim::Auto))?;
+            let (cxp, cyp) = parse_clip_center(pos, cx)?;
+            Some(ClipPath::Circle { r, cx: cxp, cy: cyp })
+        }
+        "ellipse" => {
+            let (radii, pos) = match inner.split_once("at") {
+                Some((r, p)) => (r.trim(), Some(p.trim())),
+                None => (inner, None),
+            };
+            let rr = split_ws(radii);
+            if rr.len() != 2 {
+                return None;
+            }
+            let rx = parse_length(&rr[0], cx).filter(|d| !matches!(d, Dim::Auto))?;
+            let ry = parse_length(&rr[1], cx).filter(|d| !matches!(d, Dim::Auto))?;
+            let (cxp, cyp) = parse_clip_center(pos, cx)?;
+            Some(ClipPath::Ellipse { rx, ry, cx: cxp, cy: cyp })
+        }
+        "polygon" => {
+            let mut pts = Vec::new();
+            for pair in split_commas(inner) {
+                let xy = split_ws(&pair);
+                if xy.len() != 2 {
+                    return None;
+                }
+                let (x, y) = (parse_length(&xy[0], cx)?, parse_length(&xy[1], cx)?);
+                if matches!(x, Dim::Auto) || matches!(y, Dim::Auto) {
+                    return None;
+                }
+                pts.push((x, y));
+            }
+            if pts.len() < 3 {
+                return None;
+            }
+            Some(ClipPath::Polygon(pts))
+        }
+        _ => None,
+    }
+}
+
+/// Centre for `circle`/`ellipse` (`at <x> <y>`, each px or `%`); defaults to 50%/50%.
+fn parse_clip_center(pos: Option<&str>, cx: &LengthContext) -> Option<(Dim, Dim)> {
+    let Some(p) = pos else { return Some((Dim::Percent(50.0), Dim::Percent(50.0))) };
+    let xy = split_ws(p);
+    if xy.len() != 2 {
+        return None;
+    }
+    let (x, y) = (parse_length(&xy[0], cx)?, parse_length(&xy[1], cx)?);
+    if matches!(x, Dim::Auto) || matches!(y, Dim::Auto) {
+        return None;
+    }
+    Some((x, y))
+}
+
+/// Extract the `url(...)` target from `mask-image` / `mask` values.
+fn extract_mask_url(v: &str) -> Option<String> {
+    let lower = v.to_ascii_lowercase();
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find("url(") {
+        let start = i + pos + 4;
+        let rest = &v[start..];
+        let Some(end) = rest.find(')') else { break };
+        let url = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        if !url.is_empty() {
+            return Some(url.to_string());
+        }
+        i = start + end + 1;
+    }
+    None
 }
 
 fn parse_background_image(v: &str, cur: Color) -> Option<BackgroundImage> {
@@ -1254,4 +1624,118 @@ mod tests {
         assert_eq!(s.line_height, LineHeight::Px(20.0));
         assert_eq!(s.font_family.len(), 2);
     }
+
+    #[test]
+    fn grid_template_areas_parsing() {
+        let s = apply(&[("grid-template-areas", "\"header header\" \"sidebar main\"")]);
+        assert_eq!(s.grid_template_areas, vec![vec!["header".to_string(), "header".to_string()], vec!["sidebar".to_string(), "main".to_string()]]);
+        let none = apply(&[("grid-template-areas", "none")]);
+        assert!(none.grid_template_areas.is_empty());
+        // Ragged rows are invalid: the declaration is ignored, keeping the previous value.
+        let mut st = apply(&[("grid-template-areas", "\"a a\" \"b\"")]);
+        assert!(st.grid_template_areas.is_empty(), "ragged areas rejected: {:?}", st.grid_template_areas);
+        st = apply(&[("grid-template-areas", "\"a a\""), ("grid-template-areas", "\"b\" \"c d\"")]);
+        assert_eq!(st.grid_template_areas, vec![vec!["a".to_string(), "a".to_string()]], "second invalid declaration ignored");
+        // Unquoted rows are invalid.
+        assert!(apply(&[("grid-template-areas", "header header")]).grid_template_areas.is_empty());
+    }
+
+    #[test]
+    fn grid_area_placement() {
+        let s = apply(&[("grid-area", "header")]);
+        assert_eq!(s.grid_area.as_deref(), Some("header"));
+        assert_eq!(s.grid_column, (GridLine::Auto, GridLine::Auto));
+        let s = apply(&[("grid-area", "1 / 2 / 3 / 4")]);
+        assert_eq!(s.grid_area, None);
+        assert_eq!(s.grid_row, (GridLine::Line(1), GridLine::Line(3)));
+        assert_eq!(s.grid_column, (GridLine::Line(2), GridLine::Line(4)));
+        let s = apply(&[("grid-area", "auto")]);
+        assert_eq!(s.grid_area, None);
+        // Longhands clear a previous area name.
+        let s = apply(&[("grid-area", "main"), ("grid-column-start", "2")]);
+        assert_eq!(s.grid_area, None);
+    }
+
+    #[test]
+    fn calc_mixed_widths_parse() {
+        let s = apply(&[("width", "calc(100% - 20px)")]);
+        assert_eq!(s.width, Dim::Calc(100.0, -20.0));
+        assert_eq!(s.width.resolve(400.0), Some(380.0));
+        let s = apply(&[("width", "calc(10px + 2em)")]);
+        assert_eq!(s.width, Dim::Px(42.0), "2em at default 16px");
+    }
+
+    #[test]
+    fn table_float_and_column_properties_parse() {
+        // Every table keyword parses; layout collapses them to a grid-like form.
+        for (kw, expect) in [
+            ("table", Display::Table),
+            ("inline-table", Display::InlineTable),
+            ("table-caption", Display::TableCaption),
+            ("table-column-group", Display::TableColumnGroup),
+            ("table-column", Display::TableColumn),
+            ("table-header-group", Display::TableHeaderGroup),
+            ("table-row-group", Display::TableRowGroup),
+            ("table-footer-group", Display::TableFooterGroup),
+            ("table-row", Display::TableRow),
+            ("table-cell", Display::TableCell),
+            ("list-item", Display::ListItem),
+        ] {
+            assert_eq!(apply(&[("display", kw)]).display, expect, "{kw}");
+        }
+        // float / clear.
+        let s = apply(&[("float", "left"), ("clear", "both")]);
+        assert!(matches!(s.float, Float::Left) && matches!(s.clear, Clear::Both));
+        assert!(matches!(apply(&[("float", "sideways")]).float, Float::None), "invalid float is ignored");
+        assert!(matches!(apply(&[("clear", "all")]).clear, Clear::None), "invalid clear is ignored");
+        // columns.
+        assert_eq!(apply(&[("column-count", "3")]).column_count, Some(3));
+        assert!(apply(&[("column-count", "0")]).column_count.is_none(), "zero columns rejected");
+        assert!(apply(&[("column-count", "auto")]).column_count.is_none());
+        let s = apply(&[("column-width", "12em")]);
+        assert_eq!(s.column_width, Dim::Px(192.0), "12em at default 16px");
+        let s = apply(&[("columns", "200px 2")]);
+        assert_eq!((s.column_width, s.column_count), (Dim::Px(200.0), Some(2)));
+        let s = apply(&[("columns", "2")]);
+        assert_eq!(s.column_count, Some(2));
+        assert!(apply(&[("columns", "banana")]).column_count.is_none());
+        let s = apply(&[("column-span", "all")]);
+        assert!(s.column_span_all);
+        assert!(!apply(&[("column-span", "none")]).column_span_all);
+        // Track counts: count wins; otherwise width derives a count against the basis.
+        let counted = apply(&[("column-count", "3"), ("column-width", "200px")]);
+        assert_eq!(counted.multicol_count(100.0), Some(3));
+        assert_eq!(apply(&[("column-width", "200px")]).multicol_count(800.0), Some(4));
+        assert_eq!(ComputedStyle::default().multicol_count(800.0), None);
+        assert_eq!(apply(&[("column-count", "1")]).multicol_count(800.0), None, "one column is not multicol");
+        // inherit / initial copy the new fields.
+        let mut parent = ComputedStyle::default();
+        parent.column_count = Some(2);
+        let mut st = ComputedStyle::inherit_from(&parent);
+        let sc = StyleContext::default();
+        assert!(apply_declaration(&mut st, &parent, "column-count", "inherit", &sc));
+        assert_eq!(st.column_count, Some(2));
+        assert!(apply_declaration(&mut st, &parent, "float", "right", &sc));
+        assert!(matches!(st.float, Float::Right));
+        assert!(apply_declaration(&mut st, &parent, "float", "initial", &sc));
+        assert!(matches!(st.float, Float::None));
+    }
+}
+
+/// Parse `touch-action` into a pan/pinch bitmask (see `ComputedStyle::touch_action`).
+pub fn parse_touch_action(v: &str) -> Option<u8> {
+    let mut mask = 0u8;
+    let mut any = false;
+    for tok in v.split_whitespace() {
+        any = true;
+        match tok.to_ascii_lowercase().as_str() {
+            "auto" | "manipulation" => return (v.split_whitespace().count() == 1).then_some(7),
+            "none" => return (v.split_whitespace().count() == 1).then_some(0),
+            "pan-x" | "pan-left" | "pan-right" => mask |= 1,
+            "pan-y" | "pan-up" | "pan-down" => mask |= 2,
+            "pinch-zoom" => mask |= 4,
+            _ => return None,
+        }
+    }
+    any.then_some(mask)
 }

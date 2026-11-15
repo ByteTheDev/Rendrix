@@ -1,7 +1,7 @@
 //! A running application: engine + JavaScript runtime + the input state machine.
 //!
 //! `Session` is platform-independent. The window driver and the headless driver both feed it
-//! pointer, wheel, keyboard and text events and call [`Session::frame`]; it turns them into DOM
+//! pointer, wheel, touch, keyboard and text events and call [`Session::frame`]; it turns them into DOM
 //! events, default actions (focus, click activation, caret placement, text editing, Tab traversal)
 //! and engine updates.
 
@@ -13,7 +13,7 @@ use rendrix_js::{JsRuntime, WindowCommand};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
+use web_time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Mods {
@@ -43,6 +43,14 @@ pub trait Clipboard {
 
 #[derive(Default)]
 pub struct MemoryClipboard(pub String);
+impl MemoryClipboard {
+    pub fn new() -> Self {
+        MemoryClipboard(String::new())
+    }
+}
+/// Android/iOS have no system-clipboard backend in this build: use an in-process clipboard.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub type SystemClipboard = MemoryClipboard;
 impl Clipboard for MemoryClipboard {
     fn get(&mut self) -> String {
         self.0.clone()
@@ -52,17 +60,21 @@ impl Clipboard for MemoryClipboard {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
 pub struct SystemClipboard(Option<arboard::Clipboard>);
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
 impl SystemClipboard {
     pub fn new() -> Self {
         SystemClipboard(arboard::Clipboard::new().ok())
     }
 }
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
 impl Default for SystemClipboard {
     fn default() -> Self {
         Self::new()
     }
 }
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
 impl Clipboard for SystemClipboard {
     fn get(&mut self) -> String {
         self.0.as_mut().and_then(|c| c.get_text().ok()).unwrap_or_default()
@@ -86,6 +98,8 @@ pub struct FrameInfo {
     pub quit: bool,
     pub title: Option<String>,
     pub resize: Option<(f32, f32)>,
+    /// A text control has focus: show the soft keyboard / enable the IME.
+    pub text_input: bool,
 }
 
 struct ClickState {
@@ -108,6 +122,52 @@ struct InputState {
     edit_dirty: Option<NodeId>,
     space_down_on: Option<NodeId>,
     window_focused: bool,
+    /// Active touch points (multi-touch), oldest first.
+    touches: Vec<TouchPoint>,
+    /// While a touch gesture synthesises compatibility mouse events, `pointerType` is `"touch"`.
+    touch_mode: bool,
+    /// Inertial scroll after a flick.
+    fling: Option<Fling>,
+    /// Connected gamepads (index → state); see [`Session::set_gamepad`].
+    gamepads: Vec<Option<GamepadState>>,
+}
+
+/// Finger travel (CSS px) before a touch stops being a tap and becomes a pan.
+const TOUCH_SLOP: f32 = 10.0;
+/// A stationary touch held this long fires `contextmenu` (long press).
+const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(500);
+
+struct TouchPoint {
+    id: u32,
+    start: (f32, f32),
+    pos: (f32, f32),
+    target: Option<NodeId>,
+    t0: Instant,
+    last_t: Instant,
+    /// Smoothed finger velocity in px/s.
+    vel: (f32, f32),
+    panning: bool,
+    /// `pointercancel` was sent (the browser took the gesture for scrolling): no more pointer events.
+    pointer_cancelled: bool,
+    /// `touchstart` (or a later `touchmove`) called `preventDefault`: no scroll, no compat mouse events.
+    prevented: bool,
+    long_press_fired: bool,
+    /// Pan allowed by `touch-action` at the touch target: bit 1 = x, 2 = y.
+    pan_mask: u8,
+}
+
+struct Fling {
+    pos: (f32, f32),
+    vel: (f32, f32),
+    last: Instant,
+}
+
+/// One gamepad in the W3C "standard" layout: 17 buttons (value 0..1) and 4 axes (-1..1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GamepadState {
+    pub id: String,
+    pub buttons: Vec<f32>,
+    pub axes: Vec<f32>,
 }
 
 pub struct Session {
@@ -133,12 +193,24 @@ impl Drop for Session {
 
 impl Session {
     /// Parse the bundle's document, install the runtime and run its scripts in document order.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(bundle: &AppBundle, clipboard: Box<dyn Clipboard>, viewport: (f32, f32, f32)) -> Result<Session, String> {
+        Self::new_with_engine(bundle, clipboard, viewport, |host| Ok(Box::new(rendrix_js::quickjs::QuickJsEngine::new(host)?) as Box<dyn rendrix_js::JsEngine>))
+    }
+
+    /// Like [`Session::new`] on a caller-supplied JavaScript engine (the web driver passes the
+    /// browser's). `make_engine` receives the host the engine routes `__native` calls to.
+    pub fn new_with_engine(
+        bundle: &AppBundle,
+        clipboard: Box<dyn Clipboard>,
+        viewport: (f32, f32, f32),
+        make_engine: impl FnOnce(Rc<RefCell<rendrix_js::DomHost>>) -> Result<Box<dyn rendrix_js::JsEngine>, rendrix_js::JsError>,
+    ) -> Result<Session, String> {
         let doc = rendrix_dom::Document::parse(&bundle.html);
         let mut engine = Engine::with_document(doc, bundle.asset_provider());
         engine.set_viewport(viewport.0, viewport.1, viewport.2);
         let engine = Rc::new(RefCell::new(engine));
-        let mut js = JsRuntime::new(engine.clone(), &bundle.name, bundle.permissions()).map_err(|e| e.to_string())?;
+        let mut js = JsRuntime::new_with_engine(engine.clone(), &bundle.name, bundle.permissions(), make_engine).map_err(|e| e.to_string())?;
         for (path, src) in &bundle.modules {
             js.add_module(path, src.clone());
         }
@@ -156,6 +228,7 @@ impl Session {
 
     /// D2 hot swap: validate + commit `changed` (the full bundle.modules map) without
     /// dropping the DOM. Returns re-run entry labels; on Err the session is last-good.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn apply_hot_update(&mut self, changed: std::collections::BTreeMap<String, String>) -> Result<Vec<String>, String> {
         crate::hot_reload::apply_module_update(self, changed)
     }
@@ -216,7 +289,7 @@ impl Session {
         let m = self.input.mods;
         let mut v = json!({
             "clientX": self.input.pos.0, "clientY": self.input.pos.1, "pageX": self.input.pos.0, "pageY": self.input.pos.1, "screenX": self.input.pos.0, "screenY": self.input.pos.1,
-            "buttons": self.input.buttons, "ctrlKey": m.ctrl, "shiftKey": m.shift, "altKey": m.alt, "metaKey": m.meta,
+            "buttons": self.input.buttons, "pointerType": if self.input.touch_mode { "touch" } else { "mouse" }, "ctrlKey": m.ctrl, "shiftKey": m.shift, "altKey": m.alt, "metaKey": m.meta,
         });
         if let (Value::Object(base), Value::Object(more)) = (&mut v, extra) {
             base.extend(more);
@@ -266,11 +339,17 @@ impl Session {
     }
 
     pub fn pointer_move(&mut self, x: f32, y: f32) {
+        self.pointer_move_inner(x, y, true);
+    }
+
+    fn pointer_move_inner(&mut self, x: f32, y: f32, emit_pointer: bool) {
         self.input.pos = (x, y);
         let target = self.engine.borrow().hit_test(x, y);
         self.set_hover(target);
         if let Some(t) = target {
-            self.dispatch("pointermove", Some(t), json!({ "pointerType": "mouse" }));
+            if emit_pointer {
+                self.dispatch("pointermove", Some(t), json!({}));
+            }
             self.dispatch("mousemove", Some(t), json!({}));
         }
         if let Some((c, anchor)) = self.input.drag {
@@ -309,6 +388,11 @@ impl Session {
     }
 
     pub fn pointer_down(&mut self, x: f32, y: f32, button: u32) {
+        self.input.fling = None;
+        self.pointer_down_inner(x, y, button, true);
+    }
+
+    fn pointer_down_inner(&mut self, x: f32, y: f32, button: u32, emit_pointer: bool) {
         self.input.pos = (x, y);
         let target = self.engine.borrow().hit_test(x, y);
         self.set_hover(target);
@@ -327,7 +411,7 @@ impl Session {
             self.engine.borrow_mut().doc.set_active_chain(Some(t));
             self.input.pressed = Some(t);
         }
-        let ok_p = self.dispatch("pointerdown", Some(t), json!({ "button": button, "pointerType": "mouse" }));
+        let ok_p = !emit_pointer || self.dispatch("pointerdown", Some(t), json!({ "button": button }));
         let ok_m = self.dispatch("mousedown", Some(t), json!({ "button": button }));
         if !(ok_p && ok_m) || button != 0 {
             return;
@@ -359,6 +443,10 @@ impl Session {
     }
 
     pub fn pointer_up(&mut self, x: f32, y: f32, button: u32) {
+        self.pointer_up_inner(x, y, button, true);
+    }
+
+    fn pointer_up_inner(&mut self, x: f32, y: f32, button: u32, emit_pointer: bool) {
         self.input.pos = (x, y);
         let target = self.engine.borrow().hit_test(x, y);
         let bit = match button {
@@ -370,7 +458,9 @@ impl Session {
         self.input.buttons &= !bit;
         self.input.drag = None;
         if let Some(t) = target {
-            self.dispatch("pointerup", Some(t), json!({ "button": button, "pointerType": "mouse" }));
+            if emit_pointer {
+                self.dispatch("pointerup", Some(t), json!({ "button": button }));
+            }
             self.dispatch("mouseup", Some(t), json!({ "button": button }));
         }
         if button == 0 {
@@ -385,7 +475,7 @@ impl Session {
                 };
                 if let Some(c) = common {
                     let count = self.input.last_click.as_ref().map(|c| c.count).unwrap_or(1);
-                    self.dispatch("click", Some(c), json!({ "button": 0, "detail": count, "pointerType": "mouse" }));
+                    self.dispatch("click", Some(c), json!({ "button": 0, "detail": count  }));
                     if count == 2 {
                         self.dispatch("dblclick", Some(c), json!({ "button": 0, "detail": 2 }));
                     }
@@ -403,6 +493,7 @@ impl Session {
     }
 
     pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32) {
+        self.input.fling = None;
         self.input.pos = (x, y);
         let target = self.engine.borrow().hit_test(x, y).or_else(|| self.engine.borrow().doc.body());
         let allowed = self.dispatch("wheel", target, json!({ "deltaX": dx, "deltaY": dy, "deltaMode": 0 }));
@@ -415,6 +506,299 @@ impl Session {
                     self.set_hover(Some(t));
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Touch (phones, tablets, touch screens)
+    //
+    // Mirrors what a mobile browser does: `pointerdown/move/up` (pointerType "touch") and
+    // `touchstart/move/end` while the finger is down; a drag past the slop scrolls the nearest
+    // scroller (with a flick fling) and sends `pointercancel`; a tap synthesises the compatibility
+    // `mousemove/mousedown/mouseup/click` sequence; a long press fires `contextmenu`. Hover never
+    // sticks after a tap. `touch-action` limits which axes may pan; calling `preventDefault` on
+    // `touchstart`/`touchmove` (non-passive listeners) disables scrolling and compat mouse events.
+    // ------------------------------------------------------------------------------------
+
+    /// Effective `touch-action` pan mask at a node: the intersection along the ancestor chain.
+    fn pan_mask_at(&self, n: Option<NodeId>) -> u8 {
+        let e = self.engine.borrow();
+        let mut mask = 7u8;
+        let mut cur = n;
+        while let Some(id) = cur {
+            if let Some(s) = e.style_of(id) {
+                mask &= s.touch_action;
+            }
+            cur = e.doc.parent(id);
+        }
+        mask & 3
+    }
+
+    fn touch_json(&self, tp: &TouchPoint) -> Value {
+        json!({ "identifier": tp.id, "clientX": tp.pos.0, "clientY": tp.pos.1, "pageX": tp.pos.0, "pageY": tp.pos.1, "screenX": tp.pos.0, "screenY": tp.pos.1, "targetId": tp.target })
+    }
+
+    /// Dispatch a `touch*` event: `changed` are the touch ids that changed in this event.
+    fn dispatch_touch(&mut self, ty: &str, target: Option<NodeId>, changed: &[u32], gone: Option<&TouchPoint>) -> bool {
+        let live: Vec<Value> = self.input.touches.iter().map(|t| self.touch_json(t)).collect();
+        let on_target: Vec<Value> = self.input.touches.iter().filter(|t| t.target == target).map(|t| self.touch_json(t)).collect();
+        let mut changed_json: Vec<Value> = self.input.touches.iter().filter(|t| changed.contains(&t.id)).map(|t| self.touch_json(t)).collect();
+        if let Some(g) = gone {
+            changed_json.push(self.touch_json(g));
+        }
+        let init = self.base_init(json!({ "touches": live, "targetTouches": on_target, "changedTouches": changed_json }));
+        self.js.dispatch(ty, target, &init)
+    }
+
+    pub fn touch_start(&mut self, id: u32, x: f32, y: f32) {
+        self.input.fling = None;
+        self.input.pos = (x, y);
+        self.input.touch_mode = true;
+        let target = self.engine.borrow().hit_test(x, y);
+        let primary = self.input.touches.is_empty();
+        if primary {
+            self.set_hover(target);
+        }
+        let now = Instant::now();
+        let pan_mask = self.pan_mask_at(target);
+        self.input.touches.push(TouchPoint { id, start: (x, y), pos: (x, y), target, t0: now, last_t: now, vel: (0.0, 0.0), panning: false, pointer_cancelled: false, prevented: false, long_press_fired: false, pan_mask });
+        self.input.buttons |= 1;
+        if let Some(t) = target {
+            if primary {
+                self.engine.borrow_mut().doc.set_active_chain(Some(t));
+                self.input.pressed = Some(t);
+            }
+            self.dispatch("pointerdown", Some(t), json!({ "button": 0, "pointerId": id + 2, "isPrimary": primary }));
+            if !self.dispatch_touch("touchstart", Some(t), &[id], None) {
+                if let Some(tp) = self.input.touches.iter_mut().find(|t| t.id == id) {
+                    tp.prevented = true;
+                }
+            }
+        }
+        self.input.touch_mode = false;
+    }
+
+    pub fn touch_move(&mut self, id: u32, x: f32, y: f32) {
+        let Some(i) = self.input.touches.iter().position(|t| t.id == id) else { return };
+        self.input.pos = (x, y);
+        let now = Instant::now();
+        let (prev, target, primary) = {
+            let tp = &mut self.input.touches[i];
+            let dt = now.duration_since(tp.last_t).as_secs_f32().max(0.001);
+            let inst = ((x - tp.pos.0) / dt, (y - tp.pos.1) / dt);
+            // Exponential smoothing keeps a final slow-down from being lost in a single noisy sample.
+            tp.vel = if tp.vel == (0.0, 0.0) { inst } else { (tp.vel.0 * 0.4 + inst.0 * 0.6, tp.vel.1 * 0.4 + inst.1 * 0.6) };
+            let prev = tp.pos;
+            tp.pos = (x, y);
+            tp.last_t = now;
+            (prev, tp.target, i == 0)
+        };
+        if (x, y) == prev {
+            return;
+        }
+        self.input.touch_mode = true;
+        let (cancelled, panning) = {
+            let tp = &self.input.touches[i];
+            (tp.pointer_cancelled, tp.panning)
+        };
+        if let Some(t) = target {
+            if !cancelled {
+                self.dispatch("pointermove", Some(t), json!({ "pointerId": id + 2, "isPrimary": primary }));
+            }
+            if !self.dispatch_touch("touchmove", Some(t), &[id], None) {
+                self.input.touches[i].prevented = true;
+            }
+        }
+        let (prevented, start, pan_mask) = {
+            let tp = &self.input.touches[i];
+            (tp.prevented, tp.start, tp.pan_mask)
+        };
+        if !prevented {
+            if !panning && pan_mask != 0 && ((x - start.0).powi(2) + (y - start.1).powi(2)).sqrt() > TOUCH_SLOP {
+                self.input.touches[i].panning = true;
+                if let Some(t) = target {
+                    if !cancelled {
+                        self.dispatch("pointercancel", Some(t), json!({ "pointerId": id + 2, "isPrimary": primary }));
+                    }
+                }
+                self.input.touches[i].pointer_cancelled = true;
+                self.engine.borrow_mut().doc.set_active_chain(None);
+                self.input.pressed = None;
+            }
+            if self.input.touches[i].panning && i == 0 {
+                let dx = if pan_mask & 1 != 0 { prev.0 - x } else { 0.0 };
+                let dy = if pan_mask & 2 != 0 { prev.1 - y } else { 0.0 };
+                if dx != 0.0 || dy != 0.0 {
+                    self.engine.borrow_mut().scroll_by(x, y, dx, dy);
+                }
+            }
+        }
+        self.input.touch_mode = false;
+    }
+
+    pub fn touch_end(&mut self, id: u32, x: f32, y: f32) {
+        self.touch_finish(id, x, y, false);
+    }
+
+    /// The system took the touch (palm rejection, gesture, app switch): no tap, no fling.
+    pub fn touch_cancel(&mut self, id: u32) {
+        let pos = self.input.touches.iter().find(|t| t.id == id).map(|t| t.pos);
+        if let Some((x, y)) = pos {
+            self.touch_finish(id, x, y, true);
+        }
+    }
+
+    fn touch_finish(&mut self, id: u32, x: f32, y: f32, cancelled: bool) {
+        let Some(i) = self.input.touches.iter().position(|t| t.id == id) else { return };
+        let mut tp = self.input.touches.remove(i);
+        tp.pos = (x, y);
+        self.input.pos = (x, y);
+        self.input.touch_mode = true;
+        let primary = i == 0;
+        if let Some(t) = tp.target {
+            let ty = if cancelled { "pointercancel" } else { "pointerup" };
+            if !tp.pointer_cancelled {
+                self.dispatch(ty, Some(t), json!({ "button": 0, "pointerId": id + 2, "isPrimary": primary }));
+            }
+        }
+        let touchend_ok = match tp.target {
+            Some(t) => self.dispatch_touch(if cancelled { "touchcancel" } else { "touchend" }, Some(t), &[], Some(&tp)),
+            None => true,
+        };
+        let last = self.input.touches.is_empty();
+        let moved = ((x - tp.start.0).powi(2) + (y - tp.start.1).powi(2)).sqrt() > TOUCH_SLOP;
+        if last {
+            self.input.buttons &= !1;
+            self.engine.borrow_mut().doc.set_active_chain(None);
+            self.input.pressed = None;
+        }
+        let is_tap = !cancelled && last && !tp.panning && !tp.prevented && !tp.long_press_fired && touchend_ok && !moved;
+        if is_tap {
+            // Compatibility mouse events: `mousemove`, `mousedown`, `mouseup`, `click` (pointerType touch).
+            self.pointer_move_inner(x, y, false);
+            self.pointer_down_inner(x, y, 0, false);
+            self.pointer_up_inner(x, y, 0, false);
+        } else if !cancelled && last && tp.panning && !tp.prevented {
+            let v = tp.vel;
+            // A finger that stopped before lifting must not fling: require a recent movement sample.
+            let fresh = Instant::now().duration_since(tp.last_t).as_millis() < 80;
+            let (vx, vy) = (if tp.pan_mask & 1 != 0 { v.0 } else { 0.0 }, if tp.pan_mask & 2 != 0 { v.1 } else { 0.0 });
+            if fresh && (vx * vx + vy * vy).sqrt() > 120.0 {
+                self.input.fling = Some(Fling { pos: (x, y), vel: (vx.clamp(-6000.0, 6000.0), vy.clamp(-6000.0, 6000.0)), last: Instant::now() });
+            }
+        }
+        if last {
+            self.set_hover(None);
+        }
+        self.input.touch_mode = false;
+    }
+
+    /// Whether a finger is currently down (drivers keep the frame loop awake for flings/long press).
+    pub fn touching(&self) -> bool {
+        !self.input.touches.is_empty()
+    }
+
+    fn step_fling(&mut self) -> bool {
+        let Some(f) = self.input.fling.as_mut() else { return false };
+        let now = Instant::now();
+        let dt = now.duration_since(f.last).as_secs_f32().clamp(0.0, 0.05);
+        f.last = now;
+        // Finger-velocity to content delta is the inverse sign; friction is about 0.95 per 60 Hz frame.
+        let (dx, dy) = (-f.vel.0 * dt, -f.vel.1 * dt);
+        let decay = (-3.0 * dt).exp();
+        f.vel = (f.vel.0 * decay, f.vel.1 * decay);
+        let (pos, slow) = (f.pos, (f.vel.0 * f.vel.0 + f.vel.1 * f.vel.1).sqrt() < 20.0);
+        let moved = self.engine.borrow_mut().scroll_by(pos.0, pos.1, dx, dy);
+        if !moved || slow {
+            self.input.fling = None;
+            return false;
+        }
+        true
+    }
+
+    /// Fire `contextmenu` for touches held past [`LONG_PRESS`]. Returns time until the next one is due.
+    fn step_long_press(&mut self) -> Option<std::time::Duration> {
+        let now = Instant::now();
+        let mut due: Vec<Option<NodeId>> = Vec::new();
+        let mut next: Option<std::time::Duration> = None;
+        for tp in self.input.touches.iter_mut() {
+            if tp.panning || tp.prevented || tp.long_press_fired {
+                continue;
+            }
+            if ((tp.pos.0 - tp.start.0).powi(2) + (tp.pos.1 - tp.start.1).powi(2)).sqrt() > TOUCH_SLOP {
+                continue;
+            }
+            let held = now.duration_since(tp.t0);
+            if held >= LONG_PRESS {
+                tp.long_press_fired = true;
+                due.push(tp.target);
+            } else {
+                let left = LONG_PRESS - held;
+                next = Some(next.map_or(left, |n| n.min(left)));
+            }
+        }
+        for target in due.into_iter().flatten() {
+            self.input.touch_mode = true;
+            self.dispatch("contextmenu", Some(target), json!({ "button": 2 }));
+            self.input.touch_mode = false;
+        }
+        next
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Safe area, on-screen keyboard, gamepads
+    // ------------------------------------------------------------------------------------
+
+    /// Notch / system-bar insets in CSS px, exposed to CSS as `env(safe-area-inset-*)`.
+    pub fn set_safe_area(&mut self, top: f32, right: f32, bottom: f32, left: f32) {
+        self.engine.borrow_mut().set_safe_area([top.max(0.0), right.max(0.0), bottom.max(0.0), left.max(0.0)]);
+    }
+
+    /// On-screen keyboard height in CSS px (`env(keyboard-inset-height)`); 0 when hidden. When it
+    /// opens over a focused text control the control is scrolled into view.
+    pub fn set_keyboard_height(&mut self, height: f32) {
+        let was = self.engine.borrow().keyboard_h;
+        self.engine.borrow_mut().set_keyboard_inset(height.max(0.0));
+        if height > 0.0 && was <= 0.0 && self.wants_text_input() {
+            let _ = self.js.eval("document.activeElement && document.activeElement.scrollIntoView && document.activeElement.scrollIntoView()");
+        }
+    }
+
+    /// A text control has focus: drivers should show the soft keyboard / enable the IME.
+    pub fn wants_text_input(&self) -> bool {
+        let e = self.engine.borrow();
+        e.doc.focused().is_some_and(|n| e.doc.is_text_control(n))
+    }
+
+    /// `navigator.maxTouchPoints` (0 = no touch screen).
+    pub fn set_max_touch_points(&mut self, n: u32) {
+        self.js.host.borrow_mut().max_touch_points = n;
+    }
+
+    /// Report the current state of gamepad `index` (`None` = disconnected). Drivers call this every
+    /// frame with whatever the OS/browser reports, in the W3C standard layout; the session turns
+    /// changes into `gamepadconnected`/`gamepaddisconnected` and keeps `navigator.getGamepads()` current.
+    pub fn set_gamepad(&mut self, index: usize, state: Option<GamepadState>) {
+        if self.input.gamepads.len() <= index {
+            self.input.gamepads.resize(index + 1, None);
+        }
+        let prev = self.input.gamepads[index].clone();
+        if prev == state {
+            return;
+        }
+        self.input.gamepads[index] = state.clone();
+        let json_list: Vec<Value> = self.input.gamepads.iter().enumerate().filter_map(|(i, g)| g.as_ref().map(|g| gamepad_json(i, g))).collect();
+        self.js.host.borrow_mut().gamepads_json = Value::Array(json_list).to_string();
+        match (&prev, &state) {
+            (None, Some(g)) => {
+                self.js.dispatch("gamepadconnected", None, &json!({ "gamepad": gamepad_json(index, g) }));
+            }
+            (Some(g), None) => {
+                let mut gone = gamepad_json(index, g);
+                gone["connected"] = json!(false);
+                self.js.dispatch("gamepaddisconnected", None, &json!({ "gamepad": gone }));
+            }
+            _ => {}
         }
     }
 
@@ -661,6 +1045,8 @@ impl Session {
         if tick.wants_frame {
             self.js.run_animation_frame(now * 1000.0);
         }
+        let flinging = self.step_fling();
+        let long_press_due = self.step_long_press();
         let mut info = self.engine.borrow_mut().update(now);
         self.js.after_layout();
         // 3D scenes: prune scenes of dead nodes, re-arm on backing-size changes.
@@ -674,12 +1060,16 @@ impl Session {
         }
         let mut out = FrameInfo { repainted: info.repainted, ..Default::default() };
         let tick = self.js.tick_info();
-        out.continuous = info.animating || tick.wants_frame || self.engine.borrow().needs_update();
+        out.continuous = info.animating || tick.wants_frame || self.engine.borrow().needs_update() || flinging;
+        out.text_input = self.wants_text_input();
         let timer = tick.next_timer_ms.map(|ms| ms / 1000.0);
         out.next_wake_s = match (timer, info.next_wake) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        if let Some(d) = long_press_due {
+            out.next_wake_s = Some(out.next_wake_s.map_or(now + d.as_secs_f64(), |w| w.min(now + d.as_secs_f64())));
+        }
         if tick.pending_io {
             out.next_wake_s = Some(out.next_wake_s.map_or(now + 0.016, |w| w.min(now + 0.016)));
         }
@@ -727,6 +1117,11 @@ impl Session {
     pub fn center_of(&self, id: NodeId) -> Option<(f32, f32)> {
         self.engine.borrow().element_rect(id).map(|r| (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0))
     }
+}
+
+/// A gamepad in the JSON shape `navigator.getGamepads()` consumes.
+fn gamepad_json(index: usize, g: &GamepadState) -> Value {
+    json!({ "index": index, "id": g.id, "connected": true, "mapping": "standard", "buttons": g.buttons, "axes": g.axes, "timestamp": 0 })
 }
 
 fn word_bounds(s: &str, at: usize) -> (usize, usize) {

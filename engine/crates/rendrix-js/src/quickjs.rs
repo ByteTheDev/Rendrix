@@ -1,6 +1,7 @@
 //! QuickJS backend for [`JsEngine`]. This is the only file that names `rquickjs`.
 
 use crate::engine_trait::{Host, JsEngine, JsError, Val};
+pub use crate::engine_trait::resolve_module;
 use rquickjs::function::{Args, Rest};
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::module::Declared;
@@ -14,27 +15,6 @@ pub type ModuleMap = Rc<RefCell<HashMap<String, String>>>;
 
 struct MapResolver(ModuleMap);
 struct MapLoader(ModuleMap);
-
-/// Resolve `name` imported from `base` against the module map.
-pub fn resolve_module(map: &HashMap<String, String>, base: &str, name: &str) -> Option<String> {
-    let joined = if name.starts_with("./") || name.starts_with("../") {
-        let dir = base.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let mut parts: Vec<&str> = if dir.is_empty() { vec![] } else { dir.split('/').collect() };
-        for seg in name.split('/') {
-            match seg {
-                "." | "" => {}
-                ".." => {
-                    parts.pop();
-                }
-                s => parts.push(s),
-            }
-        }
-        parts.join("/")
-    } else {
-        name.trim_start_matches('/').to_string()
-    };
-    [joined.clone(), format!("{joined}.js"), format!("{joined}/index.js"), format!("{joined}.mjs")].into_iter().find(|c| map.contains_key(c))
-}
 
 impl Resolver for MapResolver {
     fn resolve<'js>(&mut self, _ctx: &Ctx<'js>, base: &str, name: &str, _attrs: Option<ImportAttributes<'js>>) -> QResult<String> {

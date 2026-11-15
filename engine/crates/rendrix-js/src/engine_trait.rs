@@ -116,3 +116,25 @@ pub trait JsEngine {
         self.set_execution_deadline(None);
     }
 }
+
+/// Resolve `name` imported from `base` against a module map (`./x`, `../x`, bare keys; tries `.js`,
+/// `/index.js` and `.mjs`). Shared by every [`JsEngine`] backend so resolution is identical.
+pub fn resolve_module(map: &std::collections::HashMap<String, String>, base: &str, name: &str) -> Option<String> {
+    let joined = if name.starts_with("./") || name.starts_with("../") {
+        let dir = base.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let mut parts: Vec<&str> = if dir.is_empty() { vec![] } else { dir.split('/').collect() };
+        for seg in name.split('/') {
+            match seg {
+                "." | "" => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        parts.join("/")
+    } else {
+        name.trim_start_matches('/').to_string()
+    };
+    [joined.clone(), format!("{joined}.js"), format!("{joined}/index.js"), format!("{joined}.mjs")].into_iter().find(|c| map.contains_key(c))
+}

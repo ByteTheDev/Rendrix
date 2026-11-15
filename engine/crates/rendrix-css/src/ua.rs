@@ -3,7 +3,16 @@
 pub const USER_AGENT_CSS: &str = r#"
 html, body, div, section, article, aside, header, footer, main, nav, p, h1, h2, h3, h4, h5, h6,
 ul, ol, dl, dt, dd, li, form, fieldset, legend, figure, figcaption, blockquote, pre, hr, address,
-details, summary, menu, dialog, table, caption { display: block; }
+details, summary, menu, dialog { display: block; }
+table { display: table; }
+caption { display: table-caption; }
+colgroup { display: table-column-group; }
+col { display: table-column; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; }
 head, script, style, title, meta, link, template, noscript, datalist, base, option, optgroup { display: none; }
 html { color: #000; font-size: 16px; }
 body { margin: 8px; }

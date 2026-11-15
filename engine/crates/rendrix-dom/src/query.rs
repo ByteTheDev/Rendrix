@@ -58,6 +58,13 @@ impl SelectorElement for ElRef<'_> {
     fn next_sibling_element(&self) -> Option<Self> {
         self.sibling(self.doc.next_sibling(self.id), true)
     }
+    fn child_elements(&self) -> Vec<Self> {
+        self.doc
+            .children(self.id)
+            .filter(|c| matches!(self.doc.node(*c).kind, NodeKind::Element(_)))
+            .map(|c| ElRef { doc: self.doc, id: c })
+            .collect()
+    }
     fn has_state(&self, state: ElementState) -> bool {
         let d = self.data();
         match state {
@@ -191,6 +198,18 @@ mod tests {
         assert!(d.matches(li, "ul > li.item").unwrap());
         assert_eq!(d.closest(li, ".shell").unwrap(), d.get_element_by_id("app"));
         assert_eq!(d.closest(li, "section").unwrap(), None);
+    }
+
+    #[test]
+    fn has_selectors_match_ancestors() {
+        let d = doc();
+        let root = d.root();
+        // `ul` contains `.a`; `div#app` contains `ul`, `button`, `input`.
+        assert_eq!(d.query_selector_all(root, "ul:has(.a)").unwrap().len(), 1);
+        assert_eq!(d.query_selector_all(root, "ul:has(.missing)").unwrap().len(), 0);
+        assert_eq!(d.query_selector_all(root, "div:has(> ul)").unwrap().len(), 1);
+        assert_eq!(d.query_selector_all(root, "div:has(button:disabled)").unwrap().len(), 1);
+        assert!(d.matches(d.get_element_by_id("app").unwrap(), "div:has(li.item)").unwrap());
     }
 
     #[test]

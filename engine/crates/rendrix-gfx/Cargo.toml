@@ -12,12 +12,13 @@ rendrix-css.workspace = true
 rendrix-layout.workspace = true
 cosmic-text.workspace = true
 wgpu.workspace = true
-pollster.workspace = true
+
 bytemuck.workspace = true
 image.workspace = true
 glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sys-locale.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
@@ -25,3 +26,10 @@ criterion.workspace = true
 [[bench]]
 name = "text"
 harness = false
+
+# Web: WebGPU first, WebGL2 as the fallback for browsers (older iOS/Android WebViews) without it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["webgl"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true

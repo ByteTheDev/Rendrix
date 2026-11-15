@@ -3,6 +3,7 @@
 
 pub mod engine_trait;
 pub mod host;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod quickjs;
 pub mod runtime;
 pub mod scene3d;

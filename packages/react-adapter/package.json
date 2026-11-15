@@ -1,0 +1,23 @@
+{
+  "name": "rendrix-react-adapter",
+  "version": "0.1.0",
+  "description": "Run React components on Rendrix's DOM: a react-reconciler host config over the real DOM, no react-dom",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.js",
+    "./jsx-runtime": "./src/jsx-runtime.js"
+  },
+  "scripts": {
+    "pretest": "node scripts/vendor.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-reconciler": "0.34.0",
+    "scheduler": "0.28.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

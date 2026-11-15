@@ -5,6 +5,7 @@ pub mod context;
 pub mod display;
 pub mod renderer;
 pub mod scene3d;
+pub mod svg;
 pub mod text;
 
 pub use context::GpuContext;

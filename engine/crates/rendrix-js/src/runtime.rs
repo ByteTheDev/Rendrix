@@ -2,6 +2,7 @@
 
 use crate::engine_trait::{JsEngine, JsError, Val};
 use crate::host::{base64_encode, DomHost, Permissions, WindowCommand};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::quickjs::QuickJsEngine;
 use crate::sourcemap::{remap_stack, SourceMap};
 use rendrix_core::Engine;
@@ -11,7 +12,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "worker.rs"]
+mod worker;
+#[cfg(target_arch = "wasm32")]
+#[path = "worker_stub.rs"]
 mod worker;
 pub use worker::{WorkerEvent, WorkerRegistry, WORKER_MAX_PER_TICK};
 
@@ -51,9 +56,22 @@ pub struct JsRuntime {
 pub const DEFAULT_TASK_BUDGET: Duration = Duration::from_secs(5);
 
 impl JsRuntime {
+    /// Native runtime on the bundled QuickJS engine.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(engine: Rc<RefCell<Engine>>, app_name: &str, permissions: Permissions) -> Result<JsRuntime, JsError> {
+        Self::new_with_engine(engine, app_name, permissions, |host| Ok(Box::new(QuickJsEngine::new(host)?) as Box<dyn JsEngine>))
+    }
+
+    /// Runtime on any [`JsEngine`]: `make_engine` receives the host the engine must route
+    /// `__native(op, ...args)` calls to (the browser backend uses this on the web target).
+    pub fn new_with_engine(
+        engine: Rc<RefCell<Engine>>,
+        app_name: &str,
+        permissions: Permissions,
+        make_engine: impl FnOnce(Rc<RefCell<DomHost>>) -> Result<Box<dyn JsEngine>, JsError>,
+    ) -> Result<JsRuntime, JsError> {
         let host = Rc::new(RefCell::new(DomHost::new(engine.clone(), app_name, permissions)));
-        let mut js: Box<dyn JsEngine> = Box::new(QuickJsEngine::new(host.clone())?);
+        let mut js: Box<dyn JsEngine> = make_engine(host.clone())?;
         let prelude = format!("(function(global){{'use strict';\nconst N = global.__native;\ndelete global.__native;\n{EVENTS_JS}\n{DOM_JS}\n{WEB_JS}\n}})(globalThis);");
         js.eval_script("rendrix:prelude", &prelude)?;
         js.add_module("rendrix", "export default globalThis.rendrix; export const { version, quit, window, fs, clipboard } = globalThis.rendrix;".to_string());
@@ -408,9 +426,11 @@ impl JsRuntime {
         self.finish_task();
     }
 
-    /// Notify ResizeObservers after layout (runs inside the frame, after `Engine::update`).
+    /// Notify Resize/IntersectionObservers after layout (runs inside the frame, after `Engine::update`).
+    /// A single JS entry point (`checkObservers`) fans out to both observer kinds so an
+    /// idle frame costs one cheap call that early-returns when no observers exist.
     pub fn after_layout(&mut self) {
-        self.call("__rendrix_checkResize", vec![]);
+        self.call("__rendrix_checkObservers", vec![]);
         self.finish_task();
     }
 

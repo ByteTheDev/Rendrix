@@ -34,6 +34,10 @@ struct WindowState {
     a11y: Option<Adapter>,
     /// A file drag is hovering this window (for `dragenter` vs `dragover` synthesis).
     hovered_file: bool,
+    /// Soft keyboard / IME currently requested (mobile toggles it with the focused control).
+    /// Desktop-only builds never read this (the IME stays enabled); it exists on mobile only.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    ime_on: bool,
 }
 
 struct App {
@@ -52,12 +56,17 @@ struct App {
     trace: bool,
     /// D2 hot reload: mtime of the CLI sidecar file last consumed.
     hot_mtime: Option<std::time::SystemTime>,
+    /// Desktop gamepads (`gilrs`); `None` when the OS backend is unavailable.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pads: Option<crate::gamepad::Pads>,
+    /// Whether any gamepad was connected at the last poll (keeps the loop polling at ~60 Hz).
+    pads_active: bool,
 }
 
 pub fn run(bundle: AppBundle) -> Result<(), String> {
     let event_loop = EventLoop::<accesskit_winit::Event>::with_user_event().build().map_err(|e| format!("event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { bundle, windows: HashMap::new(), mods: ModifiersState::empty(), error: None, start: Instant::now(), frames: 0, a11y_proxy: None, trace: std::env::var_os("RENDRIX_TRACE_EVENTS").is_some(), dump: std::env::var_os("RENDRIX_DUMP_FRAME").map(|p| (std::path::PathBuf::from(p), Instant::now() - Duration::from_secs(1))), hot_mtime: None };
+    let mut app = App { bundle, windows: HashMap::new(), mods: ModifiersState::empty(), error: None, start: Instant::now(), frames: 0, a11y_proxy: None, trace: std::env::var_os("RENDRIX_TRACE_EVENTS").is_some(), dump: std::env::var_os("RENDRIX_DUMP_FRAME").map(|p| (std::path::PathBuf::from(p), Instant::now() - Duration::from_secs(1))), hot_mtime: None, #[cfg(not(any(target_os = "android", target_os = "ios")))] pads: crate::gamepad::Pads::new(), pads_active: false };
     app.a11y_proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app).map_err(|e| format!("event loop: {e}"))?;
     match app.error.take() {
@@ -136,6 +145,18 @@ fn file_name_of(path: &std::path::Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// Push the OS window insets into CSS `env(safe-area-inset-*)`.
+///
+/// winit 0.30 exposes no safe-area-insets API on any backend: on iOS `inner_size` already *is*
+/// the safe area (so zero padding is correct there) and everywhere else there is nothing to
+/// query. Native mobile shells that do know the insets (edge-to-edge Android, notched iOS)
+/// feed them through [`Session::set_safe_area`] directly; this stays the single call site so a
+/// future backend only changes this function. Re-run on resize because rotation can change the
+/// insets; `set_safe_area` no-ops when the values are unchanged, so the steady state is free.
+fn refresh_safe_area(state: &mut WindowState) {
+    state.session.set_safe_area(0.0, 0.0, 0.0, 0.0);
+}
+
 impl App {
     /// Build one native window and boot a fresh `Session` (full app instance) in it.
     fn create_window_state(&mut self, event_loop: &ActiveEventLoop, width: u32, height: u32, title: &str, script_id: Option<u32>) -> Result<WindowId, String> {
@@ -177,7 +198,8 @@ impl App {
         let a11y = self.a11y_proxy.clone().map(|proxy| Adapter::with_event_loop_proxy(event_loop, &window, proxy));
         window.set_visible(true);
         window.request_redraw();
-        self.windows.insert(id, WindowState { window, surface, config, renderer, session, cursor_pos: PhysicalPosition::new(0.0, 0.0), script_id, hovered_file: false, a11y });
+        self.windows.insert(id, WindowState { window, surface, config, renderer, session, cursor_pos: PhysicalPosition::new(0.0, 0.0), script_id, hovered_file: false, #[cfg(any(target_os = "android", target_os = "ios"))] ime_on: true, a11y });
+        refresh_safe_area(self.windows.get_mut(&id).expect("just inserted"));
         Ok(id)
     }
 
@@ -257,6 +279,13 @@ impl App {
         }
         if let Some(c) = info.cursor {
             state.window.set_cursor(cursor_icon(c));
+        }
+        // Mobile: show the soft keyboard exactly while a text control has focus. Desktop keeps the
+        // IME enabled permanently (composition must work before the first keystroke).
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        if info.text_input != state.ime_on {
+            state.ime_on = info.text_input;
+            state.window.set_ime_allowed(info.text_input);
         }
         if let Some(r) = state.session.caret_rect() {
             state.window.set_ime_cursor_area(LogicalPosition::new(r[0] as f64, r[1] as f64), LogicalSize::new(r[2] as f64, r[3] as f64));
@@ -367,6 +396,17 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 }
             }
         }
+        // Gamepads have no OS wake-up here: poll them each loop turn and keep the loop ticking while one is connected.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(pads) = self.pads.as_mut() {
+            let snapshot = pads.poll();
+            self.pads_active = snapshot.iter().any(|(_, s)| s.is_some());
+            for state in self.windows.values_mut() {
+                for (i, s) in &snapshot {
+                    state.session.set_gamepad(*i, s.clone());
+                }
+            }
+        }
         let mut earliest: Option<f64> = None;
         let mut need_wait = false;
         for state in self.windows.values_mut() {
@@ -380,7 +420,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 earliest = Some(earliest.map_or(t, |e: f64| e.min(t)));
             }
         }
-        if need_wait {
+        if need_wait || self.pads_active {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
         } else if let Some(t) = earliest {
             // `pump` returns runtime-clock seconds; convert through any one session.
@@ -422,6 +462,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                         state.surface.configure(state.renderer.device(), &state.config);
                         let s = state.window.scale_factor();
                         state.session.resize((size.width as f64 / s) as f32, (size.height as f64 / s) as f32, s as f32);
+                        refresh_safe_area(state);
                     }
                 }
             }
@@ -429,6 +470,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 if let Some(state) = self.windows.get_mut(&id) {
                     let size = state.window.inner_size();
                     state.session.resize((size.width as f64 / scale_factor) as f32, (size.height as f64 / scale_factor) as f32, scale_factor as f32);
+                    refresh_safe_area(state);
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
@@ -484,6 +526,23 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 };
                 if let Some(s) = self.windows.get_mut(&id) {
                     s.session.wheel(x, y, dx, dy);
+                }
+            }
+            WindowEvent::Touch(touch) => {
+                let s = self.windows.get(&id).map(|g| g.window.scale_factor()).unwrap_or(1.0);
+                let (x, y) = ((touch.location.x / s) as f32, (touch.location.y / s) as f32);
+                // winit touch ids are 64-bit; DOM touch identifiers are small ints.
+                let tid = (touch.id & 0xffff) as u32;
+                if let Some(st) = self.windows.get_mut(&id) {
+                    if st.session.js.host.borrow().max_touch_points == 0 {
+                        st.session.set_max_touch_points(5);
+                    }
+                    match touch.phase {
+                        winit::event::TouchPhase::Started => st.session.touch_start(tid, x, y),
+                        winit::event::TouchPhase::Moved => st.session.touch_move(tid, x, y),
+                        winit::event::TouchPhase::Ended => st.session.touch_end(tid, x, y),
+                        winit::event::TouchPhase::Cancelled => st.session.touch_cancel(tid),
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

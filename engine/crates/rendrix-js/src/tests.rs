@@ -512,6 +512,125 @@ fn a_resize(r: &mut JsRuntime) {
 }
 
 #[test]
+fn resize_observer_box_options_report_distinct_boxes() {
+    let mut r = rt("<style>body{margin:0} #b{width:100px;height:40px;padding:10px;border:5px solid black}</style><div id=b></div>");
+    run(
+        &mut r,
+        "globalThis.rec = []; const b = document.getElementById('b');
+         const o1 = new ResizeObserver(es => es.forEach(e => rec.push(['content', e.contentRect.width, e.contentRect.height, e.contentBoxSize[0].inlineSize, e.borderBoxSize[0].inlineSize]))); o1.observe(b);
+         const o2 = new ResizeObserver(es => es.forEach(e => rec.push(['border', e.contentRect.width, e.borderBoxSize[0].inlineSize, e.borderBoxSize[0].blockSize]))); o2.observe(b, { box: 'border-box' });
+         const o3 = new ResizeObserver(es => es.forEach(e => rec.push(['device', e.devicePixelContentBoxSize[0].inlineSize, e.devicePixelContentBoxSize[0].blockSize]))); o3.observe(b, { box: 'device-pixel-content-box' });",
+    );
+    r.run_animation_frame(16.0);
+    // content-box 100x40, border-box 130x70 (10px padding + 5px border per side).
+    assert_eq!(s(&mut r, "rec"), "[[\"content\",100,40,100,130],[\"border\",100,130,70],[\"device\",100,40]]");
+    // Invalid box options throw.
+    run(
+        &mut r,
+        "globalThis.boxErr = (() => { try { new ResizeObserver(() => {}).observe(b, { box: 'margin-box' }); return 'no-throw'; } catch (e) { return e.name; } })();",
+    );
+    assert_eq!(s(&mut r, "boxErr"), "TypeError");
+    // Growing the content box fires content/border observers with the new sizes.
+    run(&mut r, "rec.length = 0; document.getElementById('b').style.width = '120px';");
+    r.run_animation_frame(32.0);
+    assert_eq!(s(&mut r, "rec"), "[[\"content\",120,40,120,150],[\"border\",120,150,70],[\"device\",120,40]]");
+    // devicePixelContentBoxSize scales with the viewport scale.
+    r.engine.borrow_mut().set_viewport(400.0, 300.0, 2.0);
+    run(&mut r, "rec.length = 0; document.getElementById('b').style.height = '50px';");
+    r.run_animation_frame(48.0);
+    assert!(
+        s(&mut r, "rec").contains("[\"device\",240,100]"),
+        "device pixels scale with dpr: {}",
+        s(&mut r, "rec")
+    );
+}
+
+#[test]
+fn intersection_observer_delivers_per_frame_entries() {
+    let mut r = rt("<style>body{margin:0} #a{width:100px;height:100px} #far{margin-top:900px;width:50px;height:50px}</style><div id=a></div><div id=far></div>");
+    run(
+        &mut r,
+        "globalThis.entries = []; const a = document.getElementById('a'), far = document.getElementById('far');
+         globalThis.io = new IntersectionObserver(es => { for (const e of es) entries.push([e.target.id, e.isIntersecting, Math.round(e.intersectionRatio * 100) / 100]); });
+         io.observe(a); io.observe(far);",
+    );
+    assert_eq!(s(&mut r, "typeof IntersectionObserver"), "function");
+    r.run_animation_frame(16.0);
+    assert_eq!(s(&mut r, "entries"), r#"[["a",true,1],["far",false,0]]"#, "initial state fires once per target");
+    // No changes -> no further callbacks (per-frame delivery, no polling spam).
+    run(&mut r, "entries.length = 0;");
+    r.run_animation_frame(32.0);
+    assert_eq!(s(&mut r, "entries"), "[]");
+    // Hiding the element flips it to non-intersecting on the next frame.
+    run(&mut r, "entries.length = 0; document.getElementById('a').style.display = 'none';");
+    r.run_animation_frame(48.0);
+    assert_eq!(s(&mut r, "entries"), r#"[["a",false,0]]"#);
+    // Unobserve stops delivery; disconnect clears the rest.
+    run(&mut r, "entries.length = 0; io.unobserve(document.getElementById('far')); document.getElementById('a').style.display = 'block';");
+    r.run_animation_frame(64.0);
+    assert_eq!(s(&mut r, "entries"), r#"[["a",true,1]]"#, "far was unobserved");
+    run(&mut r, "entries.length = 0; io.disconnect(); document.getElementById('a').style.display = 'none';");
+    r.run_animation_frame(80.0);
+    assert_eq!(s(&mut r, "entries"), "[]", "disconnected observer stays silent");
+    // Constructor validation.
+    run(
+        &mut r,
+        "globalThis.ioErrs = [];
+         try { new IntersectionObserver('nope'); } catch (e) { ioErrs.push(e.name); }
+         try { new IntersectionObserver(() => {}, { threshold: 2 }); } catch (e) { ioErrs.push(e.name); }
+         try { new IntersectionObserver(() => {}, { rootMargin: 'bogus' }); } catch (e) { ioErrs.push(e.name); }
+         try { new IntersectionObserver(() => {}).observe(null); } catch (e) { ioErrs.push(e.name); }",
+    );
+    assert_eq!(s(&mut r, "ioErrs"), r#"["TypeError","TypeError","TypeError","TypeError"]"#);
+}
+
+#[test]
+fn intersection_observer_thresholds_and_root_margin() {
+    let mut r = rt("<style>body{margin:0} #edge{margin-left:350px;width:100px;height:50px}</style><div id=edge></div>");
+    run(
+        &mut r,
+        "globalThis.ratios = []; const edge = document.getElementById('edge');
+         globalThis.io2 = new IntersectionObserver(es => { for (const e of es) ratios.push(Math.round(e.intersectionRatio * 100) / 100); }, { threshold: [0, 0.5, 1] });
+         io2.observe(edge);",
+    );
+    r.run_animation_frame(16.0);
+    // Viewport is 400 wide; the box spans 350..450 so 50/100 = 0.5 is visible.
+    assert_eq!(s(&mut r, "ratios"), "[0.5]");
+    // A large rootMargin pulls the box fully inside.
+    run(
+        &mut r,
+        "ratios.length = 0; globalThis.io3 = new IntersectionObserver(es => { for (const e of es) ratios.push([e.isIntersecting, Math.round(e.intersectionRatio * 100) / 100]); }, { rootMargin: '100px' }); io3.observe(edge);",
+    );
+    r.run_animation_frame(32.0);
+    assert!(
+        s(&mut r, "ratios").contains("[true,1]"),
+        "rootMargin expands the clip: {}",
+        s(&mut r, "ratios")
+    );
+}
+
+#[test]
+fn computed_style_covers_common_properties() {
+    let mut r = rt("<style>body{margin:0} #x{width:120px;height:40px;margin:10px 20px;padding:5px;color:rgb(1,2,3);background-color:rgb(4,5,6);display:flex;position:absolute;top:3px;left:4px;border:2px solid rgb(7,8,9);border-radius:6px;font-style:italic;font-weight:700;opacity:0.5;overflow:hidden;z-index:7;flex-direction:column;box-sizing:border-box}</style><div id=x></div>");
+    run(
+        &mut r,
+        "const cs = getComputedStyle(document.getElementById('x'));
+         globalThis.c = { d: cs.display, pos: cs.position, w: cs.width, h: cs.height, mt: cs.marginTop, m: cs.margin, pt: cs.paddingTop, p: cs.padding,
+           btw: cs.borderTopWidth, bts: cs.borderTopStyle, btc: cs.borderTopColor, br: cs.borderTopLeftRadius, bw: cs.borderWidth, bs: cs.borderStyle,
+           box: cs.boxSizing, fw: cs.fontWeight, fs: cs.fontStyle, fam: cs.fontFamily, lh: cs.lineHeight, ls: cs.letterSpacing,
+           o: cs.opacity, of: cs.overflow, ox: cs.overflowX, zi: cs.zIndex, fd: cs.flexDirection, fg: cs.flexGrow, tr: cs.transform, cur: cs.cursor, pe: cs.pointerEvents,
+           bg: cs.backgroundColor, col: cs.color, ta: cs.textAlign, tt: cs.textTransform, ws: cs.whiteSpace, td: cs.textDecorationLine, us: cs.userSelect };",
+    );
+    assert_eq!(
+        s(&mut r, "c"),
+        r#"{"d":"flex","pos":"absolute","w":"120px","h":"40px","mt":"10px","m":"10px 20px","pt":"5px","p":"5px","btw":"2px","bts":"solid","btc":"rgb(7, 8, 9)","br":"6px","bw":"2px","bs":"solid","box":"border-box","fw":"700","fs":"italic","fam":"sans-serif","lh":"normal","ls":"0px","o":"0.5","of":"hidden","ox":"hidden","zi":"7","fd":"column","fg":"0","tr":"none","cur":"auto","pe":"auto","bg":"rgb(4, 5, 6)","col":"rgb(1, 2, 3)","ta":"start","tt":"none","ws":"normal","td":"none","us":"auto"}"#
+    );
+    // Custom properties still pass through, unknown properties stay empty.
+    run(&mut r, "document.getElementById('x').style.setProperty('--brand', 'teal'); globalThis.custom = [getComputedStyle(document.getElementById('x')).getPropertyValue('--brand'), getComputedStyle(document.getElementById('x')).getPropertyValue('nope-not-real')];");
+    assert_eq!(s(&mut r, "custom"), r#"["teal",""]"#);
+}
+
+#[test]
 fn unhandled_rejections_and_script_errors_are_reported() {
     let mut r = rt("");
     run(&mut r, "globalThis.seen = []; addEventListener('unhandledrejection', e => { seen.push(String(e.reason)); if (String(e.reason).includes('nobody')) e.preventDefault(); }); Promise.reject(new Error('nobody catches this'));");
@@ -561,7 +680,7 @@ fn unsupported_apis_are_honestly_absent_or_throw() {
     let mut r = rt("<canvas id=c width=10 height=10></canvas>");
     assert_eq!(
         s(&mut r, "[typeof WebSocket, typeof XMLHttpRequest, typeof IntersectionObserver]"),
-        r#"["function","undefined","undefined"]"#
+        r#"["function","undefined","function"]"#
     );
     assert_eq!(
         s(&mut r, "[typeof WebGLRenderingContext, typeof WebGL2RenderingContext, typeof RendrixScene, typeof Rendrix3D]"),
@@ -1071,18 +1190,203 @@ fn canvas_2d_pixels_paths_gradients_and_images() {
     );
     assert_eq!(s(&mut r, "copied"), "0,255,0,255");
     assert_eq!(s(&mut r, "restored"), "0,255,0,255");
-    // Invalid styles are ignored, bad arcs throw IndexSizeError, zero-size reads throw.
+    // Invalid styles are ignored (restore() puts the saved gradient back, so park a
+    // plain color first to keep the assertion readable). Bad arcs throw IndexSizeError,
+    // zero-size reads throw. Radial gradients now paint (negative radii still throw);
+    // only patterns stay unsupported.
     run(
         &mut r,
-        "globalThis.errs = []; x.fillStyle = 'nope-not-a-color'; globalThis.kept = x.fillStyle;
+        "globalThis.errs = []; x.fillStyle = 'lime'; x.fillStyle = 'nope-not-a-color'; globalThis.kept = x.fillStyle;
          try { x.arc(1, 1, -2, 0, 1); } catch (e) { errs.push(e.name); }
          try { x.getImageData(0, 0, 0, 4); } catch (e) { errs.push(e.name); }
-         try { x.createRadialGradient(0,0,1,0,0,2); } catch (e) { errs.push(e.name); }",
+         try { x.createRadialGradient(0,0,-1,0,0,2); } catch (e) { errs.push(e.name); }
+         try { x.createPattern(null); } catch (e) { errs.push(e.name); }
+         globalThis.radialOk = (() => { try { x.createRadialGradient(0,0,1,0,0,2); x.createConicGradient(0,0,0); return true; } catch (_) { return false; } })();",
     );
     assert_eq!(
-        s(&mut r, "[kept, errs]"),
-        r#"["lime",["IndexSizeError","IndexSizeError","NotSupportedError"]]"#
+        s(&mut r, "[kept, errs, radialOk]"),
+        r#"["lime",["IndexSizeError","IndexSizeError","IndexSizeError","NotSupportedError"],true]"#
     );
+}
+
+#[test]
+fn canvas_2d_remainder_text_path2d_clip_gradients_shadows() {
+    let mut r = rt("<canvas id=c width=64 height=64></canvas>");
+    run(
+        &mut r,
+        "globalThis.c = document.getElementById('c'); globalThis.x = c.getContext('2d');
+         globalThis.px = (a, b) => [...x.getImageData(a, b, 1, 1).data].join();",
+    );
+    // Radial gradient: white center, black edge.
+    run(
+        &mut r,
+        "x.clearRect(0, 0, 64, 64);
+         const rg = x.createRadialGradient(32, 32, 2, 32, 32, 30);
+         rg.addColorStop(0, 'white'); rg.addColorStop(1, 'black');
+         x.fillStyle = rg; x.fillRect(0, 0, 64, 64);
+         globalThis.radial = [px(32, 32), px(0, 0)];",
+    );
+    assert_eq!(s(&mut r, "radial"), r#"["255,255,255,255","0,0,0,255"]"#);
+    // Conic gradient: the 12-o'clock ray holds the first stop, the sweep blends.
+    // (Pixel centers sit half a pixel off the ray, so the assertions allow the
+    // sub-percent blend that produces.)
+    run(
+        &mut r,
+        "x.clearRect(0, 0, 64, 64);
+         const cg = x.createConicGradient(0, 32, 32);
+         cg.addColorStop(0, 'red'); cg.addColorStop(1, 'blue');
+         x.fillStyle = cg; x.fillRect(0, 0, 64, 64);
+         globalThis.conic = (() => { const [a, b] = [px(32, 48), px(48, 32)].map(s => s.split(',').map(Number)); return [a[0] > 200 && a[2] < 60, a.join() !== b.join()]; })();",
+    );
+    assert_eq!(s(&mut r, "conic"), "[true,true]");
+    // Gradient stop validation still throws SyntaxError for out-of-range offsets.
+    run(
+        &mut r,
+        "globalThis.gradErr = (() => { try { const g = x.createLinearGradient(0,0,1,1); g.addColorStop(2, 'red'); } catch (e) { return e.name; } return 'no-throw'; })();",
+    );
+    assert_eq!(s(&mut r, "gradErr"), "SyntaxError");
+    // Path2D: own path object usable in fill/stroke, copy constructor, evenodd holes.
+    run(
+        &mut r,
+        "x.clearRect(0, 0, 64, 64); x.save();
+         const p = new Path2D(); p.rect(40, 2, 10, 10);
+         x.fillStyle = 'red'; x.fill(p);
+         globalThis.pathFill = px(45, 7);
+         const q = new Path2D(p); x.fillStyle = 'blue'; x.fill(q);
+         globalThis.pathCopy = px(45, 7);
+         const s2 = new Path2D(); s2.moveTo(2, 50); s2.lineTo(20, 50);
+         x.strokeStyle = 'black'; x.lineWidth = 4; x.stroke(s2);
+         globalThis.pathStroke = px(10, 50);
+         const e = new Path2D(); e.rect(0, 0, 20, 20); e.rect(5, 5, 10, 10);
+         x.fillStyle = 'magenta'; x.fill(e, 'evenodd');
+         globalThis.evenodd = [px(2, 2), px(10, 10)];
+         globalThis.pathStrErr = (() => { try { new Path2D('M0 0h10v10H0z'); } catch (err) { return err.name; } return 'no-throw'; })();
+         x.restore();",
+    );
+    assert_eq!(s(&mut r, "pathFill"), "255,0,0,255");
+    assert_eq!(s(&mut r, "pathCopy"), "0,0,255,255");
+    assert_eq!(s(&mut r, "pathStroke"), "0,0,0,255");
+    assert_eq!(
+        s(&mut r, "evenodd"),
+        r#"["255,0,255,255","0,0,0,0"]"#,
+        "evenodd leaves the inner rect unpainted"
+    );
+    assert_eq!(s(&mut r, "pathStrErr"), "NotSupportedError");
+    assert_eq!(s(&mut r, "typeof Path2D"), "function");
+    // clip(): intersect, restore-on-save, Path2D form.
+    run(
+        &mut r,
+        "x.clearRect(0, 0, 64, 64); x.save();
+         x.beginPath(); x.rect(0, 0, 8, 8); x.clip();
+         x.fillStyle = 'lime'; x.fillRect(0, 0, 64, 64);
+         globalThis.clipIn = px(4, 4); globalThis.clipOut = px(20, 20);
+         const cp = new Path2D(); cp.rect(40, 40, 8, 8); x.clip(cp);
+         x.fillRect(0, 0, 64, 64);
+         globalThis.clipDisjoint = px(4, 4);
+         x.restore(); x.fillStyle = 'lime'; x.fillRect(0, 0, 64, 64);
+         globalThis.clipRestored = px(20, 20);",
+    );
+    assert_eq!(
+        s(&mut r, "[clipIn, clipOut, clipDisjoint, clipRestored]"),
+        r#"["0,255,0,255","0,0,0,0","0,255,0,255","0,255,0,255"]"#
+    );
+    // Text: font wiring, measureText, fillText pixels, alignment, invalid fonts ignored.
+    run(
+        &mut r,
+        "x.clearRect(0, 0, 64, 64);
+         x.font = '20px sans-serif'; globalThis.fontAfterGood = x.font;
+         x.font = 'bogus'; globalThis.fontKept = x.font;
+         const m = x.measureText('Hello');
+         globalThis.metrics = [m.width > 0, m.actualBoundingBoxAscent > 0];
+         x.fillStyle = 'black'; x.textBaseline = 'alphabetic'; x.textAlign = 'start';
+         x.fillText('Hi', 2, 30);
+         let found = 0; for (let yy = 10; yy < 36 && !found; yy++) for (let xx = 0; xx < 40 && !found; xx++) if (+px(xx, yy).split(',')[3] > 0) found = 1;
+         globalThis.textFound = found;
+         x.clearRect(0, 0, 64, 64); x.textAlign = 'right'; x.fillText('Hi', 64, 30);
+         let right = 0; for (let xx = 40; xx < 64 && !right; xx++) for (let yy = 10; yy < 36 && !right; yy++) if (+px(xx, yy).split(',')[3] > 0) right = 1;
+         let left = 0; for (let xx = 0; xx < 20 && !left; xx++) for (let yy = 10; yy < 36 && !left; yy++) if (+px(xx, yy).split(',')[3] > 0) left = 1;
+         globalThis.alignRight = [right, left];
+         x.textAlign = 'start';
+         globalThis.maxW = x.measureText('Hello world, this is long').width > x.measureText('Hi').width;
+         x.fillText('Hello', 2, 50, 4);
+         globalThis.strokeTextOk = (() => { x.strokeStyle = 'black'; x.strokeText('S', 30, 20); return true; })();",
+    );
+    assert_eq!(s(&mut r, "fontAfterGood"), "20px sans-serif");
+    assert_eq!(s(&mut r, "fontKept"), "20px sans-serif", "invalid fonts are ignored");
+    assert_eq!(s(&mut r, "metrics"), "[true,true]");
+    assert_eq!(s(&mut r, "textFound"), "1", "fillText leaves opaque pixels");
+    assert_eq!(s(&mut r, "alignRight"), "[1,0]", "right alignment hugs the right edge");
+    assert_eq!(s(&mut r, "maxW"), "true");
+    assert_eq!(s(&mut r, "strokeTextOk"), "true");
+    // save/restore round-trips the font cache too.
+    run(
+        &mut r,
+        "x.font = '20px serif'; x.save(); x.font = '10px monospace'; x.restore(); globalThis.fontRestored = x.font;",
+    );
+    assert_eq!(s(&mut r, "fontRestored"), "20px serif");
+    // Shadows: offset shadow beside the shape, blur spreads it, save/restore works.
+    run(
+        &mut r,
+        "x.clearRect(0, 0, 64, 64);
+         x.save(); x.shadowColor = 'red'; x.shadowBlur = 0; x.shadowOffsetX = 10; x.shadowOffsetY = 0;
+         x.fillStyle = 'blue'; x.fillRect(2, 2, 4, 4);
+         globalThis.shadow = [px(3, 4), px(13, 4), px(30, 4)];
+         x.shadowBlur = 6; x.shadowOffsetX = 0; x.fillRect(30, 2, 4, 4);
+         globalThis.shadowBlur = px(27, 4);
+         x.restore(); globalThis.shadowAfter = [x.shadowColor, x.shadowBlur, x.shadowOffsetX];
+         x.fillStyle = 'blue'; x.fillRect(50, 50, 4, 4);
+         globalThis.noShadow = [px(52, 52), px(62, 52)];",
+    );
+    assert_eq!(
+        s(&mut r, "shadow"),
+        r#"["0,0,255,255","255,0,0,255","0,0,0,0"]"#,
+        "shape on top, offset shadow beside it"
+    );
+    assert_ne!(
+        s(&mut r, "shadowBlur"),
+        "0,0,0,0",
+        "blur spreads the shadow past the shape"
+    );
+    assert_eq!(
+        s(&mut r, "shadowAfter"),
+        r#"["rgba(0, 0, 0, 0)",0,0]"#,
+        "restore drops shadow state"
+    );
+    assert_eq!(s(&mut r, "noShadow"), r#"["0,0,255,255","0,0,0,0"]"#);
+    // Still-source-over compositing and still-unsupported surface APIs.
+    run(
+        &mut r,
+        "x.globalCompositeOperation = 'lighter'; globalThis.gco = x.globalCompositeOperation;
+         globalThis.unsupported = [typeof c.toBlob, typeof OffscreenCanvas, typeof x.filter];",
+    );
+    assert_eq!(
+        s(&mut r, "[gco, unsupported]"),
+        r#"["source-over",["undefined","undefined","undefined"]]"#
+    );
+}
+
+#[test]
+fn svg_image_decodes_and_draws_to_canvas_with_getimagedata_pixels() {
+    // `<img src=.svg>` decodes through the same engine path as PNG: natural size from
+    // width/height (or viewBox), CPU raster upload, `drawImage` + `getImageData` pixels.
+    let mut assets = MapAssets::default();
+    assets.0.insert(
+        "r.svg".into(),
+        br##"<svg width="40" height="20"><rect x="0" y="0" width="40" height="20" fill="#ff0000"/><circle cx="30" cy="10" r="6" fill="rgb(0,0,255)"/></svg>"##.to_vec(),
+    );
+    let mut r = rt_with("<canvas id=c width=40 height=20></canvas>", assets);
+    run(
+        &mut r,
+        "globalThis.c = document.getElementById('c'); globalThis.x = c.getContext('2d');
+         const img = new Image(); img.src = 'r.svg';
+         globalThis.nat = [img.naturalWidth, img.naturalHeight, img.complete];
+         x.drawImage(img, 0, 0);
+         globalThis.px = (a, b) => [...x.getImageData(a, b, 1, 1).data].join();",
+    );
+    assert_eq!(s(&mut r, "nat"), "[40,20,true]");
+    assert_eq!(s(&mut r, "px(2, 10)"), "255,0,0,255");
+    // Circle centre (30,10) paints blue over the red rect.
+    assert_eq!(s(&mut r, "px(30, 10)"), "0,0,255,255");
 }
 
 #[test]

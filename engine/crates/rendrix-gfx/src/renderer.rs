@@ -6,7 +6,7 @@ use crate::text::TextSystem;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use rendrix_css::animation::{mat_apply, mat_mul, Matrix, IDENTITY};
-use rendrix_css::Color;
+use rendrix_css::{Color, FilterOp};
 use std::collections::HashMap;
 
 const ATLAS_SIZE: u32 = 2048;
@@ -26,6 +26,10 @@ struct Inst {
     clip: [f32; 4],
     uv: [f32; 4],
     extra: [f32; 4],
+    /// Filter/clip-shape factors, always present so filtered and unfiltered draws share
+    /// one pipeline (zero batch impact when unused): `x` = clip kind (0 = rounded rect,
+    /// 1 = ellipse inscribed in `clip`), `y` = grayscale 0..1, `z` = brightness factor.
+    clip_info: [f32; 4],
 }
 
 #[repr(C)]
@@ -73,23 +77,56 @@ struct Atlas {
     bind: wgpu::BindGroup,
     size: u32,
     map: HashMap<cosmic_text::CacheKey, Option<AtlasEntry>>,
+    /// Last-use tick per resident glyph (blank markers excluded: they occupy no
+    /// texture space). Drives LRU eviction in `begin_frame`.
+    recency: HashMap<cosmic_text::CacheKey, u64>,
+    /// Monotonic tick bumped on every atlas lookup.
+    clock: u64,
     cursor_x: u32,
     cursor_y: u32,
     row_h: u32,
     pub evictions: u32,
-    /// Bumped every time the atlas is cleared. Instances always reference the
-    /// current generation's placements: the clear is deferred to the next frame
+    /// Bumped every time the atlas is recycled. Instances always reference the
+    /// current generation's placements: the recycle is deferred to the next frame
     /// start, so no in-flight instance can ever point at a recycled slot.
     pub generation: u64,
-    /// Set when a frame needed more space than the atlas holds; cleared (and
+    /// Set when a frame needed more space than the atlas holds; recycled (and
     /// counted) at the next frame start.
     overflowed: bool,
 }
 
 struct State {
     xf: Vec<Matrix>,
-    clip: Vec<([f32; 4], f32)>,
+    clip: Vec<ClipEntry>,
     opacity: Vec<f32>,
+    filter: Vec<Vec<FilterOp>>,
+    /// `backdrop-filter` levels. Stored for push/pop balance only: sampling the backdrop
+    /// needs an offscreen feedback pass, so the ops have no visual effect (documented approx).
+    backdrop: Vec<Vec<FilterOp>>,
+}
+
+/// One clip-stack level: the intersected rectangle plus the newest level's shape.
+/// Per-pixel testing follows the newest level only (outer shapes still cull through the
+/// intersected rectangle) — the same approximation overflow clips already used.
+#[derive(Clone, Copy)]
+struct ClipEntry {
+    rect: [f32; 4],
+    radius: f32,
+    ellipse: bool,
+}
+
+/// Order resident glyphs newest-first for LRU repack (pure helper, unit-tested).
+fn lru_order(recency: &HashMap<cosmic_text::CacheKey, u64>) -> Vec<(cosmic_text::CacheKey, u64)> {
+    let mut v: Vec<_> = recency.iter().map(|(k, t)| (*k, *t)).collect();
+    v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+    v
+}
+
+/// Conservative offscreen test for a whole text item in device space.
+/// The paragraph height is unknown pre-shape, so only left/right/below are
+/// culled; anything possibly visible returns true. Pure helper, unit-tested.
+fn text_maybe_visible(x: f32, y: f32, w: f32, clip: [f32; 4]) -> bool {
+    !(x > clip[0] + clip[2] || x + w < clip[0] || y > clip[1] + clip[3])
 }
 
 // ---- 3D forward pass (R6.2 v1) ------------------------------------------------------
@@ -405,7 +442,7 @@ impl Renderer {
             tex_layout,
             sampler,
             white_bind,
-            atlas: Atlas { texture: atlas_tex, bind: atlas_bind, size: atlas_size, map: HashMap::new(), cursor_x: 3, cursor_y: 0, row_h: 3, evictions: 0, generation: 0, overflowed: false },
+            atlas: Atlas { texture: atlas_tex, bind: atlas_bind, size: atlas_size, map: HashMap::new(), recency: HashMap::new(), clock: 0, cursor_x: 3, cursor_y: 0, row_h: 3, evictions: 0, generation: 0, overflowed: false },
             images: HashMap::new(),
             next_image: 1,
             inst_buf,
@@ -437,7 +474,7 @@ impl Renderer {
         })
     }
 
-    /// Glyph-atlas evictions so far (each one cleared the map and re-uploaded).
+    /// Glyph-atlas recycles so far (each one LRU-repacked the atlas and re-uploaded).
     pub fn atlas_evictions(&self) -> u32 {
         self.atlas.evictions
     }
@@ -583,7 +620,12 @@ impl Renderer {
     // ------------------------------------------------------------------------------------
 
     fn atlas_entry(&mut self, text: &mut TextSystem, key: cosmic_text::CacheKey) -> Option<AtlasEntry> {
+        self.atlas.clock = self.atlas.clock.wrapping_add(1);
+        let now = self.atlas.clock;
         if let Some(e) = self.atlas.map.get(&key) {
+            if e.is_some() {
+                self.atlas.recency.insert(key, now);
+            }
             return *e;
         }
         let Some(r) = text.raster(key) else {
@@ -617,26 +659,71 @@ impl Renderer {
         );
         let e = AtlasEntry { x, y, w: r.width, h: r.height, left: r.left, top: r.top, is_color: r.is_color };
         self.atlas.map.insert(key, Some(e));
+        self.atlas.recency.insert(key, now);
         Some(e)
     }
 
     /// Recycle the glyph atlas if the previous frame overflowed it. Runs at frame
     /// start so in-flight instances never go stale.
-    fn begin_frame(&mut self) {
-        if self.atlas.overflowed {
-            self.atlas.map.clear();
-            self.atlas.cursor_x = 3;
-            self.atlas.cursor_y = 0;
-            self.atlas.row_h = 3;
-            self.atlas.evictions += 1;
-            self.atlas.generation += 1;
-            self.atlas.overflowed = false;
+    ///
+    /// Per-glyph LRU: resident glyphs are re-uploaded newest-first into the fresh
+    /// atlas until it is full; the coldest glyphs stay evicted and fault back in
+    /// on demand. The 2x2 white block at the origin is never overwritten
+    /// (allocation restarts at x=3), so shapes keep sampling it. Blank-glyph
+    /// markers occupy no texture space and are always retained.
+    fn begin_frame(&mut self, text: &mut TextSystem) {
+        if !self.atlas.overflowed {
+            return;
+        }
+        let live = lru_order(&self.atlas.recency);
+        let blanks: Vec<cosmic_text::CacheKey> =
+            self.atlas.map.iter().filter_map(|(k, v)| v.is_none().then_some(*k)).collect();
+        self.atlas.map.clear();
+        self.atlas.recency.clear();
+        let (nlive, nblanks) = (live.len(), blanks.len());
+        for k in blanks {
+            self.atlas.map.insert(k, None);
+        }
+        self.atlas.cursor_x = 3;
+        self.atlas.cursor_y = 0;
+        self.atlas.row_h = 3;
+        self.atlas.evictions += 1;
+        self.atlas.generation += 1;
+        self.atlas.overflowed = false;
+        self.atlas.clock = self.atlas.clock.wrapping_add(1);
+        for (key, used) in live {
+            let Some(r) = text.raster(key) else {
+                self.atlas.map.insert(key, None);
+                continue;
+            };
+            let (w, h) = (r.width + 1, r.height + 1);
+            let size = self.atlas.size;
+            if self.atlas.cursor_x + w > size {
+                self.atlas.cursor_x = 0;
+                self.atlas.cursor_y += self.atlas.row_h;
+                self.atlas.row_h = 0;
+            }
+            if self.atlas.cursor_y + h > size {
+                // Still full: this and all colder glyphs stay evicted.
+                continue;
+            }
+            let (x, y) = (self.atlas.cursor_x, self.atlas.cursor_y);
+            self.atlas.cursor_x += w;
+            self.atlas.row_h = self.atlas.row_h.max(h);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.atlas.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                &r.rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(r.width * 4), rows_per_image: Some(r.height) },
+                wgpu::Extent3d { width: r.width, height: r.height, depth_or_array_layers: 1 },
+            );
+            self.atlas.map.insert(key, Some(AtlasEntry { x, y, w: r.width, h: r.height, left: r.left, top: r.top, is_color: r.is_color }));
+            self.atlas.recency.insert(key, used);
         }
     }
 
     /// Draw a display list into `target` (`size_px` physical pixels, `scale` device px per logical px).
     pub fn render(&mut self, list: &DisplayList, text: &mut TextSystem, target: &wgpu::TextureView, size_px: (u32, u32), scale: f32) {
-        self.begin_frame();
+        self.begin_frame(text);
         let mut insts: Vec<Inst> = Vec::with_capacity(512);
         let mut batches: Vec<Batch> = Vec::new();
         let mut scenes: Vec<SceneDraw> = Vec::new();
@@ -767,20 +854,25 @@ impl Renderer {
     // ------------------------------------------------------------------------------------
 
     fn flatten(&mut self, list: &DisplayList, text: &mut TextSystem, scale: f32, insts: &mut Vec<Inst>, batches: &mut Vec<Batch>, scenes: &mut Vec<SceneDraw>) {
-        let mut st = State { xf: vec![[scale, 0.0, 0.0, scale, 0.0, 0.0]], clip: vec![(NO_CLIP, 0.0)], opacity: vec![1.0] };
-        let push = |insts: &mut Vec<Inst>, batches: &mut Vec<Batch>, tex: Tex, inst: Inst| {
-            let idx = insts.len() as u32;
-            insts.push(inst);
-            match batches.last_mut() {
-                Some(b) if b.tex == tex && b.end == idx => b.end += 1,
-                _ => batches.push(Batch { tex, start: idx, end: idx + 1 }),
-            }
+        let mut st = State {
+            xf: vec![[scale, 0.0, 0.0, scale, 0.0, 0.0]],
+            clip: vec![ClipEntry { rect: NO_CLIP, radius: 0.0, ellipse: false }],
+            opacity: vec![1.0],
+            filter: Vec::new(),
+            backdrop: Vec::new(),
         };
 
         for item in &list.items {
             let xf = *st.xf.last().unwrap();
-            let (clip, clip_r) = *st.clip.last().unwrap();
+            let top = *st.clip.last().unwrap();
+            let (clip, clip_r, clip_e) = (top.rect, top.radius, top.ellipse);
             let op = *st.opacity.last().unwrap();
+            // Fold the filter stack to per-instance factors (pointwise ops are exact;
+            // blur is expanded into offset copies at emit time).
+            let (f_gray, f_bright, f_blur) = filter_fold(&st.filter);
+            let det_sc = (xf[0] * xf[3] - xf[1] * xf[2]).abs().sqrt().max(1e-3);
+            let blur_local = if f_blur > 0.0 { f_blur * 0.5 / det_sc } else { 0.0 };
+            let clip_kind = if clip_e { 1.0 } else { 0.0 };
             let base = |rect: [f32; 4], kind: f32| Inst {
                 rect,
                 xf0: [xf[0], xf[1], xf[2], xf[3]],
@@ -789,6 +881,7 @@ impl Renderer {
                 // Shapes sample the atlas's white block (see `Renderer::new`).
                 uv: [1.0 / ATLAS_SIZE as f32, 1.0 / ATLAS_SIZE as f32, 0.0, 0.0],
                 extra: [0.0, 0.0, clip_r, 0.0],
+                clip_info: [clip_kind, f_gray, f_bright, 0.0],
                 ..Default::default()
             };
             match item {
@@ -808,7 +901,7 @@ impl Renderer {
                     if matches!(r.fill, Fill::None) && r.border.is_none() {
                         continue;
                     }
-                    push(insts, batches, Tex::Atlas, i);
+                    push_inst(insts, batches, Tex::Atlas, i, blur_local);
                 }
                 Item::Shadow(s) => {
                     let mut i = base(s.rect, if s.inset { 2.0 } else { 1.0 });
@@ -820,18 +913,26 @@ impl Renderer {
                         i.border = s.hole;
                         i.bcolor = clamp_radii(s.radii, s.hole[2], s.hole[3]);
                     }
-                    push(insts, batches, Tex::Atlas, i);
+                    push_inst(insts, batches, Tex::Atlas, i, blur_local);
                 }
                 Item::Image(im) => {
                     let mut i = base(im.rect, 4.0);
                     i.radii = clamp_radii(im.radii, im.rect[2], im.rect[3]);
                     i.c[0] = [1.0, 1.0, 1.0, op];
                     i.uv = im.uv;
-                    push(insts, batches, Tex::Image(im.image), i);
+                    push_inst(insts, batches, Tex::Image(im.image), i, blur_local);
                 }
                 Item::Text(t) => {
-                    let para = text.paragraph(&t.content, Some(t.width));
                     let simple = xf[1].abs() < 1e-6 && xf[2].abs() < 1e-6;
+                    if simple {
+                        // Lazy-shape offscreen paragraphs: skip shaping, atlas
+                        // uploads and instances for text fully outside the clip.
+                        let (dx0, dy0) = mat_apply(xf, t.x, t.y);
+                        if !text_maybe_visible(dx0, dy0, t.width * xf[0].abs(), clip) {
+                            continue;
+                        }
+                    }
+                    let para = text.paragraph(&t.content, Some(t.width));
                     let sc = (xf[0] * xf[3] - xf[1] * xf[2]).abs().sqrt().max(1e-3);
                     for g in &para.glyphs {
                         let run = &t.content.runs[g.run.min(t.content.runs.len() - 1)];
@@ -842,7 +943,10 @@ impl Renderer {
                         let (ox, oy) = (t.x, t.y + g.line_y);
                         let phys = g.glyph.physical((0.0, 0.0), sc);
                         let Some(e) = self.atlas_entry(text, phys.cache_key) else { continue };
-                        let uv = [e.x as f32 / ATLAS_SIZE as f32, e.y as f32 / ATLAS_SIZE as f32, e.w as f32 / ATLAS_SIZE as f32, e.h as f32 / ATLAS_SIZE as f32];
+                        // UVs are fractions of the actual atlas edge (the test
+                        // renderer uses a tiny atlas; production uses 2048).
+                        let s = self.atlas.size as f32;
+                        let uv = [e.x as f32 / s, e.y as f32 / s, e.w as f32 / s, e.h as f32 / s];
                         let kind = if e.is_color { 4.0 } else { 3.0 };
                         let mut i;
                         if simple {
@@ -851,7 +955,15 @@ impl Renderer {
                             let (dx, dy) = mat_apply(xf, ox, oy);
                             let px = (dx.round() as i32 + phys.x + e.left) as f32;
                             let py = (dy.round() as i32 + phys.y - e.top) as f32;
-                            i = Inst { rect: [px, py, e.w as f32, e.h as f32], xf0: [1.0, 0.0, 0.0, 1.0], xf1: [0.0, 0.0, kind, 0.0], clip, extra: [0.0, 0.0, clip_r, 0.0], ..Default::default() };
+                            // Fully-clipped glyphs need no atlas slot and no instance.
+                            if px + e.w as f32 <= clip[0]
+                                || px >= clip[0] + clip[2]
+                                || py + e.h as f32 <= clip[1]
+                                || py >= clip[1] + clip[3]
+                            {
+                                continue;
+                            }
+                            i = Inst { rect: [px, py, e.w as f32, e.h as f32], xf0: [1.0, 0.0, 0.0, 1.0], xf1: [0.0, 0.0, kind, 0.0], clip, extra: [0.0, 0.0, clip_r, 0.0], clip_info: [clip_kind, f_gray, f_bright, 0.0], ..Default::default() };
                         } else {
                             // Rotated/skewed text: place the glyph quad in local space and let the matrix transform it.
                             let lx = ox + (phys.x + e.left) as f32 / sc;
@@ -860,7 +972,7 @@ impl Renderer {
                         }
                         i.c[0] = color;
                         i.uv = uv;
-                        push(insts, batches, Tex::Atlas, i);
+                        push_inst(insts, batches, Tex::Atlas, i, blur_local);
                     }
                     // Underline / line-through spans.
                     for seg in &para.segments {
@@ -883,18 +995,18 @@ impl Renderer {
                         for y in lines {
                             let mut i = base([t.x + seg.x, t.y + y, seg.w, thick], 0.0);
                             i.c[0] = mul_alpha(run.style.color, op);
-                            push(insts, batches, Tex::Atlas, i);
+                            push_inst(insts, batches, Tex::Atlas, i, blur_local);
                         }
                     }
                 }
                 Item::PushClip { rect, radius } => {
-                    let corners = [mat_apply(xf, rect[0], rect[1]), mat_apply(xf, rect[0] + rect[2], rect[1]), mat_apply(xf, rect[0], rect[1] + rect[3]), mat_apply(xf, rect[0] + rect[2], rect[1] + rect[3])];
-                    let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.0), a.1.max(c.0)));
-                    let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.1), a.1.max(c.1)));
-                    let (px0, py0, px1, py1) = (clip[0], clip[1], clip[0] + clip[2], clip[1] + clip[3]);
-                    let (nx0, ny0, nx1, ny1) = (x0.max(px0), y0.max(py0), x1.min(px1), y1.min(py1));
+                    let r = intersect_rect(xf, rect, clip);
                     let sc = (xf[0] * xf[3] - xf[1] * xf[2]).abs().sqrt();
-                    st.clip.push(([nx0, ny0, (nx1 - nx0).max(0.0), (ny1 - ny0).max(0.0)], radius * sc));
+                    st.clip.push(ClipEntry { rect: r, radius: radius * sc, ellipse: false });
+                }
+                Item::PushEllipseClip { rect } => {
+                    let r = intersect_rect(xf, rect, clip);
+                    st.clip.push(ClipEntry { rect: r, radius: 0.0, ellipse: true });
                 }
                 Item::PopClip => {
                     if st.clip.len() > 1 {
@@ -912,6 +1024,14 @@ impl Renderer {
                     if st.opacity.len() > 1 {
                         st.opacity.pop();
                     }
+                }
+                Item::PushFilter(ops) => st.filter.push(ops.clone()),
+                Item::PopFilter => {
+                    st.filter.pop();
+                }
+                Item::PushBackdrop(ops) => st.backdrop.push(ops.clone()),
+                Item::PopBackdrop => {
+                    st.backdrop.pop();
                 }
                 // 3D viewports ignore opacity (opaque forward pass in v1) but honour
                 // the transform + clip stacks: the rect is resolved to device pixels
@@ -1135,6 +1255,64 @@ fn set_gradient(i: &mut Inst, kind: f32, angle: f32, stops: &[(Color, f32)], op:
     }
 }
 
+/// Fold a filter stack to per-instance factors: `(grayscale 0..1, brightness, blur radius px)`.
+/// Sequential grayscale ops compose as `1 - Π(1 - g)`; brightness multiplies; blur radii add
+/// (capped — the offset-copy expansion below is O(blur) work per instance).
+fn filter_fold(stack: &[Vec<FilterOp>]) -> (f32, f32, f32) {
+    let (mut g, mut b, mut r) = (0.0f32, 1.0f32, 0.0f32);
+    for ops in stack {
+        for op in ops {
+            match op {
+                FilterOp::Grayscale(x) => g += (1.0 - g) * x,
+                FilterOp::Brightness(x) => b *= x,
+                FilterOp::Blur(x) => r += x,
+            }
+        }
+    }
+    (g.clamp(0.0, 1.0), b.max(0.0), r.clamp(0.0, 24.0))
+}
+
+/// Intersect a clip rect (local space) with the current clip, both in device space.
+fn intersect_rect(xf: Matrix, rect: &[f32; 4], clip: [f32; 4]) -> [f32; 4] {
+    let corners = [mat_apply(xf, rect[0], rect[1]), mat_apply(xf, rect[0] + rect[2], rect[1]), mat_apply(xf, rect[0], rect[1] + rect[3]), mat_apply(xf, rect[0] + rect[2], rect[1] + rect[3])];
+    let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.0), a.1.max(c.0)));
+    let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.1), a.1.max(c.1)));
+    let (nx0, ny0, nx1, ny1) = (x0.max(clip[0]), y0.max(clip[1]), x1.min(clip[0] + clip[2]), y1.min(clip[1] + clip[3]));
+    [nx0, ny0, (nx1 - nx0).max(0.0), (ny1 - ny0).max(0.0)]
+}
+
+/// Emit one instance, merging into the current batch when the texture matches.
+/// `blur` is the local-space offset step for `filter: blur()` (0 = one copy): the content is
+/// expanded into a centre + 4 axis copies whose weights sum to 1, a box-blur approximation
+/// that keeps batching identical (same texture, consecutive instances).
+fn push_inst(insts: &mut Vec<Inst>, batches: &mut Vec<Batch>, tex: Tex, inst: Inst, blur: f32) {
+    let emit = |insts: &mut Vec<Inst>, batches: &mut Vec<Batch>, inst: Inst| {
+        let idx = insts.len() as u32;
+        insts.push(inst);
+        match batches.last_mut() {
+            Some(b) if b.tex == tex && b.end == idx => b.end += 1,
+            _ => batches.push(Batch { tex, start: idx, end: idx + 1 }),
+        }
+    };
+    if blur <= 0.0 {
+        emit(insts, batches, inst);
+        return;
+    }
+    // Copies: the centre paints at full strength (opaque interiors stay exact) and the
+    // four axis offsets add a soft halo. Instance colors are non-premultiplied, so only
+    // the alpha is scaled — scaling rgb too would double-premultiply in the shader.
+    const COPIES: [(f32, f32, f32); 5] = [(0.0, 0.0, 1.0), (1.0, 0.0, 0.25), (-1.0, 0.0, 0.25), (0.0, 1.0, 0.25), (0.0, -1.0, 0.25)];
+    for (dx, dy, w) in COPIES {
+        let mut c = inst.clone();
+        c.rect[0] += dx * blur;
+        c.rect[1] += dy * blur;
+        for k in 0..4 {
+            c.c[k][3] *= w;
+        }
+        emit(insts, batches, c);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,7 +1400,7 @@ mod tests {
         s.font_size = 32.0;
         s.color = Color::BLACK;
         let s = Arc::new(s);
-        let content = Arc::new(InlineContent { runs: vec![InlineRun { text: "Hello, Rendrix".into(), style: s.clone(), node: 1, is_break: false }], container: s });
+        let content = Arc::new(InlineContent::new(vec![InlineRun { text: "Hello, Rendrix".into(), style: s.clone(), node: 1, is_break: false }], s));
         let mut ts = TextSystem::new();
         let (mw, mh) = ts.measure(&content, None);
         let (x0, y0) = (10.0f32, 8.0f32);
@@ -1282,7 +1460,7 @@ mod tests {
         s.font_size = 32.0;
         s.color = Color::BLACK;
         let s = Arc::new(s);
-        let content = Arc::new(InlineContent { runs: vec![InlineRun { text, style: s.clone(), node: 1, is_break: false }], container: s });
+        let content = Arc::new(InlineContent::new(vec![InlineRun { text, style: s.clone(), node: 1, is_break: false }], s));
         let mut l = DisplayList::new(2000.0, 2000.0, Color::WHITE);
         l.push(Item::Text(TextItem { content, x: 8.0, y: 8.0, width: 1984.0 }));
         let img1 = r.render_to_rgba(&l, &mut t, (320, 200), 1.0);
@@ -1300,6 +1478,25 @@ mod tests {
         assert_eq!(img2, img3, "steady state stays stable");
         // … and real ink landed in the top-left where the text starts.
         assert!(img1.chunks_exact(4).any(|p| p[0] < 128), "text produced ink");
+        // LRU retention: the hot head glyphs survived the recycle, so drawing
+        // only them faults nothing new in.
+        assert!(r.atlas_generation() >= 1, "recycle bumped the generation");
+        let head: String = (0..20).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        let mut hs = ComputedStyle::default();
+        hs.font_size = 32.0;
+        hs.color = Color::BLACK;
+        let hs = Arc::new(hs);
+        let head_content =
+            Arc::new(InlineContent::new(vec![InlineRun { text: head, style: hs.clone(), node: 1, is_break: false }], hs));
+        let mut hl = DisplayList::new(2000.0, 2000.0, Color::WHITE);
+        hl.push(Item::Text(TextItem { content: head_content, x: 8.0, y: 8.0, width: 1984.0 }));
+        // First head-only frame recycles the previous frame's leftover overflow
+        // flag; every glyph is already resident so nothing faults in.
+        r.render_to_rgba(&hl, &mut t, (320, 200), 1.0);
+        let ev = r.atlas_evictions();
+        // Second head-only frame: steady hot state, no overflow, no recycle.
+        r.render_to_rgba(&hl, &mut t, (320, 200), 1.0);
+        assert_eq!(r.atlas_evictions(), ev, "hot glyphs retained, no new recycle");
     }
 
     #[test]
@@ -1412,5 +1609,34 @@ mod tests {
         let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
         assert_eq!(r.last_3d_meshes, 0);
         assert!(img.chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn lru_order_is_newest_first() {
+        use cosmic_text::{CacheKey, CacheKeyFlags};
+        let key = |glyph: u16| CacheKey::new(cosmic_text::fontdb::ID::dummy(), glyph, 16.0, (0.0, 0.0), CacheKeyFlags::empty()).0;
+        let mut recency = HashMap::new();
+        recency.insert(key(1), 10u64);
+        recency.insert(key(2), 30u64);
+        recency.insert(key(3), 20u64);
+        let order = lru_order(&recency);
+        assert_eq!(order.iter().map(|(k, _)| k.glyph_id).collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert!(order.windows(2).all(|w| w[0].1 >= w[1].1), "monotonic recency");
+        assert!(lru_order(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn text_culling_keeps_anything_possibly_visible() {
+        let clip = [0.0, 0.0, 100.0, 50.0];
+        assert!(text_maybe_visible(10.0, 10.0, 20.0, clip));
+        // Edge-touching counts as visible (conservative).
+        assert!(text_maybe_visible(-20.0, 10.0, 20.0, clip));
+        assert!(text_maybe_visible(100.0, 10.0, 20.0, clip));
+        // Fully outside left / right / below is skipped.
+        assert!(!text_maybe_visible(-30.0, 10.0, 20.0, clip));
+        assert!(!text_maybe_visible(110.0, 10.0, 20.0, clip));
+        assert!(!text_maybe_visible(10.0, 60.0, 20.0, clip));
+        // Above is never culled: the height is unknown pre-shape.
+        assert!(text_maybe_visible(10.0, -100.0, 20.0, clip));
     }
 }

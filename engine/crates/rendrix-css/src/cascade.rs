@@ -5,7 +5,7 @@ use crate::parser::{Declaration, FontFace, Keyframes, MediaContext, Rule, StyleR
 use crate::properties::{apply_declaration, StyleContext};
 use crate::selector::{PseudoElement, Selector, SelectorElement};
 use crate::style::{ComputedStyle, Display, Position};
-use crate::values::{substitute_vars, value_uses_viewport_units};
+use crate::values::{substitute_env, substitute_vars, value_uses_viewport_units};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -105,6 +105,7 @@ impl RuleSet {
                     match p {
                         Hover | Active | Focus | FocusVisible | FocusWithin | Checked => true,
                         Not(l) | Is(l) | Where(l) => l.iter().any(|s| s.compounds.iter().any(|c| c.pseudos.iter().any(has))),
+                        Has(h) => h.iter().any(|x| x.selector.compounds.iter().any(|c| c.pseudos.iter().any(has))),
                         _ => false,
                     }
                 }
@@ -116,6 +117,7 @@ impl RuleSet {
                     match p {
                         FirstChild | LastChild | OnlyChild | NthChild(..) | NthLastChild(..) | NthOfType(..) | FirstOfType | LastOfType | Empty => true,
                         Not(l) | Is(l) | Where(l) => l.iter().any(|s| s.compounds.iter().any(|c| c.pseudos.iter().any(has))),
+                        Has(_) => true,
                         _ => false,
                     }
                 }
@@ -127,6 +129,19 @@ impl RuleSet {
             }
             if sel.compounds.len() > 1 && sel.compounds[..sel.compounds.len() - 1].iter().any(state) {
                 self.state_deps_nonlocal = true;
+            }
+            // `:has()` always observes other elements; state inside it is nonlocal
+            // even when the `:has()` itself sits on the subject.
+            {
+                let has_inner_state = sel.compounds.iter().any(|c| {
+                    c.pseudos.iter().any(|p| match p {
+                        crate::selector::PseudoClass::Has(h) => h.iter().any(|x| x.selector.compounds.iter().any(state)),
+                        _ => false,
+                    })
+                });
+                if has_inner_state {
+                    self.state_deps_nonlocal = true;
+                }
             }
             let idx = self.rules.len() as u32;
             let subject = sel.compounds.last().unwrap();
@@ -259,10 +274,11 @@ pub fn compute_style<E: SelectorElement>(
     // Un-inherit nothing else: inherit_from already gave initial values for non-inherited props.
 
     let value_of = |d: &Declaration| -> Option<String> {
-        if d.value.contains("var(") {
-            substitute_vars(&d.value, &custom)
+        let v = if d.value.contains("env(") { substitute_env(&d.value, sc.safe_area, sc.keyboard_h)? } else { d.value.clone() };
+        if v.contains("var(") {
+            substitute_vars(&v, &custom)
         } else {
-            Some(d.value.clone())
+            Some(v)
         }
     };
 
@@ -288,11 +304,14 @@ pub fn compute_style<E: SelectorElement>(
     }
 
     // Used-value adjustments that CSS applies at computed-value time.
-    if matches!(style.position, Position::Absolute | Position::Fixed) {
+    if matches!(style.position, Position::Absolute | Position::Fixed) || !matches!(style.float, crate::style::Float::None) {
         style.display = match style.display {
             Display::Inline | Display::InlineBlock => Display::Block,
             Display::InlineFlex => Display::Flex,
             Display::InlineGrid => Display::Grid,
+            Display::InlineTable => Display::Table,
+            // Floated internal table boxes and columns lose their table role.
+            Display::TableCell | Display::TableCaption | Display::ListItem => Display::Block,
             d => d,
         };
     }
@@ -479,5 +498,14 @@ mod tests {
         let (_, span) = tree(false);
         let rs = rules("span { position: absolute }");
         assert_eq!(compute(&span, &rs, None).display, Display::Block);
+    }
+
+    #[test]
+    fn float_blockifies_inline_level_boxes() {
+        let (_, span) = tree(false);
+        let rs = rules("span { float: left }");
+        assert_eq!(compute(&span, &rs, None).display, Display::Block, "floated inlines become blocks");
+        let rs = rules("span { float: none }");
+        assert_eq!(compute(&span, &rs, None).display, Display::Inline);
     }
 }

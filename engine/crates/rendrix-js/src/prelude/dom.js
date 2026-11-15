@@ -571,12 +571,29 @@ function scheduleImageEvents(img) {
 }
 
 class CanvasGradient {
-  constructor(x0, y0, x1, y1) { this._x0 = +x0; this._y0 = +y0; this._x1 = +x1; this._y1 = +y1; this._stops = []; }
+  constructor(kind, p) { this._kind = kind; Object.assign(this, p); this._stops = []; }
   addColorStop(offset, color) {
     offset = +offset;
     if (!Number.isFinite(offset) || offset < 0 || offset > 1) throw new DOMException('The provided float value is non-finite', 'SyntaxError');
     this._stops.push([offset, String(color)]);
   }
+}
+const pathFinalizer = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(pid => { try { N('canvas_path_drop', pid); } catch (_) {} })
+  : { register() {} };
+class Path2D {
+  constructor(path) {
+    if (path === undefined) this._pid = N('canvas_path_create');
+    else if (path instanceof Path2D) this._pid = mut('canvas_path_clone', path._pid);
+    else throw new DOMException('Path2D string parsing is not supported', 'NotSupportedError');
+    pathFinalizer.register(this, this._pid);
+  }
+  moveTo(x, y) { N('canvas_path_move_to', this._pid, +x, +y); }
+  lineTo(x, y) { N('canvas_path_line_to', this._pid, +x, +y); }
+  rect(x, y, w, h) { N('canvas_path_rect', this._pid, +x, +y, +w, +h); }
+  arc(x, y, r, a0, a1, ccw) { mut('canvas_path_arc', this._pid, +x, +y, +r, +a0, +a1, !!ccw); }
+  ellipse(x, y, rx, ry, rot, a0, a1, ccw) { mut('canvas_path_ellipse', this._pid, +x, +y, +rx, +ry, +rot, +a0, +a1, !!ccw); }
+  closePath() { N('canvas_path_close', this._pid); }
 }
 class CanvasRenderingContext2D {
   constructor(canvas) {
@@ -584,11 +601,25 @@ class CanvasRenderingContext2D {
     this._resetCache();
     N('canvas_ensure', this._id);
   }
-  _resetCache() { this._fill = '#000000'; this._stroke = '#000000'; }
+  _resetCache() {
+    this._fill = '#000000'; this._stroke = '#000000';
+    this._font = '10px sans-serif'; this._align = 'start'; this._baseline = 'alphabetic';
+    this._shadowColor = 'rgba(0, 0, 0, 0)'; this._shadowBlur = 0; this._shadowX = 0; this._shadowY = 0;
+    this._stack = [];
+  }
   get canvas() { return wrap(this._id); }
   // ----- state -----
-  save() { N('canvas_save', this._id); }
-  restore() { N('canvas_restore', this._id); }
+  save() {
+    N('canvas_save', this._id);
+    this._stack.push([this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha,
+      this._font, this._align, this._baseline, this._shadowColor, this._shadowBlur, this._shadowX, this._shadowY]);
+  }
+  restore() {
+    N('canvas_restore', this._id);
+    const s = this._stack.pop();
+    if (s) [this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha,
+      this._font, this._align, this._baseline, this._shadowColor, this._shadowBlur, this._shadowX, this._shadowY] = s;
+  }
   // ----- transform (canvas matrix convention: x' = a*x + c*y + e) -----
   translate(x, y) { N('canvas_transform', this._id, 1, 0, 0, 1, +x, +y); }
   scale(x, y) { N('canvas_transform', this._id, +x, 0, 0, +(y === undefined ? x : y), 0, 0); }
@@ -603,7 +634,9 @@ class CanvasRenderingContext2D {
   _paintJSON(v) {
     if (v instanceof CanvasGradient) {
       if (!v._stops.length) return JSON.stringify({ color: '#000000' });
-      return JSON.stringify({ grad: { x0: v._x0, y0: v._y0, x1: v._x1, y1: v._y1, stops: v._stops } });
+      if (v._kind === 'radial') return JSON.stringify({ grad: { type: 'radial', x0: v._x0, y0: v._y0, r0: v._r0, x1: v._x1, y1: v._y1, r1: v._r1, stops: v._stops } });
+      if (v._kind === 'conic') return JSON.stringify({ grad: { type: 'conic', x: v._x, y: v._y, start: v._start, stops: v._stops } });
+      return JSON.stringify({ grad: { type: 'linear', x0: v._x0, y0: v._y0, x1: v._x1, y1: v._y1, stops: v._stops } });
     }
     return JSON.stringify({ color: String(v) });
   }
@@ -619,7 +652,48 @@ class CanvasRenderingContext2D {
   set lineJoin(v) { if (['miter', 'round', 'bevel'].includes(v)) { N('canvas_set_line_join', this._id, v); this._lineJoin = v; } }
   get globalAlpha() { return this._alpha === undefined ? 1 : this._alpha; }
   set globalAlpha(v) { v = +v; if (Number.isFinite(v) && v >= 0 && v <= 1) { N('canvas_set_alpha', this._id, v); this._alpha = v; } }
-  // ----- paths -----
+  // Shadows: box-blur approximation; drawImage casts no shadow (documented). Invalid values ignored.
+  get shadowColor() { return this._shadowColor; }
+  set shadowColor(v) { try { N('canvas_set_shadow_color', this._id, String(v)); this._shadowColor = String(v); } catch (_) {} }
+  get shadowBlur() { return this._shadowBlur; }
+  set shadowBlur(v) { v = +v; if (Number.isFinite(v) && v >= 0) { N('canvas_set_shadow_blur', this._id, v); this._shadowBlur = v; } }
+  get shadowOffsetX() { return this._shadowX; }
+  set shadowOffsetX(v) { v = +v; if (Number.isFinite(v)) { N('canvas_set_shadow_offset', this._id, v, this._shadowY); this._shadowX = v; } }
+  get shadowOffsetY() { return this._shadowY; }
+  set shadowOffsetY(v) { v = +v; if (Number.isFinite(v)) { N('canvas_set_shadow_offset', this._id, this._shadowX, v); this._shadowY = v; } }
+  // Only source-over compositing is supported; other modes are ignored (documented).
+  get globalCompositeOperation() { return 'source-over'; }
+  set globalCompositeOperation(_) {}
+  // ----- text (shaped through the shared TextSystem; invalid values are ignored) -----
+  get font() { return this._font; }
+  set font(v) { v = String(v); try { mut('canvas_set_font', this._id, v); this._font = v; } catch (_) {} }
+  get textAlign() { return this._align; }
+  set textAlign(v) { if (['start', 'end', 'left', 'right', 'center'].includes(v)) { N('canvas_set_text_align', this._id, v); this._align = v; } }
+  get textBaseline() { return this._baseline; }
+  set textBaseline(v) { if (['alphabetic', 'top', 'hanging', 'middle', 'ideographic', 'bottom'].includes(v)) { N('canvas_set_text_baseline', this._id, v); this._baseline = v; } }
+  fillText(text, x, y, maxWidth) {
+    if (maxWidth === undefined) N('canvas_fill_text', this._id, String(text), +x, +y);
+    else N('canvas_fill_text', this._id, String(text), +x, +y, +maxWidth);
+  }
+  strokeText(text, x, y, maxWidth) {
+    if (maxWidth === undefined) N('canvas_stroke_text', this._id, String(text), +x, +y);
+    else N('canvas_stroke_text', this._id, String(text), +x, +y, +maxWidth);
+  }
+  measureText(text) {
+    const m = JSON.parse(N('canvas_measure_text', this._id, String(text)));
+    return {
+      width: m.w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: m.w,
+      actualBoundingBoxAscent: m.a, actualBoundingBoxDescent: m.d,
+      fontBoundingBoxAscent: m.a, fontBoundingBoxDescent: m.d,
+      emHeightAscent: m.a, emHeightDescent: m.d, alphabeticBaseline: m.a,
+    };
+  }
+  // ----- paths (each of fill/stroke/clip takes an optional Path2D + fillRule) -----
+  _pathArgs(path, rule) {
+    if (path instanceof Path2D) return [path._pid, typeof rule === 'string' ? rule : ''];
+    if (typeof path === 'string') return [0, path];
+    return [0, ''];
+  }
   beginPath() { N('canvas_begin', this._id); }
   moveTo(x, y) { N('canvas_move_to', this._id, +x, +y); }
   lineTo(x, y) { N('canvas_line_to', this._id, +x, +y); }
@@ -627,13 +701,24 @@ class CanvasRenderingContext2D {
   arc(x, y, r, a0, a1, ccw) { mut('canvas_arc', this._id, +x, +y, +r, +a0, +a1, !!ccw); }
   ellipse(x, y, rx, ry, rot, a0, a1, ccw) { mut('canvas_ellipse', this._id, +x, +y, +rx, +ry, +rot, +a0, +a1, !!ccw); }
   closePath() { N('canvas_close', this._id); }
-  fill() { N('canvas_fill', this._id); }
-  stroke() { N('canvas_stroke', this._id); }
+  fill(path, rule) { const [pid, r] = this._pathArgs(path, rule); mut('canvas_fill', this._id, pid, r); }
+  stroke(path) { mut('canvas_stroke', this._id, path instanceof Path2D ? path._pid : 0); }
+  clip(path, rule) { const [pid, r] = this._pathArgs(path, rule); mut('canvas_clip', this._id, pid, r); }
   fillRect(x, y, w, h) { N('canvas_fill_rect', this._id, +x, +y, +w, +h); }
   strokeRect(x, y, w, h) { N('canvas_stroke_rect', this._id, +x, +y, +w, +h); }
   clearRect(x, y, w, h) { N('canvas_clear_rect', this._id, +x, +y, +w, +h); }
-  createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient(x0, y0, x1, y1); }
-  createRadialGradient() { throw new DOMException('Radial gradients are not supported', 'NotSupportedError'); }
+  createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient('linear', { _x0: +x0, _y0: +y0, _x1: +x1, _y1: +y1 }); }
+  createRadialGradient(x0, y0, r0, x1, y1, r1) {
+    [x0, y0, r0, x1, y1, r1] = [+x0, +y0, +r0, +x1, +y1, +r1];
+    if (r0 < 0 || r1 < 0) throw new DOMException('The radius is negative', 'IndexSizeError');
+    if (![x0, y0, r0, x1, y1, r1].every(Number.isFinite)) throw new DOMException('The provided float value is non-finite', 'SyntaxError');
+    return new CanvasGradient('radial', { _x0: x0, _y0: y0, _r0: r0, _x1: x1, _y1: y1, _r1: r1 });
+  }
+  createConicGradient(startAngle, x, y) {
+    [startAngle, x, y] = [+startAngle, +x, +y];
+    if (![startAngle, x, y].every(Number.isFinite)) throw new DOMException('The provided float value is non-finite', 'SyntaxError');
+    return new CanvasGradient('conic', { _start: startAngle, _x: x, _y: y });
+  }
   createPattern() { throw new DOMException('Patterns are not supported', 'NotSupportedError'); }
   // ----- images -----
   drawImage(src, ...a) {
@@ -684,6 +769,7 @@ class ImageData {
 }
 global.CanvasRenderingContext2D = CanvasRenderingContext2D;
 global.CanvasGradient = CanvasGradient;
+global.Path2D = Path2D;
 global.ImageData = ImageData;
 
 class HTMLCanvasElement extends HTMLElement {

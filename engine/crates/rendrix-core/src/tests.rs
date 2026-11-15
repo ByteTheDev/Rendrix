@@ -475,3 +475,141 @@ fn scene_hosts_emit_scene3d_items_with_border_box_rects() {
     assert!(!e2.display_list().has_3d);
     assert!(e2.display_list().items.iter().all(|i| !matches!(i, Item::Scene3D(_))));
 }
+
+#[test]
+fn text_overflow_ellipsis_truncates_with_ellipsis() {
+    use rendrix_gfx::Item;
+    let e = engine(
+        r#"<div id="a">Hello world this is a long line that must overflow</div>"#,
+        "body{margin:0} #a{width:100px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:16px}",
+        800.0,
+        600.0,
+    );
+    let texts: Vec<String> = e
+        .display_list()
+        .items
+        .iter()
+        .filter_map(|i| if let Item::Text(t) = i { Some(t.content.runs.iter().map(|r| r.text.clone()).collect::<String>()) } else { None })
+        .collect();
+    assert!(!texts.is_empty(), "text is painted");
+    let shown = texts.join("");
+    assert!(shown.contains('…'), "truncated text ends with ellipsis: {shown:?}");
+    assert!(!shown.contains("overflow"), "overflowing tail is cut: {shown:?}");
+    // Without the flag the full text survives (no ellipsis).
+    let full = engine(
+        r#"<div id="a">Hello world this is a long line that must overflow</div>"#,
+        "body{margin:0} #a{width:100px;white-space:nowrap;overflow:hidden;font-size:16px}",
+        800.0,
+        600.0,
+    );
+    let full_text: String = full
+        .display_list()
+        .items
+        .iter()
+        .filter_map(|i| if let Item::Text(t) = i { Some(t.content.runs.iter().map(|r| r.text.clone()).collect::<String>()) } else { None })
+        .collect();
+    assert!(full_text.contains("overflow") && !full_text.contains('…'), "no truncation without text-overflow:ellipsis: {full_text:?}");
+}
+
+#[test]
+fn tables_collapse_to_a_grid() {
+    let e = engine(
+        r#"<table id="t"><tr><td id="a">a</td><td id="b">b</td></tr><tr><td id="c">c</td><td id="d">d</td></tr></table>"#,
+        "body{margin:0} #t{width:300px} td{height:20px}",
+        800.0,
+        600.0,
+    );
+    let (a, b, c, d) = (rect(&e, "a"), rect(&e, "b"), rect(&e, "c"), rect(&e, "d"));
+    assert!(near(a[0], 0.0) && near(a[2], 150.0), "first cell, first column: {a:?}");
+    assert!(near(b[0], 150.0) && near(b[2], 150.0), "second cell shares the row: {b:?}");
+    assert!(near(b[1], a[1]), "same row: {a:?} {b:?}");
+    assert!(near(c[0], 0.0) && near(c[1], 20.0), "second row below the first: {c:?}");
+    assert!(near(d[0], 150.0) && near(d[1], 20.0), "{d:?}");
+}
+
+#[test]
+fn table_sections_caption_and_columns() {
+    let e = engine(
+        r#"<table id="t"><caption id="cap">cap</caption><colgroup><col><col></colgroup><thead><tr><td id="h">h</td><td>h2</td></tr></thead><tbody><tr><td id="a">a</td><td id="b">b</td></tr></tbody></table>"#,
+        "body{margin:0} #t{width:200px} td{height:10px}",
+        800.0,
+        600.0,
+    );
+    let (cap, h, a, b) = (rect(&e, "cap"), rect(&e, "h"), rect(&e, "a"), rect(&e, "b"));
+    assert!(near(cap[0], 0.0) && near(cap[2], 200.0), "caption spans the table width: {cap:?}");
+    assert!(near(h[1], cap[1] + cap[3]), "header row below the caption: {h:?} {cap:?}");
+    assert!(near(a[1], b[1]), "body cells share a row: {a:?} {b:?}");
+    assert!(near(a[2], 100.0) && near(b[2], 100.0) && near(b[0], 100.0), "two equal columns: {a:?} {b:?}");
+    assert!(a[1] > h[1], "tbody below thead: {a:?} {h:?}");
+}
+
+#[test]
+fn explicit_table_display_values_become_grid_like() {
+    // Author-specified table roles (not just UA defaults for <table>/<tr>/<td>).
+    let e = engine(
+        r#"<div id="t"><div id="r"><div id="a">a</div><div id="b">b</div></div></div>"#,
+        "body{margin:0} #t{display:table;width:200px} #r{display:table-row} #a,#b{display:table-cell;height:10px}",
+        800.0,
+        600.0,
+    );
+    let (a, b) = (rect(&e, "a"), rect(&e, "b"));
+    assert!(near(a[2], 100.0) && near(b[0], 100.0) && near(b[1], a[1]), "{a:?} {b:?}");
+}
+
+#[test]
+fn floats_pin_to_the_content_edges() {
+    let e = engine(
+        r#"<div id="wrap"><div id="fl">f</div><div id="fr">g</div></div>"#,
+        "body{margin:0} #wrap{width:300px} #fl{float:left;width:100px;height:40px} #fr{float:right;width:120px;height:30px}",
+        800.0,
+        600.0,
+    );
+    let (fl, fr) = (rect(&e, "fl"), rect(&e, "fr"));
+    assert!(near(fl[0], 0.0) && near(fl[2], 100.0), "left float at the inline start: {fl:?}");
+    assert!(near(fr[0], 180.0) && near(fr[2], 120.0), "right float at the inline end: {fr:?}");
+    assert_eq!(e.computed_value(by_id(&e, "fl"), "float"), "left");
+    assert_eq!(e.computed_value(by_id(&e, "fr"), "float"), "right");
+}
+
+#[test]
+fn clear_pushes_boxes_below_preceding_floats() {
+    let e = engine(
+        r#"<div id="wrap"><div id="fl">f</div><div id="pulled">p</div></div>"#,
+        "body{margin:0} #wrap{width:300px} #fl{float:left;width:100px;height:60px} #pulled{clear:left;height:20px;margin-top:-40px}",
+        800.0,
+        600.0,
+    );
+    let (fl, p) = (rect(&e, "fl"), rect(&e, "pulled"));
+    assert!(near(fl[3], 60.0));
+    assert!(near(p[1], 60.0), "clear:left starts below the float bottom: {p:?}");
+    assert_eq!(e.computed_value(by_id(&e, "pulled"), "clear"), "left");
+}
+
+#[test]
+fn multicol_splits_children_into_equal_tracks() {
+    let e = engine(
+        r#"<div id="mc"><div id="a">a</div><div id="b">b</div><div id="c">c</div><div id="d">d</div></div>"#,
+        "body{margin:0} #mc{column-count:2;width:300px} #mc>div{height:10px}",
+        800.0,
+        600.0,
+    );
+    let (a, b, c, d) = (rect(&e, "a"), rect(&e, "b"), rect(&e, "c"), rect(&e, "d"));
+    assert!(near(a[0], 0.0) && near(a[2], 150.0), "{a:?}");
+    assert!(near(b[0], 150.0) && near(b[2], 150.0) && near(b[1], a[1]), "{b:?}");
+    assert!(near(c[0], 0.0) && near(c[1], 10.0), "{c:?}");
+    assert!(near(d[0], 150.0) && near(d[1], 10.0), "{d:?}");
+    assert_eq!(e.computed_value(by_id(&e, "mc"), "column-count"), "2");
+}
+
+#[test]
+fn multicol_column_width_derives_a_count_and_span_all_stretches() {
+    let e = engine(
+        r#"<div id="mc"><div id="a">a</div><div id="s">s</div><div id="b">b</div></div>"#,
+        "body{margin:0} #mc{column-width:200px;width:800px} #mc>div{height:10px} #s{column-span:all}",
+        800.0,
+        600.0,
+    );
+    let (a, s) = (rect(&e, "a"), rect(&e, "s"));
+    assert!(near(a[2], 200.0), "800px / 200px columns: {a:?}");
+    assert!(near(s[2], 800.0), "column-span:all stretches across every track: {s:?}");
+}

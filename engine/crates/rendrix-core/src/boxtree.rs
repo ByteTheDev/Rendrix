@@ -6,7 +6,7 @@
 //! absolutely positioned boxes.
 
 use crate::Engine;
-use rendrix_css::{Align, ComputedStyle, Dim, Display, TextAlign, WhiteSpace};
+use rendrix_css::{Align, ComputedStyle, Dim, Display, GridLine, RepeatCount, TextAlign, TrackItem, TrackSize, WhiteSpace};
 use rendrix_dom::{NodeId, NodeKind};
 use rendrix_layout::{InlineContent, InlineRun, LayoutKind, LayoutNode};
 use std::collections::{HashMap, HashSet};
@@ -60,11 +60,58 @@ impl<'a> Builder<'a> {
     fn anon_block_style(&self, parent: &ComputedStyle) -> Arc<ComputedStyle> {
         let mut s = ComputedStyle::inherit_from(parent);
         s.display = Display::Block;
+        // `text-overflow` is non-inherited but anonymous text leaves must honour the
+        // originating block's ellipsis (they are that block's inline content).
+        s.text_overflow_ellipsis = parent.text_overflow_ellipsis;
         Arc::new(s)
     }
 
     fn is_replaced(tag: &str) -> bool {
         matches!(tag, "img" | "canvas" | "video" | "svg" | "iframe" | "object" | "embed" | "rendrix-scene")
+    }
+
+    /// Rewrite a `display: table` style into its grid-backed equivalent.
+    fn table_grid_style(engine: &Engine, id: NodeId, style: &Arc<ComputedStyle>) -> Arc<ComputedStyle> {
+        let mut s = (**style).clone();
+        s.display = Display::Grid;
+        if s.grid_template_columns.is_empty() {
+            let cols = Self::table_columns(engine, id).max(1);
+            s.grid_template_columns = vec![TrackItem::Repeat(RepeatCount::Count(cols), vec![TrackSize::Fr(1.0)])];
+        }
+        Arc::new(s)
+    }
+
+    /// Widest row of the table in cells (through row groups; bare cells count as
+    /// one-column rows). Capped: pathological tables still lay out.
+    fn table_columns(engine: &Engine, id: NodeId) -> u16 {
+        let mut max = 0u16;
+        for row in engine.doc.child_elements(id) {
+            match engine.style_of(row).map(|s| s.display) {
+                Some(Display::TableRow) => max = max.max(Self::row_cells(engine, row)),
+                Some(Display::TableHeaderGroup) | Some(Display::TableRowGroup) | Some(Display::TableFooterGroup) => {
+                    for r in engine.doc.child_elements(row) {
+                        if engine.style_of(r).map(|s| s.display) == Some(Display::TableRow) {
+                            max = max.max(Self::row_cells(engine, r));
+                        }
+                    }
+                }
+                // Cells outside any row (invalid HTML the parser kept): each starts a row.
+                Some(Display::TableCell) => max = max.max(1),
+                _ => {}
+            }
+        }
+        max.max(1).min(64)
+    }
+
+    fn row_cells(engine: &Engine, row: NodeId) -> u16 {
+        let mut n = 0u16;
+        for c in engine.doc.child_elements(row) {
+            if engine.style_of(c).map(|s| s.display) == Some(Display::TableCell) {
+                // `colspan` is not modelled: one cell, one column.
+                n += 1;
+            }
+        }
+        n.max(1).min(64)
     }
 
     fn is_box_like(s: &ComputedStyle) -> bool {
@@ -140,6 +187,55 @@ impl<'a> Builder<'a> {
         let tag: &str = engine.doc.tag(id)?;
         let lid = id as u64;
 
+        // --- tables: internal column boxes generate no box (widths are not modelled) ---
+        if matches!(style.display, Display::TableColumn | Display::TableColumnGroup) {
+            return None;
+        }
+        if style.display == Display::InlineTable {
+            let mut s = (*style).clone();
+            s.display = Display::Table;
+            style = Arc::new(s);
+        }
+        // `display: table` collapses to a grid-like layout: the table becomes a grid
+        // container (explicit `grid-template-*` wins; otherwise one `1fr` track per
+        // column, counted from the rows), rows and row groups dissolve, cells are items.
+        // `colspan`/`rowspan`, automatic column sizing and anonymous table objects are ❌.
+        if style.display == Display::Table {
+            style = Self::table_grid_style(engine, id, &style);
+        }
+        // Multi-column basics: `column-count` (or a `column-width` that yields > 1
+        // column against the viewport width) lays children out in N equal grid tracks.
+        // No balancing, no `column-fill`; `column-span: all` stretches (see below).
+        if style.display == Display::Block && (style.column_count.is_some() || !matches!(style.column_width, Dim::Auto)) {
+            if let Some(n) = style.multicol_count(engine.viewport.0) {
+                let mut s = (*style).clone();
+                s.display = Display::Grid;
+                if s.grid_template_columns.is_empty() {
+                    s.grid_template_columns = vec![TrackItem::Repeat(RepeatCount::Count(n), vec![TrackSize::Fr(1.0)])];
+                }
+                style = Arc::new(s);
+            }
+        }
+        // `column-span: all` and table captions stretch across every track of a
+        // synthesized grid (a multicol container, or a collapsed table for captions).
+        // Both are ignored inside real grids, per CSS.
+        if style.column_span_all || style.display == Display::TableCaption {
+            if let Some(pid) = engine.doc.parent(id) {
+                if let Some(ps) = engine.style_of(pid) {
+                    let span_all = style.column_span_all
+                        && ps.display == Display::Block
+                        && (ps.column_count.is_some_and(|n| n > 1)
+                            || (!matches!(ps.column_width, Dim::Auto) && ps.multicol_count(engine.viewport.0).is_some()));
+                    let caption = style.display == Display::TableCaption && ps.is_table();
+                    if span_all || caption {
+                        let mut s = (*style).clone();
+                        s.grid_column = (GridLine::Line(1), GridLine::Line(-1));
+                        style = Arc::new(s);
+                    }
+                }
+            }
+        }
+
         // --- replaced elements ---
         if Self::is_replaced(tag) {
             let attr_px = |name: &str| engine.doc.get_attr(id, name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok());
@@ -196,7 +292,7 @@ impl<'a> Builder<'a> {
         if matches!(kind, LayoutKind::Text(_)) && !children.is_empty() {
             if let LayoutKind::Text(content) = std::mem::replace(&mut kind, LayoutKind::Box) {
                 let leaf_style = self.anon_block_style(&style);
-                let content = Arc::new(InlineContent { runs: content.runs.clone(), container: style.clone() });
+                let content = Arc::new(InlineContent::new(content.runs.clone(), style.clone()));
                 children.insert(0, LayoutNode { id: anon_id(lid, 0), style: leaf_style, kind: LayoutKind::Text(content), children: vec![] });
             }
         }
@@ -225,7 +321,7 @@ impl<'a> Builder<'a> {
                 } else {
                     (value, container.clone())
                 };
-                Some(InlineContent { runs: vec![InlineRun { text, style: run_style, node: id as u64, is_break: false }], container })
+                Some(InlineContent::new(vec![InlineRun { text, style: run_style, node: id as u64, is_break: false }], container))
             }
             "input" if matches!(doc.get_attr(id, "type").map(|t| t.to_ascii_lowercase()).as_deref(), Some("button" | "submit" | "reset")) => {
                 let label = doc.get_attr(id, "value").unwrap_or(match doc.get_attr(id, "type") {
@@ -236,7 +332,7 @@ impl<'a> Builder<'a> {
                 let mut c = (**style).clone();
                 c.white_space = WhiteSpace::Pre;
                 let c = Arc::new(c);
-                Some(InlineContent { runs: vec![InlineRun { text: label.to_string(), style: c.clone(), node: id as u64, is_break: false }], container: c })
+                Some(InlineContent::new(vec![InlineRun { text: label.to_string(), style: c.clone(), node: id as u64, is_break: false }], c))
             }
             "textarea" => {
                 let value = doc.value(id);
@@ -247,7 +343,7 @@ impl<'a> Builder<'a> {
                 } else {
                     (value, style.clone())
                 };
-                Some(InlineContent { runs: vec![InlineRun { text, style: rs, node: id as u64, is_break: false }], container: style.clone() })
+                Some(InlineContent::new(vec![InlineRun { text, style: rs, node: id as u64, is_break: false }], style.clone()))
             }
             "select" => {
                 let opts = doc.get_elements_by_tag_name(id, "option");
@@ -256,7 +352,7 @@ impl<'a> Builder<'a> {
                 let mut c = (**style).clone();
                 c.white_space = WhiteSpace::Pre;
                 let c = Arc::new(c);
-                Some(InlineContent { runs: vec![InlineRun { text: format!("{label}  \u{25be}"), style: c.clone(), node: id as u64, is_break: false }], container: c })
+                Some(InlineContent::new(vec![InlineRun { text: format!("{label}  \u{25be}"), style: c.clone(), node: id as u64, is_break: false }], c))
             }
             _ => None,
         }
@@ -272,7 +368,7 @@ impl<'a> Builder<'a> {
         if !flex && matches!(ps.display, Display::Inline) {
             items.push(Item::Run(run));
         } else {
-            let content = Arc::new(InlineContent { runs: vec![run], container: ps.clone() });
+            let content = Arc::new(InlineContent::new(vec![run], ps.clone()));
             let id = anon_id(parent as u64, if before { 250 } else { 251 });
             items.push(Item::Block(LayoutNode { id, style: ps, kind: LayoutKind::Text(content), children: vec![] }));
         }
@@ -311,7 +407,15 @@ impl<'a> Builder<'a> {
                     let Some(cs) = self.style(c) else { continue };
                     match cs.display {
                         Display::None => continue,
+                        // Internal column boxes generate no box at all.
+                        Display::TableColumn | Display::TableColumnGroup => continue,
                         Display::Contents => {
+                            self.collect(c, &cs, flex, items);
+                            continue;
+                        }
+                        // Table rows and row groups dissolve: their cells lift into the
+                        // table's grid (the grid-like collapse of `display: table`).
+                        Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
                             self.collect(c, &cs, flex, items);
                             continue;
                         }
@@ -354,7 +458,7 @@ impl<'a> Builder<'a> {
 
     fn text_leaf(&self, parent: u64, idx: u64, style: &Arc<ComputedStyle>, runs: Vec<InlineRun>) -> LayoutNode {
         let leaf_style = self.anon_block_style(style);
-        let content = Arc::new(InlineContent { runs, container: leaf_style.clone() });
+        let content = Arc::new(InlineContent::new(runs, leaf_style.clone()));
         LayoutNode { id: anon_id(parent, idx), style: leaf_style, kind: LayoutKind::Text(content), children: vec![] }
     }
 
@@ -393,7 +497,7 @@ impl<'a> Builder<'a> {
             if runs.is_empty() || runs.iter().all(|r| !r.is_break && r.text.trim().is_empty() && r.style.white_space != WhiteSpace::Pre && r.style.white_space != WhiteSpace::PreWrap) {
                 return (LayoutKind::Box, vec![]);
             }
-            return (LayoutKind::Text(Arc::new(InlineContent { runs, container: style.clone() })), vec![]);
+            return (LayoutKind::Text(Arc::new(InlineContent::new(runs, style.clone()))), vec![]);
         }
 
         // Mixed content: group consecutive inline-level items into anonymous boxes.
@@ -435,7 +539,7 @@ impl<'a> Builder<'a> {
                 if runs.iter().any(|r| r.is_break || !r.text.trim().is_empty()) {
                     sub += 1;
                     let ls = this.anon_block_style(style);
-                    let content = Arc::new(InlineContent { runs, container: ls.clone() });
+                    let content = Arc::new(InlineContent::new(runs, ls.clone()));
                     kids.push(LayoutNode { id: anon_id(row_id, sub), style: ls, kind: LayoutKind::Text(content), children: vec![] });
                 }
             };
@@ -564,6 +668,8 @@ fn has_block_child(engine: &Engine, id: NodeId) -> bool {
     engine.doc.child_elements(id).any(|c| match engine.style_of(c) {
         Some(s) => match s.display {
             Display::Block | Display::Flex | Display::Grid => true,
+            Display::Table | Display::TableCell | Display::TableCaption | Display::ListItem => true,
+            Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => true,
             Display::Inline => has_block_child(engine, c),
             _ => false,
         },
@@ -574,6 +680,13 @@ fn has_block_child(engine: &Engine, id: NodeId) -> bool {
 /// P1: does this element dissolve into its parent's inline content (or vanish structurally)?
 fn is_transparent(engine: &Engine, id: NodeId, s: &Arc<ComputedStyle>) -> bool {
     if s.display == Display::Contents {
+        return true;
+    }
+    // Dissolved table internals belong to the table's grid, not to their own box.
+    if matches!(
+        s.display,
+        Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup
+    ) {
         return true;
     }
     if s.display != Display::Inline {

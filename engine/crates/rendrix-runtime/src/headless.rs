@@ -27,6 +27,55 @@ impl Shot {
         image::save_buffer(path, &self.rgba, self.width, self.height, image::ColorType::Rgba8).map_err(|e| e.to_string())
     }
 
+    /// Save as a one-page PDF with the pixels as an uncompressed RGB image.
+    ///
+    /// Used by `rendrix render page.html -o out.pdf`. Deliberately dependency-free
+    /// (raw RGB, no filters): a 800×600 page is ~1.4 MB. `/video` owns mp4; PDF and
+    /// frame sequences are the only render outputs here.
+    pub fn save_pdf(&self, path: &std::path::Path) -> Result<(), String> {
+        // Minimal PDF 1.4: catalog → pages → page → RGB image XObject.
+        // The content matrix flips vertically so the top pixel row stays on top.
+        let rgb: Vec<u8> = self.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let content = format!("q {} 0 0 -{} 0 {} cm /Im0 Do Q", self.width, self.height, self.height);
+        let mut pdf: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<(u32, usize)> = Vec::new();
+        let mut obj = |n: u32, body: &[u8]| {
+            offsets.push((n, pdf.len()));
+            pdf.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        obj(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>",
+            self.width, self.height
+        );
+        obj(3, page.as_bytes());
+        let mut img = format!(
+            "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+            self.width,
+            self.height,
+            rgb.len()
+        )
+        .into_bytes();
+        img.extend_from_slice(&rgb);
+        img.extend_from_slice(b"\nendstream");
+        obj(4, &img);
+        let mut stream = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        stream.extend_from_slice(content.as_bytes());
+        stream.extend_from_slice(b"\nendstream");
+        obj(5, &stream);
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for n in 1..=5u32 {
+            let off = offsets.iter().find(|(i, _)| *i == n).map(|(_, o)| *o).unwrap_or(0);
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF").as_bytes());
+        std::fs::write(path, pdf).map_err(|e| e.to_string())
+    }
+
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
         [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]]
@@ -94,6 +143,26 @@ impl Headless {
         let mut text = engine.text_borrow();
         let rgba = self.renderer.render_to_rgba(engine.display_list(), &mut text, (w, h), self.scale);
         Shot { width: w, height: h, rgba }
+    }
+
+    /// Save `frames` screenshots to `dir` as `frame-0001.png`, …, advancing `frame_ms`
+    /// of application time between frames (drives rAF/animations). The frame sequence is
+    /// the handoff to the /video pipeline, which owns mp4 encoding.
+    pub fn save_frames(&mut self, dir: &std::path::Path, frames: usize, frame_ms: u64) -> Result<Vec<std::path::PathBuf>, String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for i in 0..frames.max(1) {
+            if i > 0 {
+                self.wait(frame_ms);
+            } else {
+                self.session.frame();
+            }
+            let p = dir.join(format!("frame-{:04}.png", i + 1));
+            self.screenshot().save_png(&p)?;
+            println!("[frame] {}", p.display());
+            out.push(p);
+        }
+        Ok(out)
     }
 
     /// Render the current display list into an offscreen target and wait for the GPU; returns the elapsed time.

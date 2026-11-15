@@ -7,22 +7,31 @@
 //! touched: style/layout/paint/GPU paths are bit-identical (see the invalidation test).
 //!
 //! ## Approved subset
-//! State: `save`/`restore` (style + transform only, **not** the path — per spec), `fillStyle` /
-//! `strokeStyle` (CSS color string or 2-stop+ linear gradient), `lineWidth`, `lineCap`
-//! (`butt`/`round`/`square`), `lineJoin` (`miter` with limit 10 falling back to `bevel`, `round`,
-//! `bevel`), `globalAlpha`.
-//! Paths: `beginPath`/`moveTo`/`lineTo`/`rect`/`arc`/`ellipse`/`closePath`, `fill` (nonzero
-//! winding) / `stroke` (centered, width scaled by `sqrt(|det CTM|)`), `fillRect`/`strokeRect` /
-//! `clearRect` (all CTM-transformed; `putImageData` is not).
+//! State: `save`/`restore` (style, transform, clip, shadow and font — **not** the path, per
+//! spec), `fillStyle` / `strokeStyle` (CSS color string, linear / radial / conic gradient),
+//! `lineWidth`, `lineCap` (`butt`/`round`/`square`), `lineJoin` (`miter` with limit 10 falling
+//! back to `bevel`, `round`, `bevel`), `globalAlpha`, `font` (CSS font shorthand, default
+//! `10px sans-serif`), `textAlign`, `textBaseline`, `shadowColor` / `shadowBlur` /
+//! `shadowOffsetX` / `shadowOffsetY` (box-blur approximation; `drawImage` casts no shadow).
+//! Paths: `beginPath`/`moveTo`/`lineTo`/`rect`/`arc`/`ellipse`/`closePath`, `fill` (nonzero or
+//! evenodd winding) / `stroke` (centered, width scaled by `sqrt(|det CTM|)`), `fillRect` /
+//! `strokeRect` / `clearRect` (all CTM-transformed; `putImageData` is not), `Path2D` objects
+//! (own path, usable in `fill`/`stroke`/`clip`; string SVG constructors are unsupported),
+//! `clip` (intersected with the current clip; restored on `save`/`restore`),
+//! `fillText`/`strokeText`/`measureText` (shaped through the shared `TextSystem`; glyphs are
+//! axis-aligned — rotation/skew of text is an approximation — and `strokeText` fills glyph
+//! shapes with the stroke style).
 //! Paint: `createLinearGradient` (offsets are clamped to `[0,1]` and sorted; one stop behaves as
-//! a solid, two or more interpolate — there is no stop-count clamp on this path),
+//! a solid, two or more interpolate), `createRadialGradient` (two-circle interpolation with
+//! endpoint clamping; negative radii are an error), `createConicGradient` (angle sweep with
+//! wraparound interpolation),
 //! `drawImage` (image or canvas source, nearest-neighbour, `globalAlpha` applies, `smoothing`
 //! flags ignored), `getImageData`/`putImageData` (raw round-trip; large reads base64-encode the
 //! whole rect — **perf caveat**: prefer small rects), `canvas.width/height` (setting either
 //! clears the bitmap **and** resets context state, per spec), `toDataURL` (`image/png` only).
 //! Miter joins use limit 10, acute spikes fall back to bevel. Anti-aliasing: none (hard 50%
-//! coverage test); text (`fillText`/`strokeText`), shadows, patterns, radial gradients,
-//! `globalCompositeOperation`, filters and hit regions are **not** implemented (see report).
+//! coverage test); `globalCompositeOperation` stays `source-over`, patterns, filters, hit
+//! regions, `OffscreenCanvas` and `toBlob` are **not** implemented (see report).
 
 use rendrix_css::Color;
 use std::collections::{HashMap, HashSet};
@@ -59,9 +68,33 @@ pub struct LinearGradient {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RadialGradient {
+    pub x0: f32,
+    pub y0: f32,
+    pub r0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub r1: f32,
+    /// `(offset, color)`, offsets clamped to `[0,1]` and sorted ascending.
+    pub stops: Vec<(f32, Color)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConicGradient {
+    pub x: f32,
+    pub y: f32,
+    /// Start angle in radians (clockwise from 12 o'clock, per spec).
+    pub start: f32,
+    /// `(offset, color)`, offsets clamped to `[0,1]` and sorted ascending.
+    pub stops: Vec<(f32, Color)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Paint {
     Solid(Color),
     Linear(LinearGradient),
+    Radial(RadialGradient),
+    Conic(ConicGradient),
 }
 
 impl Paint {
@@ -69,6 +102,8 @@ impl Paint {
         match self {
             Paint::Solid(c) => c.a,
             Paint::Linear(g) => g.stops.iter().map(|(_, c)| c.a).fold(1.0f32, f32::min),
+            Paint::Radial(g) => g.stops.iter().map(|(_, c)| c.a).fold(1.0f32, f32::min),
+            Paint::Conic(g) => g.stops.iter().map(|(_, c)| c.a).fold(1.0f32, f32::min),
         }
     }
 }
@@ -109,6 +144,209 @@ struct Saved {
     cap: LineCap,
     join: LineJoin,
     alpha: f32,
+    clips: Vec<ClipEntry>,
+    shadow_color: Color,
+    shadow_blur: f32,
+    shadow_dx: f32,
+    shadow_dy: f32,
+    font: CanvasFont,
+    align: CanvasTextAlign,
+    baseline: CanvasTextBaseline,
+}
+
+/// One `clip()` call: device-space polygons plus the winding rule in force at clip time. A
+/// point is visible only when it is inside **every** entry (intersection semantics).
+#[derive(Clone, Debug)]
+struct ClipEntry {
+    polys: Vec<(Vec<[f32; 2]>, bool)>,
+    evenodd: bool,
+}
+
+/// Parsed CSS font shorthand for canvas text (`10px sans-serif` default). Only the fields
+/// that affect shaping are kept: size in px, family list, weight and italic style. Variant
+/// (`small-caps`), stretch, oblique angles and `ex`/`ch`/keyword sizes are rejected (the
+/// whole declaration is then ignored, per spec).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasFont {
+    pub size: f32,
+    pub families: Vec<String>,
+    pub weight: u16,
+    pub italic: bool,
+}
+
+impl Default for CanvasFont {
+    fn default() -> CanvasFont {
+        CanvasFont {
+            size: 10.0,
+            families: vec!["sans-serif".to_string()],
+            weight: 400,
+            italic: false,
+        }
+    }
+}
+
+/// Parse a CSS font shorthand (`[style] [weight] size[/line-height] family,...`). Returns
+/// `None` when the declaration is invalid (the caller keeps the previous font).
+pub fn parse_font(s: &str) -> Option<CanvasFont> {
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.is_empty() {
+        return None;
+    }
+    let mut idx = 0;
+    let mut italic = false;
+    let mut weight = 400u16;
+    let mut size: Option<f32> = None;
+    while idx < toks.len() {
+        let t = toks[idx].to_ascii_lowercase();
+        if t == "italic" || t == "oblique" || t.starts_with("oblique(") {
+            italic = true;
+            idx += 1;
+            continue;
+        }
+        if t == "normal" {
+            idx += 1;
+            continue;
+        }
+        if t == "bold" {
+            weight = 700;
+            idx += 1;
+            continue;
+        }
+        if t == "bolder" {
+            weight = 700;
+            idx += 1;
+            continue;
+        }
+        if t == "lighter" {
+            weight = 300;
+            idx += 1;
+            continue;
+        }
+        if t.ends_with("deg") && italic {
+            // `oblique 10deg`: angle accepted but not rendered distinctly.
+            idx += 1;
+            continue;
+        }
+        if let Ok(n) = t.parse::<u16>() {
+            if matches!(n, 100 | 200 | 300 | 400 | 500 | 600 | 700 | 800 | 900) {
+                weight = n;
+                idx += 1;
+                continue;
+            }
+        }
+        let base = t.split('/').next().unwrap_or("");
+        if let Some(px) = parse_font_size(base) {
+            size = Some(px);
+            idx += 1;
+            break;
+        }
+        return None;
+    }
+    let size = size.filter(|v| v.is_finite() && *v > 0.0)?;
+    let fam_str = toks[idx..].join(" ");
+    if fam_str.trim().is_empty() {
+        return None;
+    }
+    let families: Vec<String> = fam_str
+        .split(',')
+        .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
+    if families.is_empty() {
+        return None;
+    }
+    Some(CanvasFont {
+        size,
+        families,
+        weight,
+        italic,
+    })
+}
+
+fn parse_font_size(t: &str) -> Option<f32> {
+    if t.is_empty() {
+        return None;
+    }
+    let cut = t
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '+' || c == '-' || c == 'e' || c == 'E'));
+    let (num, unit) = match cut {
+        Some(i) => (&t[..i], t[i..].to_ascii_lowercase()),
+        None => (t, String::new()),
+    };
+    let n: f32 = num.parse().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
+    Some(match unit.as_str() {
+        "" | "px" => n,
+        "pt" => n * 96.0 / 72.0,
+        "pc" => n * 16.0,
+        "in" => n * 96.0,
+        "cm" => n * 96.0 / 2.54,
+        "mm" => n * 96.0 / 25.4,
+        "q" => n * 96.0 / 25.4 / 4.0,
+        "em" | "rem" => n * 16.0,
+        "percent" | "%" => n / 100.0 * 16.0,
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasTextAlign {
+    Start,
+    End,
+    Left,
+    Right,
+    Center,
+}
+
+impl CanvasTextAlign {
+    pub fn parse(s: &str) -> Option<CanvasTextAlign> {
+        Some(match s {
+            "start" => CanvasTextAlign::Start,
+            "end" => CanvasTextAlign::End,
+            "left" => CanvasTextAlign::Left,
+            "right" => CanvasTextAlign::Right,
+            "center" => CanvasTextAlign::Center,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasTextBaseline {
+    Alphabetic,
+    Top,
+    Hanging,
+    Middle,
+    Ideographic,
+    Bottom,
+}
+
+impl CanvasTextBaseline {
+    pub fn parse(s: &str) -> Option<CanvasTextBaseline> {
+        Some(match s {
+            "alphabetic" => CanvasTextBaseline::Alphabetic,
+            "top" => CanvasTextBaseline::Top,
+            "hanging" => CanvasTextBaseline::Hanging,
+            "middle" => CanvasTextBaseline::Middle,
+            "ideographic" => CanvasTextBaseline::Ideographic,
+            "bottom" => CanvasTextBaseline::Bottom,
+            _ => return None,
+        })
+    }
+}
+
+/// One rasterized glyph for [`Canvas2D::draw_glyphs`]: device-space top-left plus
+/// premultiplied RGBA (white for masks, true color for emoji).
+#[derive(Clone, Debug)]
+pub struct PlacedGlyph {
+    pub dx: i32,
+    pub dy: i32,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+    pub is_color: bool,
 }
 
 /// CPU-side 2D context of one `<canvas>`. All coordinates in user space until `fill`/`stroke`
@@ -127,6 +365,14 @@ pub struct Canvas2D {
     join: LineJoin,
     alpha: f32,
     path: Vec<PathCmd>,
+    clips: Vec<ClipEntry>,
+    shadow_color: Color,
+    shadow_blur: f32,
+    shadow_dx: f32,
+    shadow_dy: f32,
+    font: CanvasFont,
+    align: CanvasTextAlign,
+    baseline: CanvasTextBaseline,
     dirty: Option<[u32; 4]>,
 }
 
@@ -146,6 +392,14 @@ impl Canvas2D {
             join: LineJoin::Miter,
             alpha: 1.0,
             path: Vec::new(),
+            clips: Vec::new(),
+            shadow_color: Color::TRANSPARENT,
+            shadow_blur: 0.0,
+            shadow_dx: 0.0,
+            shadow_dy: 0.0,
+            font: CanvasFont::default(),
+            align: CanvasTextAlign::Start,
+            baseline: CanvasTextBaseline::Alphabetic,
             dirty: None,
         }
     }
@@ -204,6 +458,14 @@ impl Canvas2D {
             cap: self.cap,
             join: self.join,
             alpha: self.alpha,
+            clips: self.clips.clone(),
+            shadow_color: self.shadow_color,
+            shadow_blur: self.shadow_blur,
+            shadow_dx: self.shadow_dx,
+            shadow_dy: self.shadow_dy,
+            font: self.font.clone(),
+            align: self.align,
+            baseline: self.baseline,
         });
     }
 
@@ -216,6 +478,14 @@ impl Canvas2D {
             self.cap = s.cap;
             self.join = s.join;
             self.alpha = s.alpha;
+            self.clips = s.clips;
+            self.shadow_color = s.shadow_color;
+            self.shadow_blur = s.shadow_blur;
+            self.shadow_dx = s.shadow_dx;
+            self.shadow_dy = s.shadow_dy;
+            self.font = s.font;
+            self.align = s.align;
+            self.baseline = s.baseline;
         }
     }
 
@@ -263,6 +533,130 @@ impl Canvas2D {
         }
     }
 
+    pub fn set_shadow_color(&mut self, c: Color) {
+        self.shadow_color = c;
+    }
+
+    /// Negative or non-finite blurs are ignored (per spec).
+    pub fn set_shadow_blur(&mut self, b: f32) {
+        if b.is_finite() && b >= 0.0 {
+            self.shadow_blur = b;
+        }
+    }
+
+    /// Non-finite offsets are ignored (per spec).
+    pub fn set_shadow_offset(&mut self, dx: f32, dy: f32) {
+        if dx.is_finite() && dy.is_finite() {
+            self.shadow_dx = dx;
+            self.shadow_dy = dy;
+        }
+    }
+
+    /// Invalid declarations are ignored, keeping the previous font (per spec).
+    pub fn set_font(&mut self, font: &str) -> Result<(), String> {
+        match parse_font(font) {
+            Some(f) => {
+                self.font = f;
+                Ok(())
+            }
+            None => Err(format!("SyntaxError: invalid font '{font}'")),
+        }
+    }
+
+    /// Invalid keywords are ignored (per spec).
+    pub fn set_text_align(&mut self, a: &str) {
+        if let Some(v) = CanvasTextAlign::parse(a) {
+            self.align = v;
+        }
+    }
+
+    /// Invalid keywords are ignored (per spec).
+    pub fn set_text_baseline(&mut self, b: &str) {
+        if let Some(v) = CanvasTextBaseline::parse(b) {
+            self.baseline = v;
+        }
+    }
+
+    /// Snapshot of the text state for shaping (the caller shapes through `TextSystem`).
+    pub fn font(&self) -> CanvasFont {
+        self.font.clone()
+    }
+
+    pub fn text_align(&self) -> CanvasTextAlign {
+        self.align
+    }
+
+    pub fn text_baseline(&self) -> CanvasTextBaseline {
+        self.baseline
+    }
+
+    pub fn ctm(&self) -> [f32; 6] {
+        self.xf
+    }
+
+    pub fn apply_ctm(&self, p: [f32; 2]) -> [f32; 2] {
+        apply_affine(self.xf, p)
+    }
+
+    pub fn fill_paint(&self) -> Paint {
+        self.fill.clone()
+    }
+
+    pub fn stroke_paint(&self) -> Paint {
+        self.stroke.clone()
+    }
+
+    pub fn global_alpha(&self) -> f32 {
+        self.alpha
+    }
+
+    fn shadow_active(&self) -> bool {
+        self.shadow_color.a > 0.0 && (self.shadow_blur > 0.0 || self.shadow_dx != 0.0 || self.shadow_dy != 0.0)
+    }
+
+    /// Box-blur radius in device pixels (shadow offsets apply in device space).
+    fn shadow_radius(&self) -> i32 {
+        ((self.shadow_blur / 2.0).ceil().max(0.0) as u32).min(256) as i32
+    }
+
+    /// How far past a shape's bbox coverage must be collected so the blurred, offset
+    /// shadow is complete (blur spread + offset shift + a 1px margin).
+    fn shadow_grow(&self) -> (i32, i32) {
+        let r = self.shadow_radius();
+        (
+            r + self.shadow_dx.round() as i32,
+            r + self.shadow_dy.round() as i32,
+        )
+    }
+
+    /// Coverage rect for a shadow of the device-space bbox `[x0,y0,x1,y1)`, grown to hold
+    /// the whole blurred + offset shadow and clamped to the bitmap.
+    fn shadow_rect(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> Option<(i32, i32, u32, u32)> {
+        let (gx, gy) = (self.shadow_grow().0.abs() + 1, self.shadow_grow().1.abs() + 1);
+        let (ex0, ey0, ex1, ey1) = (
+            (x0 - gx).max(0),
+            (y0 - gy).max(0),
+            (x1 + gx).min(self.width as i32),
+            (y1 + gy).min(self.height as i32),
+        );
+        if ex0 < ex1 && ey0 < ey1 {
+            Some((ex0, ey0, (ex1 - ex0) as u32, (ey1 - ey0) as u32))
+        } else {
+            None
+        }
+    }
+
+    fn clipped_out(&self, p: [f32; 2]) -> bool {
+        self.clips.iter().any(|e| {
+            let inside = if e.evenodd {
+                inside_evenodd(&e.polys, p)
+            } else {
+                inside_nonzero(&e.polys, p)
+            };
+            !inside
+        })
+    }
+
     // ---- paths ---------------------------------------------------------------------------
 
     pub fn begin_path(&mut self) {
@@ -291,19 +685,7 @@ impl Canvas2D {
         a1: f32,
         ccw: bool,
     ) -> Result<(), String> {
-        if !r.is_finite() || r < 0.0 {
-            return Err("IndexSizeError: arc radius must be non-negative".to_string());
-        }
-        if r == 0.0 {
-            return Ok(());
-        }
-        self.path.push(PathCmd::Circle {
-            c: [x, y],
-            r,
-            a0,
-            sweep: sweep_of(a0, a1, ccw),
-        });
-        Ok(())
+        push_arc_cmd(&mut self.path, x, y, r, a0, a1, ccw)
     }
 
     /// Spec-shaped parameter list (center, radii, rotation, angles, direction).
@@ -319,20 +701,7 @@ impl Canvas2D {
         a1: f32,
         ccw: bool,
     ) -> Result<(), String> {
-        if !rx.is_finite() || !ry.is_finite() || rx < 0.0 || ry < 0.0 {
-            return Err("IndexSizeError: ellipse radii must be non-negative".to_string());
-        }
-        if rx == 0.0 || ry == 0.0 {
-            return Ok(());
-        }
-        self.path.push(PathCmd::Ellipse {
-            c: [x, y],
-            r: [rx, ry],
-            rot,
-            a0,
-            sweep: sweep_of(a0, a1, ccw),
-        });
-        Ok(())
+        push_ellipse_cmd(&mut self.path, x, y, rx, ry, rot, a0, a1, ccw)
     }
 
     pub fn close_path(&mut self) {
@@ -345,22 +714,90 @@ impl Canvas2D {
         if self.width == 0 || self.height == 0 {
             return;
         }
-        let subs = flatten(&self.path);
+        let path = self.path.clone();
+        self.fill_impl(&path, false);
+    }
+
+    /// `fill(path)` / `fill(path, fillRule)`: unknown `Path2D` ids are an error.
+    pub fn fill_with(&mut self, id: u64, evenodd: bool) -> Result<(), String> {
+        match path_get(id) {
+            Some(p) => {
+                if self.width != 0 && self.height != 0 {
+                    self.fill_impl(&p, evenodd);
+                }
+                Ok(())
+            }
+            None => Err("InvalidStateError: unknown Path2D".to_string()),
+        }
+    }
+
+    fn fill_impl(&mut self, cmds: &[PathCmd], evenodd: bool) {
+        let subs = flatten(cmds);
         let inv = invert_affine(self.xf);
         let paint = self.fill.clone();
         let alpha = self.alpha;
-        self.fill_subpaths(&subs, &paint, alpha, inv, false);
+        self.fill_subpaths(&subs, &paint, alpha, inv, false, evenodd);
     }
 
     pub fn stroke(&mut self) {
         if self.width == 0 || self.height == 0 {
             return;
         }
-        let subs = flatten(&self.path);
+        let path = self.path.clone();
+        self.stroke_impl(&path);
+    }
+
+    /// `stroke(path)`: unknown `Path2D` ids are an error.
+    pub fn stroke_with(&mut self, id: u64) -> Result<(), String> {
+        match path_get(id) {
+            Some(p) => {
+                if self.width != 0 && self.height != 0 {
+                    self.stroke_impl(&p);
+                }
+                Ok(())
+            }
+            None => Err("InvalidStateError: unknown Path2D".to_string()),
+        }
+    }
+
+    fn stroke_impl(&mut self, cmds: &[PathCmd]) {
+        let subs = flatten(cmds);
         let inv = invert_affine(self.xf);
         let paint = self.stroke.clone();
         let (w, cap, join, alpha) = (self.line_width, self.cap, self.join, self.alpha);
         self.stroke_subpaths(&subs, &paint, w, cap, join, alpha, inv);
+    }
+
+    /// Intersect the current path with the clip stack (empty paths clip everything away).
+    pub fn clip(&mut self) {
+        let path = self.path.clone();
+        self.clip_impl(&path, false);
+    }
+
+    /// `clip(path)` / `clip(path, fillRule)`: unknown `Path2D` ids are an error.
+    pub fn clip_with(&mut self, id: u64, evenodd: bool) -> Result<(), String> {
+        match path_get(id) {
+            Some(p) => {
+                self.clip_impl(&p, evenodd);
+                Ok(())
+            }
+            None => Err("InvalidStateError: unknown Path2D".to_string()),
+        }
+    }
+
+    fn clip_impl(&mut self, cmds: &[PathCmd], evenodd: bool) {
+        let subs = flatten(cmds);
+        let polys: Vec<(Vec<[f32; 2]>, bool)> = subs
+            .iter()
+            .map(|s| {
+                (
+                    s.pts.iter().map(|p| apply_affine(self.xf, *p)).collect::<Vec<[f32; 2]>>(),
+                    s.closed,
+                )
+            })
+            .filter(|(p, _)| p.len() >= 2)
+            .collect();
+        self.clips.push(ClipEntry { polys, evenodd });
     }
 
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -374,7 +811,7 @@ impl Canvas2D {
         let inv = invert_affine(self.xf);
         let paint = self.fill.clone();
         let alpha = self.alpha;
-        self.fill_subpaths(&subs, &paint, alpha, inv, false);
+        self.fill_subpaths(&subs, &paint, alpha, inv, false, false);
     }
 
     pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -401,7 +838,7 @@ impl Canvas2D {
             closed: true,
         }];
         let inv = invert_affine(self.xf);
-        self.fill_subpaths(&subs, &Paint::Solid(Color::TRANSPARENT), 1.0, inv, true);
+        self.fill_subpaths(&subs, &Paint::Solid(Color::TRANSPARENT), 1.0, inv, true, false);
     }
 
     /// `drawImage` subset: blit `src` (straight-alpha, `sw`×`sh`) from the `sw`×`sh` rect at
@@ -453,6 +890,10 @@ impl Canvas2D {
         let alpha = self.alpha;
         for y in iy0..iy1 {
             for x in ix0..ix1 {
+                let p = [x as f32 + 0.5, y as f32 + 0.5];
+                if self.clipped_out(p) {
+                    continue;
+                }
                 let u = apply_affine(inv, [x as f32 + 0.5, y as f32 + 0.5]);
                 let fx = sx + (u[0] - dx) / dw * sw_;
                 let fy = sy + (u[1] - dy) / dh * sh_;
@@ -483,6 +924,164 @@ impl Canvas2D {
             (iy1 - iy0) as u32,
         );
         Ok(())
+    }
+
+    /// Blit pre-rasterized glyphs (shaped by the caller through `TextSystem`). `dx`/`dy`
+    /// are device-space top-left corners, `rgba` is premultiplied (white masks, true color
+    /// for emoji). Mask glyphs are tinted with `paint` (sampled per pixel, so gradients
+    /// apply); color glyphs keep their own colors. Clip, shadow and `globalAlpha` apply.
+    pub fn draw_glyphs(&mut self, glyphs: &[PlacedGlyph], paint: &Paint, alpha: f32) {
+        if self.width == 0 || self.height == 0 || glyphs.is_empty() {
+            return;
+        }
+        if paint.alpha() * alpha <= 0.0 {
+            return;
+        }
+        let inv = invert_affine(self.xf);
+        if self.shadow_active() {
+            let (mut x0, mut y0, mut x1, mut y1) =
+                (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for g in glyphs {
+                x0 = x0.min(g.dx);
+                y0 = y0.min(g.dy);
+                x1 = x1.max(g.dx + g.w as i32);
+                y1 = y1.max(g.dy + g.h as i32);
+            }
+            if x0 < x1 && y0 < y1 {
+                let Some((ex0, ey0, w, h)) = self.shadow_rect(x0, y0, x1, y1) else {
+                    return;
+                };
+                let mut cov = vec![0.0f32; (w * h) as usize];
+                for g in glyphs {
+                    for row in 0..g.h {
+                        for col in 0..g.w {
+                            let a = g.rgba[(row * g.w + col) as usize * 4 + 3] as f32 / 255.0;
+                            if a > 0.0 {
+                                let (px, py) = (g.dx + col as i32, g.dy + row as i32);
+                                if px < ex0 || py < ey0 {
+                                    continue;
+                                }
+                                let (ix, iy) = ((px - ex0) as u32, (py - ey0) as u32);
+                                if ix < w && iy < h {
+                                    cov[(iy * w + ix) as usize] =
+                                        cov[(iy * w + ix) as usize].max(a);
+                                }
+                            }
+                        }
+                    }
+                }
+                let shadow_paint = paint.clone();
+                self.paint_shadow(&cov, ex0, ey0, w, h, &shadow_paint, alpha, inv);
+            }
+        }
+        let (mut mx0, mut my0, mut mx1, mut my1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for g in glyphs {
+            for row in 0..g.h {
+                for col in 0..g.w {
+                    let si = (row * g.w + col) as usize * 4;
+                    let ga = g.rgba[si + 3] as f32 / 255.0 * alpha;
+                    if ga <= 0.0 {
+                        continue;
+                    }
+                    let (sx, sy) = (g.dx + col as i32, g.dy + row as i32);
+                    if sx < 0 || sy < 0 || sx >= self.width as i32 || sy >= self.height as i32 {
+                        continue;
+                    }
+                    let p = [sx as f32 + 0.5, sy as f32 + 0.5];
+                    if self.clipped_out(p) {
+                        continue;
+                    }
+                    let di = (sy as u32 * self.width + sx as u32) as usize * 4;
+                    if g.is_color {
+                        let a = g.rgba[si + 3] as f32 / 255.0;
+                        let (r, gg, b) = if a > 0.0 {
+                            (
+                                g.rgba[si] as f32 / 255.0 / a,
+                                g.rgba[si + 1] as f32 / 255.0 / a,
+                                g.rgba[si + 2] as f32 / 255.0 / a,
+                            )
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        };
+                        blend(&mut self.pixels[di..di + 4], r, gg, b, ga);
+                    } else {
+                        let c = self.sample(paint, inv, sx as f32 + 0.5, sy as f32 + 0.5);
+                        blend(&mut self.pixels[di..di + 4], c[0], c[1], c[2], c[3] * ga);
+                    }
+                    mx0 = mx0.min(sx as u32);
+                    my0 = my0.min(sy as u32);
+                    mx1 = mx1.max(sx as u32 + 1);
+                    my1 = my1.max(sy as u32 + 1);
+                }
+            }
+        }
+        if mx1 > mx0 && my1 > my0 {
+            self.mark(mx0, my0, mx1 - mx0, my1 - my0);
+        }
+    }
+
+    /// Composite a blurred, offset, shadow-colored copy of a coverage mask (`cov` over the
+    /// device-space rect at `(ox, oy)`). Coverage is geometric (0..1); the shape's own
+    /// alpha comes from sampling `paint`. The shadow is clipped like any other drawing.
+    fn paint_shadow(
+        &mut self,
+        cov: &[f32],
+        ox: i32,
+        oy: i32,
+        w: u32,
+        h: u32,
+        paint: &Paint,
+        alpha: f32,
+        inv: Option<[f32; 6]>,
+    ) {
+        if w == 0 || h == 0 || self.shadow_color.a <= 0.0 {
+            return;
+        }
+        let r = ((self.shadow_blur / 2.0).ceil().max(0.0) as u32).min(256);
+        let blurred = box_blur(cov, w, h, r);
+        let (sr, sg, sb, sa) = (
+            self.shadow_color.r,
+            self.shadow_color.g,
+            self.shadow_color.b,
+            self.shadow_color.a,
+        );
+        let (dxr, dyr) = (self.shadow_dx.round() as i32, self.shadow_dy.round() as i32);
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for row in 0..h {
+            for col in 0..w {
+                let c = blurred[(row * w + col) as usize];
+                if c <= 0.0 {
+                    continue;
+                }
+                let (sx, sy) = (ox + col as i32 + dxr, oy + row as i32 + dyr);
+                if sx < 0 || sy < 0 || sx >= self.width as i32 || sy >= self.height as i32 {
+                    continue;
+                }
+                let p = [sx as f32 + 0.5, sy as f32 + 0.5];
+                if self.clipped_out(p) {
+                    continue;
+                }
+                let s = self.sample(
+                    paint,
+                    inv,
+                    ox as f32 + col as f32 + 0.5,
+                    oy as f32 + row as f32 + 0.5,
+                );
+                let a = c * sa * alpha * s[3];
+                if a <= 0.0 {
+                    continue;
+                }
+                let di = (sy as u32 * self.width + sx as u32) as usize * 4;
+                blend(&mut self.pixels[di..di + 4], sr, sg, sb, a);
+                x0 = x0.min(sx as u32);
+                y0 = y0.min(sy as u32);
+                x1 = x1.max(sx as u32 + 1);
+                y1 = y1.max(sy as u32 + 1);
+            }
+        }
+        if x1 > x0 && y1 > y0 {
+            self.mark(x0, y0, x1 - x0, y1 - y0);
+        }
     }
 
     /// Read a straight-alpha rect; out-of-canvas pixels are transparent (per spec).
@@ -562,6 +1161,26 @@ impl Canvas2D {
                 let t = (((ux - g.x0) * vx + (uy - g.y0) * vy) / len2).clamp(0.0, 1.0);
                 gradient_at(&g.stops, t)
             }
+            Paint::Radial(g) => {
+                let (ux, uy) = match inv {
+                    Some(m) => {
+                        let p = apply_affine(m, [dx, dy]);
+                        (p[0], p[1])
+                    }
+                    None => (dx, dy),
+                };
+                gradient_at(&g.stops, radial_t(g, ux, uy))
+            }
+            Paint::Conic(g) => {
+                let (ux, uy) = match inv {
+                    Some(m) => {
+                        let p = apply_affine(m, [dx, dy]);
+                        (p[0], p[1])
+                    }
+                    None => (dx, dy),
+                };
+                conic_at(&g.stops, ux - g.x, uy - g.y, g.start)
+            }
         }
     }
 
@@ -572,6 +1191,7 @@ impl Canvas2D {
         alpha: f32,
         inv: Option<[f32; 6]>,
         clear: bool,
+        evenodd: bool,
     ) {
         if inv.is_none() {
             return;
@@ -615,14 +1235,41 @@ impl Canvas2D {
             return;
         }
         // Open subpaths are implicitly closed for fill (per spec).
+        let inside = |p: [f32; 2]| {
+            if evenodd {
+                inside_evenodd(&polys, p)
+            } else {
+                inside_nonzero(&polys, p)
+            }
+        };
+        if !clear && self.shadow_active() {
+            if let Some((ex0, ey0, w, h)) = self.shadow_rect(ix0, iy0, ix1, iy1) {
+                let mut cov = vec![0.0f32; (w * h) as usize];
+                for y in ey0..ey0 + h as i32 {
+                    for x in ex0..ex0 + w as i32 {
+                        if inside([x as f32 + 0.5, y as f32 + 0.5]) {
+                            cov[((y - ey0) as u32 * w + (x - ex0) as u32) as usize] = 1.0;
+                        }
+                    }
+                }
+                let shadow_paint = paint.clone();
+                self.paint_shadow(&cov, ex0, ey0, w, h, &shadow_paint, alpha, inv);
+            }
+        }
         for y in iy0..iy1 {
             for x in ix0..ix1 {
                 let p = [x as f32 + 0.5, y as f32 + 0.5];
-                if !inside_nonzero(&polys, p) {
+                if !inside(p) {
+                    continue;
+                }
+                if !clear && self.clipped_out(p) {
                     continue;
                 }
                 let di = (y as u32 * self.width + x as u32) as usize * 4;
                 if clear {
+                    if self.clipped_out(p) {
+                        continue;
+                    }
                     self.pixels[di..di + 4].copy_from_slice(&[0, 0, 0, 0]);
                 } else {
                     let c = self.sample(paint, inv, x as f32 + 0.5, y as f32 + 0.5);
@@ -685,9 +1332,26 @@ impl Canvas2D {
         if ix0 >= ix1 || iy0 >= iy1 {
             return;
         }
+        if self.shadow_active() {
+            if let Some((ex0, ey0, w, h)) = self.shadow_rect(ix0, iy0, ix1, iy1) {
+                let mut cov = vec![0.0f32; (w * h) as usize];
+                for y in ey0..ey0 + h as i32 {
+                    for x in ex0..ex0 + w as i32 {
+                        if stroke_hit(&polys, [x as f32 + 0.5, y as f32 + 0.5], half, cap, join) {
+                            cov[((y - ey0) as u32 * w + (x - ex0) as u32) as usize] = 1.0;
+                        }
+                    }
+                }
+                let shadow_paint = paint.clone();
+                self.paint_shadow(&cov, ex0, ey0, w, h, &shadow_paint, alpha, inv);
+            }
+        }
         for y in iy0..iy1 {
             for x in ix0..ix1 {
                 let p = [x as f32 + 0.5, y as f32 + 0.5];
+                if self.clipped_out(p) {
+                    continue;
+                }
                 if !stroke_hit(&polys, p, half, cap, join) {
                     continue;
                 }
@@ -902,6 +1566,28 @@ fn inside_nonzero(polys: &[(Vec<[f32; 2]>, bool)], p: [f32; 2]) -> bool {
     winding != 0
 }
 
+/// Even-odd point-in-path over device-space polygons (open ones implicitly closed).
+fn inside_evenodd(polys: &[(Vec<[f32; 2]>, bool)], p: [f32; 2]) -> bool {
+    let mut crossings = 0u32;
+    for (pts, _) in polys {
+        if pts.len() < 2 {
+            continue;
+        }
+        let n = pts.len();
+        for i in 0..n {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            if (a[1] <= p[1]) != (b[1] <= p[1]) {
+                let xi = a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+                if xi > p[0] {
+                    crossings += 1;
+                }
+            }
+        }
+    }
+    crossings % 2 == 1
+}
+
 /// Distance from `p` to segment `ab` (clamped). Returns `(dist, t)` with `t` unclamped unless
 /// `clamp` is set.
 fn seg_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2], clamp: bool) -> (f32, f32) {
@@ -1044,6 +1730,73 @@ fn stroke_hit(
     false
 }
 
+/// Two-circle radial interpolation: solve for `t` with `|P - (C0 + t*D)| = r0 + t*dr`.
+/// Roots outside `[0,1]` clamp to the endpoint stops (the gradient extends past its end
+/// circles with the terminal color, per spec); no real root keeps the endpoint nearest to
+/// the point.
+fn radial_t(g: &RadialGradient, ux: f32, uy: f32) -> f32 {
+    let (dx, dy, dr) = (g.x1 - g.x0, g.y1 - g.y0, g.r1 - g.r0);
+    let (qx, qy) = (ux - g.x0, uy - g.y0);
+    let a = dx * dx + dy * dy - dr * dr;
+    let b = -2.0 * (qx * dx + qy * dy + g.r0 * dr);
+    let c = qx * qx + qy * qy - g.r0 * g.r0;
+    if a.abs() < 1e-12 {
+        if b.abs() < 1e-12 {
+            return if c <= 0.0 { 0.0 } else { 1.0 };
+        }
+        return (-c / b).clamp(0.0, 1.0);
+    }
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        // Outside both cones: hold the nearer endpoint.
+        return if b > 0.0 { 0.0 } else { 1.0 };
+    }
+    let root = disc.sqrt();
+    let (t0, t1) = ((-b - root) / (2.0 * a), (-b + root) / (2.0 * a));
+    // The larger root is the far intersection the paint actually reaches.
+    t1.max(t0).clamp(0.0, 1.0)
+}
+
+/// Conic sweep: angle of `(dx, dy)` relative to `start`, normalized to `[0,1)`, then
+/// interpolated with wraparound (the last stop blends back into the first across 1→0).
+fn conic_at(stops: &[(f32, Color)], dx: f32, dy: f32, start: f32) -> [f32; 4] {
+    if stops.is_empty() {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    // Spec angles run clockwise from 12 o'clock; `atan2` runs counter-clockwise from 3
+    // o'clock, so rotate by a quarter turn and mirror.
+    let mut t = (std::f32::consts::FRAC_PI_2 - dy.atan2(dx) - start)
+        / std::f32::consts::TAU;
+    t = t.rem_euclid(1.0);
+    if t <= stops[0].0 {
+        let c = stops[0].1;
+        return [c.r, c.g, c.b, c.a];
+    }
+    for w in stops.windows(2) {
+        let ((t0, c0), (t1, c1)) = (w[0], w[1]);
+        if t <= t1 {
+            let k = if t1 > t0 { (t - t0) / (t1 - t0) } else { 1.0 };
+            return [
+                c0.r + (c1.r - c0.r) * k,
+                c0.g + (c1.g - c0.g) * k,
+                c0.b + (c1.b - c0.b) * k,
+                c0.a + (c1.a - c0.a) * k,
+            ];
+        }
+    }
+    // Wrap: last stop → first stop across the seam.
+    let (last, first) = (*stops.last().unwrap(), stops[0]);
+    let span = 1.0 - last.0 + first.0;
+    let k = if span > 1e-9 { (t - last.0) / span } else { 1.0 };
+    let (c0, c1) = (last.1, first.1);
+    [
+        c0.r + (c1.r - c0.r) * k,
+        c0.g + (c1.g - c0.g) * k,
+        c0.b + (c1.b - c0.b) * k,
+        c0.a + (c1.a - c0.a) * k,
+    ]
+}
+
 fn gradient_at(stops: &[(f32, Color)], t: f32) -> [f32; 4] {
     if stops.is_empty() {
         return [0.0, 0.0, 0.0, 0.0];
@@ -1066,6 +1819,45 @@ fn gradient_at(stops: &[(f32, Color)], t: f32) -> [f32; 4] {
     }
     let c = stops.last().unwrap().1;
     [c.r, c.g, c.b, c.a]
+}
+
+/// Separable sliding-window box blur of a coverage mask (edge-clamped), used for canvas
+/// shadows. `r = 0` returns the input unchanged.
+fn box_blur(src: &[f32], w: u32, h: u32, r: u32) -> Vec<f32> {
+    if r == 0 || w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let (w, h) = (w as usize, h as usize);
+    let n = (2 * r as usize + 1) as f32;
+    let mut tmp = vec![0.0f32; w * h];
+    for y in 0..h {
+        let mut acc = 0.0f32;
+        for x in 0..=(2 * r as usize) {
+            let xs = (x as i32 - r as i32).clamp(0, w as i32 - 1) as usize;
+            acc += src[y * w + xs];
+        }
+        for x in 0..w {
+            tmp[y * w + x] = acc / n;
+            let xa = (x as i32 - r as i32).clamp(0, w as i32 - 1) as usize;
+            let xb = (x as i32 + r as i32 + 1).clamp(0, w as i32 - 1) as usize;
+            acc += src[y * w + xb] - src[y * w + xa];
+        }
+    }
+    let mut out = vec![0.0f32; w * h];
+    for x in 0..w {
+        let mut acc = 0.0f32;
+        for y in 0..=(2 * r as usize) {
+            let ys = (y as i32 - r as i32).clamp(0, h as i32 - 1) as usize;
+            acc += tmp[ys * w + x];
+        }
+        for y in 0..h {
+            out[y * w + x] = acc / n;
+            let ya = (y as i32 - r as i32).clamp(0, h as i32 - 1) as usize;
+            let yb = (y as i32 + r as i32 + 1).clamp(0, h as i32 - 1) as usize;
+            acc += tmp[yb * w + x] - tmp[ya * w + x];
+        }
+    }
+    out
 }
 
 /// Source-over blend of straight-alpha `src` (alpha already includes `globalAlpha`).
@@ -1226,6 +2018,159 @@ pub fn base64_encode(data: &[u8]) -> String {
 // windows never share a bitmap. `PENDING` is the invalidation set: draws add, `paint.rs` drains
 // per composited canvas, so a canvas draw never restyles/relayouts siblings (only
 // `doc.dirty.paint` is set, which skips the relayout branch in `Engine::update`).
+
+// ---- Path2D objects -----------------------------------------------------------------------
+//
+// Independent path objects (no canvas attached). Each id owns a `Vec<PathCmd>` built by the
+// `path_*` helpers and consumed by `fill_with`/`stroke_with`/`clip_with`. Ids are process
+// global; the JS `Path2D` wrapper drops its id through a finalizer. String (SVG)
+// constructors are unsupported — `new Path2D(string)` throws `NotSupportedError` in JS.
+
+fn paths() -> &'static Mutex<HashMap<u64, Vec<PathCmd>>> {
+    static S: OnceLock<Mutex<HashMap<u64, Vec<PathCmd>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn path_next() -> &'static std::sync::atomic::AtomicU64 {
+    static S: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+    S.get_or_init(|| std::sync::atomic::AtomicU64::new(1))
+}
+
+/// Create an empty path object.
+pub fn path_create() -> u64 {
+    let id = path_next().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    paths().lock().unwrap().insert(id, Vec::new());
+    id
+}
+
+/// Clone a path object (`new Path2D(other)`). `None` for unknown ids.
+pub fn path_clone(src: u64) -> Option<u64> {
+    let cmds = paths().lock().unwrap().get(&src)?.clone();
+    let id = path_next().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    paths().lock().unwrap().insert(id, cmds);
+    Some(id)
+}
+
+/// Drop a path object (`None` is fine — double drops are ignored).
+pub fn path_drop(id: u64) {
+    paths().lock().unwrap().remove(&id);
+}
+
+fn path_get(id: u64) -> Option<Vec<PathCmd>> {
+    paths().lock().unwrap().get(&id).cloned()
+}
+
+/// Run `f` on a path object. `None` for unknown ids.
+fn path_with<R>(id: u64, f: impl FnOnce(&mut Vec<PathCmd>) -> R) -> Option<R> {
+    let mut p = paths().lock().unwrap();
+    p.get_mut(&id).map(f)
+}
+
+/// Path builders for the JS `Path2D` methods. Each returns `false` for unknown ids (the
+/// caller reports `InvalidStateError`).
+pub fn path_move_to(id: u64, x: f32, y: f32) -> bool {
+    path_with(id, |c| c.push(PathCmd::Move([x, y]))).is_some()
+}
+
+pub fn path_line_to(id: u64, x: f32, y: f32) -> bool {
+    path_with(id, |c| c.push(PathCmd::Line([x, y]))).is_some()
+}
+
+pub fn path_rect(id: u64, x: f32, y: f32, w: f32, h: f32) -> bool {
+    path_with(id, |c| c.push(PathCmd::Rect([x, y, w, h]))).is_some()
+}
+
+pub fn path_close(id: u64) -> bool {
+    path_with(id, |c| c.push(PathCmd::Close)).is_some()
+}
+
+pub fn path_arc(
+    id: u64,
+    x: f32,
+    y: f32,
+    r: f32,
+    a0: f32,
+    a1: f32,
+    ccw: bool,
+) -> Result<bool, String> {
+    match path_with(id, |c| push_arc_cmd(c, x, y, r, a0, a1, ccw)) {
+        None => Ok(false),
+        Some(r) => r.map(|()| true),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn path_ellipse(
+    id: u64,
+    x: f32,
+    y: f32,
+    rx: f32,
+    ry: f32,
+    rot: f32,
+    a0: f32,
+    a1: f32,
+    ccw: bool,
+) -> Result<bool, String> {
+    match path_with(id, |c| {
+        push_ellipse_cmd(c, x, y, rx, ry, rot, a0, a1, ccw)
+    }) {
+        None => Ok(false),
+        Some(r) => r.map(|()| true),
+    }
+}
+
+/// Append an arc to a raw command list (shared by `Canvas2D::arc` and path objects).
+fn push_arc_cmd(
+    cmds: &mut Vec<PathCmd>,
+    x: f32,
+    y: f32,
+    r: f32,
+    a0: f32,
+    a1: f32,
+    ccw: bool,
+) -> Result<(), String> {
+    if !r.is_finite() || r < 0.0 {
+        return Err("IndexSizeError: arc radius must be non-negative".to_string());
+    }
+    if r == 0.0 {
+        return Ok(());
+    }
+    cmds.push(PathCmd::Circle {
+        c: [x, y],
+        r,
+        a0,
+        sweep: sweep_of(a0, a1, ccw),
+    });
+    Ok(())
+}
+
+/// Spec-shaped parameter list (center, radii, rotation, angles, direction).
+fn push_ellipse_cmd(
+    cmds: &mut Vec<PathCmd>,
+    x: f32,
+    y: f32,
+    rx: f32,
+    ry: f32,
+    rot: f32,
+    a0: f32,
+    a1: f32,
+    ccw: bool,
+) -> Result<(), String> {
+    if !rx.is_finite() || !ry.is_finite() || rx < 0.0 || ry < 0.0 {
+        return Err("IndexSizeError: ellipse radii must be non-negative".to_string());
+    }
+    if rx == 0.0 || ry == 0.0 {
+        return Ok(());
+    }
+    cmds.push(PathCmd::Ellipse {
+        c: [x, y],
+        r: [rx, ry],
+        rot,
+        a0,
+        sweep: sweep_of(a0, a1, ccw),
+    });
+    Ok(())
+}
 
 type StoreKey = (usize, u32);
 
@@ -1557,5 +2502,225 @@ mod tests {
         );
         prune(0xC0FFEE, |_| false);
         read_canvas(0xC0FFEE, 7, |c| assert!(c.is_none()));
+    }
+
+    #[test]
+    fn radial_gradient_interpolates_center_to_edge() {
+        let mut c = Canvas2D::new(64, 64);
+        c.set_fill(Paint::Radial(RadialGradient {
+            x0: 32.0,
+            y0: 32.0,
+            r0: 2.0,
+            x1: 32.0,
+            y1: 32.0,
+            r1: 30.0,
+            stops: vec![(0.0, Color::WHITE), (1.0, Color::BLACK)],
+        }));
+        c.fill_rect(0.0, 0.0, 64.0, 64.0);
+        assert_eq!(px(&c, 32, 32), [255, 255, 255, 255]);
+        assert_eq!(px(&c, 0, 0), [0, 0, 0, 255]);
+        let mid = px(&c, 32, 47)[0];
+        assert!((mid as i32 - 128).abs() < 30, "mid-radius is gray: {mid}");
+    }
+
+    #[test]
+    fn conic_gradient_sweeps_around_center() {
+        let mut c = Canvas2D::new(64, 64);
+        c.set_fill(Paint::Conic(ConicGradient {
+            x: 32.0,
+            y: 32.0,
+            start: 0.0,
+            stops: vec![(0.0, Color::from_u8(255, 0, 0, 1.0)), (1.0, Color::from_u8(0, 0, 255, 1.0))],
+        }));
+        c.fill_rect(0.0, 0.0, 64.0, 64.0);
+        // Directly below the center (t = 0) holds the first stop; elsewhere blends.
+        let below = px(&c, 32, 48);
+        assert!(below[0] > 200 && below[2] < 60, "{below:?}");
+        let right = px(&c, 48, 32);
+        assert!(
+            right[0] > 100 && right[0] < 220 && right[2] > 30 && right[2] < 160,
+            "quarter turn blends red into blue: {right:?}"
+        );
+        assert_ne!(below, right);
+    }
+
+    #[test]
+    fn clip_intersects_and_restores() {
+        let mut c = Canvas2D::new(20, 20);
+        c.set_fill(Paint::Solid(Color::from_u8(0, 255, 0, 1.0)));
+        c.save();
+        c.begin_path();
+        c.rect(2.0, 2.0, 6.0, 6.0);
+        c.clip();
+        c.fill_rect(0.0, 0.0, 20.0, 20.0);
+        assert_eq!(px(&c, 4, 4), [0, 255, 0, 255]);
+        assert_eq!(px(&c, 12, 12), [0, 0, 0, 0]);
+        // A second clip intersects with the first (empty intersection paints nothing).
+        c.begin_path();
+        c.rect(10.0, 10.0, 6.0, 6.0);
+        c.clip();
+        c.fill_rect(0.0, 0.0, 20.0, 20.0);
+        assert_eq!(px(&c, 4, 4), [0, 255, 0, 255], "disjoint clip paints nothing new");
+        c.restore();
+        c.fill_rect(0.0, 0.0, 20.0, 20.0);
+        assert_eq!(px(&c, 12, 12), [0, 255, 0, 255], "restore drops the clip stack");
+    }
+
+    #[test]
+    fn evenodd_fill_leaves_holes() {
+        let mut c = Canvas2D::new(20, 20);
+        c.set_fill(Paint::Solid(Color::from_u8(255, 0, 255, 1.0)));
+        let id = path_create();
+        assert!(path_rect(id, 0.0, 0.0, 20.0, 20.0));
+        assert!(path_rect(id, 5.0, 5.0, 10.0, 10.0));
+        c.fill_with(id, false).unwrap();
+        assert_eq!(px(&c, 10, 10), [255, 0, 255, 255], "nonzero fills the hole");
+        let mut d = Canvas2D::new(20, 20);
+        d.set_fill(Paint::Solid(Color::from_u8(255, 0, 255, 1.0)));
+        d.fill_with(id, true).unwrap();
+        assert_eq!(px(&d, 10, 10), [0, 0, 0, 0], "evenodd leaves the hole");
+        assert_eq!(px(&d, 2, 2), [255, 0, 255, 255]);
+        // Unknown ids and bad radii are errors, not panics.
+        assert!(c.fill_with(0xDEAD_BEEF, false).is_err());
+        assert!(c.stroke_with(0xDEAD_BEEF).is_err());
+        assert!(c.clip_with(0xDEAD_BEEF, false).is_err());
+        assert!(path_arc(id, 0.0, 0.0, -1.0, 0.0, 1.0, false).is_err());
+        // Clone round-trips the commands.
+        let id2 = path_clone(id).unwrap();
+        assert!(path_close(id2));
+        path_drop(id);
+        path_drop(id2);
+        assert!(path_clone(id).is_none(), "dropped ids are gone");
+    }
+
+    #[test]
+    fn path_objects_stroke_and_clip() {
+        let mut c = Canvas2D::new(24, 24);
+        c.set_stroke(Paint::Solid(Color::BLACK));
+        c.set_line_width(4.0);
+        let id = path_create();
+        assert!(path_move_to(id, 2.0, 12.0));
+        assert!(path_line_to(id, 22.0, 12.0));
+        c.stroke_with(id).unwrap();
+        assert_eq!(px(&c, 12, 12), [0, 0, 0, 255]);
+        path_drop(id);
+        // Clip through a Path2D id.
+        let mut d = Canvas2D::new(16, 16);
+        d.set_fill(Paint::Solid(Color::WHITE));
+        let cid = path_create();
+        assert!(path_rect(cid, 0.0, 0.0, 4.0, 4.0));
+        d.clip_with(cid, false).unwrap();
+        d.fill_rect(0.0, 0.0, 16.0, 16.0);
+        assert_eq!(px(&d, 2, 2), [255, 255, 255, 255]);
+        assert_eq!(px(&d, 8, 8), [0, 0, 0, 0]);
+        path_drop(cid);
+    }
+
+    #[test]
+    fn shadow_offsets_and_blurs_under_the_shape() {
+        // Hard offset shadow.
+        let mut c = Canvas2D::new(20, 12);
+        c.set_fill(Paint::Solid(Color::from_u8(0, 0, 255, 1.0)));
+        c.set_shadow_color(Color::from_u8(255, 0, 0, 1.0));
+        c.set_shadow_offset(8.0, 0.0);
+        c.fill_rect(2.0, 2.0, 4.0, 4.0);
+        assert_eq!(px(&c, 3, 4), [0, 0, 255, 255], "shape on top");
+        assert_eq!(px(&c, 11, 4), [255, 0, 0, 255], "offset shadow beside it");
+        assert_eq!(px(&c, 18, 4), [0, 0, 0, 0]);
+        // Blur spreads the shadow past the shape bounds.
+        let mut b = Canvas2D::new(24, 12);
+        b.set_fill(Paint::Solid(Color::WHITE));
+        b.set_shadow_color(Color::from_u8(255, 0, 0, 1.0));
+        b.set_shadow_blur(6.0);
+        b.fill_rect(8.0, 2.0, 4.0, 4.0);
+        assert_eq!(px(&b, 10, 4), [255, 255, 255, 255]);
+        assert_ne!(px(&b, 5, 4), [0, 0, 0, 0], "blurred shadow reaches past the shape");
+        // Save/restore round-trips shadow state; transparent shadows paint nothing extra.
+        b.save();
+        b.set_shadow_color(Color::TRANSPARENT);
+        b.restore();
+        assert_eq!(b.shadow_color, Color::from_u8(255, 0, 0, 1.0));
+        c.set_shadow_color(Color::TRANSPARENT);
+        c.clear_rect(0.0, 0.0, 20.0, 12.0);
+        c.fill_rect(0.0, 0.0, 4.0, 4.0);
+        assert_eq!(px(&c, 8, 2), [0, 0, 0, 0], "no shadow when the color is transparent");
+    }
+
+    #[test]
+    fn glyph_blits_tint_clip_and_shadow() {
+        // Synthetic 2x2 white mask with a fully transparent corner.
+        let mut c = Canvas2D::new(8, 8);
+        c.set_fill(Paint::Solid(Color::from_u8(0, 255, 0, 1.0)));
+        c.draw_glyphs(
+            &[PlacedGlyph {
+                dx: 2,
+                dy: 2,
+                w: 2,
+                h: 2,
+                rgba: vec![255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+                is_color: false,
+            }],
+            &Paint::Solid(Color::from_u8(0, 255, 0, 1.0)),
+            1.0,
+        );
+        assert_eq!(px(&c, 2, 2), [0, 255, 0, 255]);
+        assert_eq!(px(&c, 3, 3), [0, 0, 0, 0]);
+        // Clipping cuts glyphs too.
+        c.save();
+        c.begin_path();
+        c.rect(0.0, 0.0, 3.0, 8.0);
+        c.clip();
+        c.draw_glyphs(
+            &[PlacedGlyph {
+                dx: 2,
+                dy: 4,
+                w: 2,
+                h: 2,
+                rgba: vec![255; 16],
+                is_color: false,
+            }],
+            &Paint::Solid(Color::from_u8(0, 255, 0, 1.0)),
+            1.0,
+        );
+        c.restore();
+        assert_eq!(px(&c, 2, 4), [0, 255, 0, 255]);
+        assert_eq!(px(&c, 3, 4), [0, 0, 0, 0], "right half clipped away");
+    }
+
+    #[test]
+    fn font_shorthand_parses_and_rejects() {
+        assert_eq!(
+            parse_font("20px serif"),
+            Some(CanvasFont {
+                size: 20.0,
+                families: vec!["serif".to_string()],
+                weight: 400,
+                italic: false,
+            })
+        );
+        assert_eq!(
+            parse_font("italic bold 16px \"Helvetica Neue\", Arial, sans-serif").map(|f| (f.size, f.weight, f.italic, f.families.len())),
+            Some((16.0, 700, true, 3))
+        );
+        assert_eq!(parse_font("12pt serif").map(|f| f.size), Some(16.0));
+        assert_eq!(parse_font("10px sans-serif").map(|f| f.size), Some(10.0));
+        assert!(parse_font("bogus").is_none());
+        assert!(parse_font("20px").is_none(), "family is required");
+        assert!(parse_font("serif").is_none(), "size is required");
+        assert!(parse_font("-4px serif").is_none());
+        assert!(parse_font("").is_none());
+        // Invalid setters keep the previous value.
+        let mut c = Canvas2D::new(4, 4);
+        c.set_font("20px serif").unwrap();
+        assert!(c.set_font("bogus").is_err());
+        assert_eq!(c.font().size, 20.0);
+        c.set_text_align("center");
+        c.set_text_align("sideways");
+        assert_eq!(c.text_align(), CanvasTextAlign::Center);
+        c.set_text_baseline("middle");
+        c.set_text_baseline("upside-down");
+        assert_eq!(c.text_baseline(), CanvasTextBaseline::Middle);
+        c.set_shadow_blur(-3.0);
+        assert_eq!(c.shadow_blur, 0.0);
     }
 }
