@@ -11,9 +11,12 @@ export function nsisScript({name, version, executable, output, publishUrl, certi
   const safe = value => value ? String(value).replace(/[\r\n"$]+/g, '_') : '(unset)';
   return `Unicode true
 ; Rendrix NSIS installer for ${name} ${version}
-; Signing: rendrix package --installer nsis --sign with RENDRIX_SIGN_COMMAND (certificateSubjectName ${safe(certificateSubjectName)})
-; Publish (manual): upload this installer plus the SHA-256 manifest to publishUrl ${safe(publishUrl)}
-; In-app updates are supported: configure autoUpdater.setFeedURL(...) to the published manifest URL.
+; Signing: rendrix package --installer nsis --sign (RENDRIX_SIGN_COMMAND, or RENDRIX_CERT_FILE on Windows)
+; Updates: manual publish — upload the installer, the standalone exe, and the SHA-256 manifest
+; (rendrix package --manifest manifest.json [--manifest-key key.pem]) to publishUrl ${safe(publishUrl)}.
+; The app checks that manifest with rendrix.update.check(feedUrl), verifies the download hash,
+; and restarts into the new binary with update.install() (quitAndInstall semantics). There is no
+; Electron autoUpdater here; do not reference autoUpdater.setFeedURL in installer scripts.
 Name "${name} ${version}"
 OutFile "${output}"
 InstallDir "$PROGRAMFILES\\${name}"

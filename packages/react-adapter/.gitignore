@@ -1,0 +1,4 @@
+# Generated ESM ports of the pinned React CJS builds. Regenerate with:
+#   node scripts/vendor.mjs
+# Never edit by hand.
+src/vendor/

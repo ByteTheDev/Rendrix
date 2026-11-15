@@ -20,7 +20,7 @@ jobs:
           node-version: 22
       - name: Linux system libraries (windowing, clipboard, software Vulkan)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libxcb1-dev mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libxcb1-dev mesa-vulkan-drivers libudev-dev
       - name: Rust tests (GPU tests skip themselves when no adapter exists)
         run: cargo test --workspace --manifest-path engine/Cargo.toml
       - name: Build the release runtime

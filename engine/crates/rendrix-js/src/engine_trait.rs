@@ -106,4 +106,35 @@ pub trait JsEngine {
     fn take_rejections(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// Arm a wall-clock deadline for subsequently executed script: when the deadline passes, the
+    /// engine's interrupt handler fires and the running script fails with an error instead of
+    /// hanging the frame loop. `None` (the default) disables the deadline. Backends that cannot
+    /// preempt execution keep the no-op default.
+    fn set_execution_deadline(&mut self, _after: Option<std::time::Duration>) {}
+    /// Clear any armed execution deadline.
+    fn clear_execution_deadline(&mut self) {
+        self.set_execution_deadline(None);
+    }
+}
+
+/// Resolve `name` imported from `base` against a module map (`./x`, `../x`, bare keys; tries `.js`,
+/// `/index.js` and `.mjs`). Shared by every [`JsEngine`] backend so resolution is identical.
+pub fn resolve_module(map: &std::collections::HashMap<String, String>, base: &str, name: &str) -> Option<String> {
+    let joined = if name.starts_with("./") || name.starts_with("../") {
+        let dir = base.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let mut parts: Vec<&str> = if dir.is_empty() { vec![] } else { dir.split('/').collect() };
+        for seg in name.split('/') {
+            match seg {
+                "." | "" => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        parts.join("/")
+    } else {
+        name.trim_start_matches('/').to_string()
+    };
+    [joined.clone(), format!("{joined}.js"), format!("{joined}/index.js"), format!("{joined}.mjs")].into_iter().find(|c| map.contains_key(c))
 }

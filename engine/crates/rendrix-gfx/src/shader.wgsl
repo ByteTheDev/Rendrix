@@ -20,6 +20,7 @@ struct Inst {
     clip: vec4<f32>,
     uv: vec4<f32>,
     extra: vec4<f32>,  // angle, nstops, clip_radius, pad
+    clip_info: vec4<f32>, // clip_kind (0 rect / 1 ellipse), grayscale, brightness, unused
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -116,9 +117,15 @@ fn fs_main(v: VOut) -> @location(0) vec4<f32> {
     let uvp = inst.uv.xy + inst.uv.zw * ((p - inst.rect.xy) / max(inst.rect.zw, vec2<f32>(1e-4)));
     let texel = textureSample(tex, samp, uvp);
 
-    // Clip (screen space, device pixels).
+    // Clip (screen space, device pixels): rounded rect, or the ellipse inscribed in
+    // the clip rect for `clip-path: circle()` / `ellipse()`.
     var clip_cov = 1.0;
-    {
+    if (inst.clip_info.x > 0.5) {
+        let ec = inst.clip.xy + inst.clip.zw * 0.5;
+        let er = max(inst.clip.zw * 0.5, vec2<f32>(1e-4));
+        let q = (v.pos.xy - ec) / er;
+        clip_cov = clamp(0.5 - (length(q) - 1.0) * min(er.x, er.y), 0.0, 1.0);
+    } else {
         let ch = inst.clip.zw * 0.5;
         let cd = sd_rrect(v.pos.xy - (inst.clip.xy + ch), ch, vec4<f32>(inst.extra.z));
         clip_cov = clamp(0.5 - cd, 0.0, 1.0);
@@ -170,6 +177,14 @@ fn fs_main(v: VOut) -> @location(0) vec4<f32> {
         // Image or colour glyph: premultiplied texel, rounded-rect masked, modulated by opacity.
         let d = sd_rrect(p - center, half, inst.radii);
         out = texel * inst.c0.a * coverage(d, aa);
+    }
+    // Pointwise `filter` factors (exact for brightness/grayscale; blur is expanded into
+    // offset instances on the CPU side). Applied in premultiplied space: alpha untouched.
+    {
+        let g = clamp(inst.clip_info.y, 0.0, 1.0);
+        let b = inst.clip_info.z;
+        let l = dot(out.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        out = vec4<f32>(mix(out.rgb, vec3<f32>(l), g) * b, out.a);
     }
     return out * clip_cov;
 }

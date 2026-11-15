@@ -3,10 +3,11 @@
 use crate::boxtree::ANON;
 use crate::Engine;
 use rendrix_css::animation::{mat_apply, mat_invert, mat_mul, transform_matrix, Matrix, IDENTITY};
-use rendrix_css::{BackgroundImage, BackgroundRepeat, BackgroundSize, BorderStyle, Color, ComputedStyle, Dim, ObjectFit, Overflow, PointerEvents, Visibility};
+use rendrix_css::{BackgroundImage, BackgroundRepeat, BackgroundSize, BorderStyle, Color, ComputedStyle, Dim, ObjectFit, Overflow, PointerEvents, Position, Visibility, WhiteSpace};
 use rendrix_dom::NodeId;
-use rendrix_gfx::{DisplayList, Fill, ImageItem, Item, RectItem, ShadowItem, TextItem};
-use rendrix_layout::{BoxLayout, LayoutKind, LayoutNode, LayoutResult};
+use rendrix_gfx::{canvas_image_id, DisplayList, Fill, ImageItem, Item, RectItem, Scene3DItem, ShadowItem, TextItem};
+use rendrix_layout::{BoxLayout, InlineContent, InlineRun, LayoutKind, LayoutNode, LayoutResult};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct HitEntry {
@@ -58,12 +59,104 @@ fn aabb(m: Matrix, r: [f32; 4]) -> [f32; 4] {
 }
 
 fn resolve_radii(s: &ComputedStyle, w: f32, h: f32) -> [f32; 4] {
+    let basis = w.min(h);
     let r = |d: Dim| match d {
         Dim::Px(v) => v,
-        Dim::Percent(p) => p / 100.0 * w.min(h),
+        Dim::Percent(p) => p / 100.0 * basis,
+        Dim::Calc(p, px) => p / 100.0 * basis + px,
         Dim::Auto => 0.0,
     };
     [r(s.border_radius[0]), r(s.border_radius[1]), r(s.border_radius[2]), r(s.border_radius[3])]
+}
+
+const ELLIPSIS: &str = "…";
+
+/// Truncate single-line (`white-space: nowrap`) text with `text-overflow: ellipsis`
+/// to `max_width`, appending `…`. Returns the original content when no truncation
+/// is needed. Multi-run styling is preserved; only the first line (up to `<br>`) is kept.
+fn ellipsize_content(content: &Arc<InlineContent>, max_width: f32, engine: &Engine) -> Arc<InlineContent> {
+    if !content.container.text_overflow_ellipsis {
+        return content.clone();
+    }
+    if !matches!(content.container.white_space, WhiteSpace::NoWrap) {
+        return content.clone();
+    }
+    if !max_width.is_finite() || max_width <= 0.0 {
+        let style = content.runs.first().map(|r| r.style.clone()).unwrap_or_else(|| content.container.clone());
+        return Arc::new(InlineContent::new(
+            vec![InlineRun { text: ELLIPSIS.to_string(), style, node: content.runs.first().map(|r| r.node).unwrap_or(0), is_break: false }],
+            content.container.clone(),
+        ));
+    }
+    // Only the first line participates (explicit breaks start new lines even with nowrap).
+    let first_line: Vec<&InlineRun> = content.runs.iter().take_while(|r| !r.is_break).collect();
+    if first_line.is_empty() {
+        return content.clone();
+    }
+    let total_chars: usize = first_line.iter().map(|r| r.text.chars().count()).sum();
+    if total_chars == 0 {
+        return content.clone();
+    }
+    let natural = engine.text_borrow().paragraph(content, None).width;
+    if natural <= max_width {
+        return content.clone();
+    }
+    // Binary search the longest prefix whose width with `…` still fits.
+    let mut lo = 0usize;
+    let mut hi = total_chars;
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let cand = truncate_runs(content, &first_line, mid);
+        let w = engine.text_borrow().paragraph(&cand, None).width;
+        if w <= max_width {
+            best = mid;
+            lo = mid + 1;
+            if mid == total_chars {
+                break;
+            }
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Arc::new(truncate_runs(content, &first_line, best))
+}
+
+/// Build truncated content keeping the first `keep` chars of `first_line` plus `…`.
+fn truncate_runs(content: &Arc<InlineContent>, first_line: &[&InlineRun], keep: usize) -> InlineContent {
+    if keep == 0 {
+        let style = first_line.first().map(|r| r.style.clone()).unwrap_or_else(|| content.container.clone());
+        let node = first_line.first().map(|r| r.node).unwrap_or(0);
+        return InlineContent::new(
+            vec![InlineRun { text: ELLIPSIS.to_string(), style, node, is_break: false }],
+            content.container.clone(),
+        );
+    }
+    let mut out: Vec<InlineRun> = Vec::new();
+    let mut remaining = keep;
+    for r in first_line {
+        let n = r.text.chars().count();
+        if remaining >= n {
+            out.push((*r).clone());
+            remaining -= n;
+        } else {
+            let prefix: String = r.text.chars().take(remaining).collect();
+            out.push(InlineRun { text: format!("{prefix}{ELLIPSIS}"), style: r.style.clone(), node: r.node, is_break: false });
+            return InlineContent::new(out, content.container.clone());
+        }
+    }
+    // `keep` covered everything (only reachable when the full text + `…` still fits,
+    // or as a rounding fallback): force the ellipsis so callers always see `…`.
+    if let Some(last) = out.last_mut() {
+        if !last.text.ends_with(ELLIPSIS) {
+            last.text.push_str(ELLIPSIS);
+        }
+        InlineContent::new(out, content.container.clone())
+    } else {
+        InlineContent::new(out, content.container.clone())
+    }
 }
 
 impl<'a> Painter<'a> {
@@ -94,6 +187,95 @@ impl<'a> Painter<'a> {
         c.a > 0.0
     }
 
+    /// `position: sticky` as relative clamped inside the nearest scrollport.
+    /// Falls back to the relative position when there is no scrollable ancestor
+    /// (or the insets are all `auto`). Release within the containing block is not
+    /// modelled: the box sticks to the scrollport while any of it would show.
+    fn sticky_rect(&self, id: u64, style: &ComputedStyle, rect: [f32; 4]) -> [f32; 4] {
+        if style.position != Position::Sticky {
+            return rect;
+        }
+        let mut anc = self.engine.doc.parent(id as NodeId);
+        let mut port: Option<ScrollInfo> = None;
+        while let Some(a) = anc {
+            if let Some(s) = self.scrolls.iter().find(|s| s.node == a) {
+                port = Some(*s);
+                break;
+            }
+            anc = self.engine.doc.parent(a);
+        }
+        let Some(p) = port else { return rect };
+        if p.rect[2] <= 0.0 || p.rect[3] <= 0.0 {
+            return rect;
+        }
+        let has = |d: Dim| !matches!(d, Dim::Auto);
+        let res = |d: Dim, basis: f32| d.resolve(basis).unwrap_or(0.0);
+        let (mut x, mut y) = (rect[0], rect[1]);
+        let top = has(style.inset[0]).then(|| p.rect[1] + res(style.inset[0], p.rect[3]));
+        let bottom = has(style.inset[2]).then(|| p.rect[1] + p.rect[3] - rect[3] - res(style.inset[2], p.rect[3]));
+        match (top, bottom) {
+            (Some(t), Some(b)) if b >= t => y = y.clamp(t, b),
+            (Some(t), _) => y = y.max(t),
+            (None, Some(b)) => y = y.min(b),
+            (None, None) => {}
+        }
+        let left = has(style.inset[3]).then(|| p.rect[0] + res(style.inset[3], p.rect[2]));
+        let right = has(style.inset[1]).then(|| p.rect[0] + p.rect[2] - rect[2] - res(style.inset[1], p.rect[2]));
+        match (left, right) {
+            (Some(l), Some(r)) if r >= l => x = x.clamp(l, r),
+            (Some(l), _) => x = x.max(l),
+            (None, Some(r)) => x = x.min(r),
+            (None, None) => {}
+        }
+        [x, y, rect[2], rect[3]]
+    }
+
+    /// Emit `clip-path` for a visible box. Returns true when a GPU clip was pushed
+    /// (the caller pops both the GPU item and the CPU cull/hit clip).
+    fn push_clip_path(&mut self, style: &ComputedStyle, rect: [f32; 4]) -> bool {
+        use rendrix_css::ClipPath as CP;
+        let (w, h) = (rect[2], rect[3]);
+        let res = |d: Dim, basis: f32| d.resolve(basis).unwrap_or(0.0);
+        // (gpu clip rect, ellipse?).
+        let (clip_rect, ellipse): ([f32; 4], bool) = match &style.clip_path {
+            CP::None => return false,
+            CP::Inset { top, right, bottom, left } => {
+                let (t, r, b, l) = (res(*top, h), res(*right, w), res(*bottom, h), res(*left, w));
+                ([rect[0] + l, rect[1] + t, (w - l - r).max(0.0), (h - t - b).max(0.0)], false)
+            }
+            CP::Circle { r, cx, cy } => {
+                let diag = (w * w + h * h).sqrt() / std::f32::consts::SQRT_2;
+                let (rr, ccx, ccy) = (res(*r, diag).max(0.0), res(*cx, w), res(*cy, h));
+                ([rect[0] + ccx - rr, rect[1] + ccy - rr, 2.0 * rr, 2.0 * rr], true)
+            }
+            CP::Ellipse { rx, ry, cx, cy } => {
+                let (rrx, rry) = (res(*rx, w).max(0.0), res(*ry, h).max(0.0));
+                let (ccx, ccy) = (res(*cx, w), res(*cy, h));
+                ([rect[0] + ccx - rrx, rect[1] + ccy - rry, 2.0 * rrx, 2.0 * rry], true)
+            }
+            CP::Polygon(pts) => {
+                // Per-pixel polygon clipping needs an offscreen pass: cull to the
+                // bounding box (documented gap).
+                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for (px, py) in pts {
+                    x0 = x0.min(res(*px, w));
+                    y0 = y0.min(res(*py, h));
+                    x1 = x1.max(res(*px, w));
+                    y1 = y1.max(res(*py, h));
+                }
+                ([rect[0] + x0, rect[1] + y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)], false)
+            }
+        };
+        if ellipse {
+            self.list.push(Item::PushEllipseClip { rect: clip_rect });
+        } else {
+            self.list.push(Item::PushClip { rect: clip_rect, radius: 0.0 });
+        }
+        let c = intersect(self.cur_clip(), aabb(self.cur_xf(), clip_rect));
+        self.clips.push(c);
+        true
+    }
+
     pub fn paint_root(&mut self, node: &LayoutNode) {
         self.paint_node(node, (0.0, 0.0));
     }
@@ -102,7 +284,8 @@ impl<'a> Painter<'a> {
         let Some(b) = self.res.boxes.get(&node.id).copied() else { return };
         let style = node.style.clone();
         let (x, y) = (origin.0 + b.x, origin.1 + b.y);
-        let rect = [x, y, b.width, b.height];
+        // `position: sticky` behaves as relative clamped inside the nearest scrollport.
+        let rect = self.sticky_rect(node.id, &style, [x, y, b.width, b.height]);
         let is_real = node.id & ANON == 0;
 
         // Cull boxes whose whole footprint (including scrollable overflow, shadows and outlines) is
@@ -110,7 +293,7 @@ impl<'a> Painter<'a> {
         if node.id != self.root as u64 {
             let reach = style.box_shadow.iter().map(|s| s.blur + s.spread.abs() + s.dx.abs().max(s.dy.abs())).fold(0.0f32, f32::max) + style.outline_width + style.outline_offset.abs() + 2.0;
             let (ew, eh) = (b.width.max(b.content_width + b.border[3]), b.height.max(b.content_height + b.border[0]));
-            let ext = [x - reach, y - reach, ew + 2.0 * reach, eh + 2.0 * reach];
+            let ext = [rect[0] - reach, rect[1] - reach, ew + 2.0 * reach, eh + 2.0 * reach];
             let screen = aabb(self.cur_xf(), if style.has_transform() { transformed_bounds(&style, ext, rect) } else { ext });
             let clip = self.cur_clip();
             if screen[0] >= clip[0] + clip[2] || screen[1] >= clip[1] + clip[3] || screen[0] + screen[2] <= clip[0] || screen[1] + screen[3] <= clip[1] {
@@ -133,8 +316,35 @@ impl<'a> Painter<'a> {
             self.list.push(Item::PushOpacity(style.opacity));
             pops.push(Item::PopOpacity);
         }
+        // Filter and backdrop-filter markers (the renderer folds pointwise filter ops
+        // into each instance; backdrop ops only balance the stack — see display.rs).
+        if style.filter.iter().any(|o| !o.is_noop()) {
+            self.list.push(Item::PushFilter(style.filter.clone()));
+            pops.push(Item::PopFilter);
+        }
+        if !style.backdrop_filter.is_empty() {
+            self.list.push(Item::PushBackdrop(style.backdrop_filter.clone()));
+            pops.push(Item::PopBackdrop);
+        }
+        // `mask-image`: average-alpha masking through the opacity stack (uniform masks
+        // exact; spatially-varying masks approximated — see COMPATIBILITY.md).
+        // `clip-path` clips the whole box (background included), so it wraps everything
+        // below and pops before the markers above (pushed last, popped first).
+        let mut pushed_clip_path = false;
 
         let visible = style.visibility == Visibility::Visible;
+        if visible {
+            if style.mask_image.is_some() {
+                let avg = style.mask_image.as_deref().and_then(|url| self.engine.image_entry(url)).map(|e| e.avg_alpha);
+                if let Some(a) = avg {
+                    if a < 1.0 {
+                        self.list.push(Item::PushOpacity(a));
+                        pops.push(Item::PopOpacity);
+                    }
+                }
+            }
+            pushed_clip_path = self.push_clip_path(&style, rect);
+        }
         if visible {
             self.paint_self(node, &style, &b, rect);
         }
@@ -153,6 +363,10 @@ impl<'a> Painter<'a> {
 
         for p in pops.into_iter().rev() {
             self.list.push(p);
+        }
+        if pushed_clip_path {
+            self.list.push(Item::PopClip);
+            self.clips.pop();
         }
         if popped_xf {
             self.xf.pop();
@@ -289,8 +503,38 @@ impl<'a> Painter<'a> {
                     }
                 }
                 let width = if control.is_some() && engine.doc.tag(control.unwrap()) == Some("input") { 1.0e5 } else { content_w };
+                // `text-overflow: ellipsis` truncates single-line text with `…` when it
+                // would overflow the content box (controls keep their own scrolling).
+                let display_content: Arc<InlineContent> = if control.is_none() {
+                    ellipsize_content(content, content_w, engine)
+                } else {
+                    content.clone()
+                };
                 if visible {
-                    self.list.push(Item::Text(TextItem { content: content.clone(), x: tx, y: content_y, width }));
+                    // `text-shadow` renders as shadow-tinted copies beneath the text
+                    // (blur softens through reduced alpha — a box-blur approximation).
+                    for sh in style.text_shadow.iter().rev() {
+                        if sh.color.a <= 0.0 {
+                            continue;
+                        }
+                        let dim = if sh.blur > 0.0 { 1.0 / (1.0 + sh.blur / 8.0) } else { 1.0 };
+                        let col = Color { a: sh.color.a * dim, ..sh.color };
+                        if col.a <= 0.0 {
+                            continue;
+                        }
+                        let runs = display_content
+                            .runs
+                            .iter()
+                            .map(|r| {
+                                let mut s = (*r.style).clone();
+                                s.color = col;
+                                InlineRun { text: r.text.clone(), style: Arc::new(s), node: r.node, is_break: r.is_break }
+                            })
+                            .collect::<Vec<_>>();
+                        let shadow = Arc::new(InlineContent::new(runs, display_content.container.clone()));
+                        self.list.push(Item::Text(TextItem { content: shadow, x: tx + sh.dx, y: content_y + sh.dy, width }));
+                    }
+                    self.list.push(Item::Text(TextItem { content: display_content.clone(), x: tx, y: content_y, width }));
                 }
                 // Text selection + caret for focused text controls.
                 if let (Some(c), true) = (control, visible) {
@@ -298,17 +542,23 @@ impl<'a> Painter<'a> {
                     if el.flags.focus {
                         let (s, e) = (el.form.selection_start, el.form.selection_end);
                         let w = if engine.doc.tag(c) == Some("input") { None } else { Some(content_w) };
-                        // Selection and caret are drawn under/over the text in paragraph space.
-                        let mut ts = engine.text_borrow();
-                        if s != e {
-                            for r in ts.selection_rects(content, w, s, e) {
-                                self.list.push(Item::Rect(RectItem { rect: [tx + r[0], content_y + r[1], r[2], r[3]], radii: [0.0; 4], fill: Fill::Solid(Color::rgba(0.10, 0.45, 0.91, 0.30)), border: None }));
+                        let show_caret = engine.caret_visible() && s == e;
+                        if s != e || show_caret {
+                            // One paragraph lookup serves selection geometry and the caret
+                            // (previously each query re-hashed the full text for its own lookup).
+                            let mut ts = engine.text_borrow();
+                            let para = ts.paragraph(content, w);
+                            if s != e {
+                                for r in ts.selection_rects_in(&para, s, e) {
+                                    self.list.push(Item::Rect(RectItem { rect: [tx + r[0], content_y + r[1], r[2], r[3]], radii: [0.0; 4], fill: Fill::Solid(Color::rgba(0.10, 0.45, 0.91, 0.30)), border: None }));
+                                }
                             }
-                        }
-                        if engine.caret_visible() && s == e {
-                            let (cx, cy, ch) = ts.caret(content, w, e);
-                            let col = style.caret_color.unwrap_or(style.color);
-                            self.list.push(Item::Rect(RectItem { rect: [tx + cx, content_y + cy, 1.0, ch], radii: [0.0; 4], fill: Fill::Solid(col), border: None }));
+                            if show_caret {
+                                let fallback_h = content.container.line_height.resolve(content.container.font_size);
+                                let (cx, cy, ch) = ts.caret_in(&para, e, fallback_h);
+                                let col = style.caret_color.unwrap_or(style.color);
+                                self.list.push(Item::Rect(RectItem { rect: [tx + cx, content_y + cy, 1.0, ch], radii: [0.0; 4], fill: Fill::Solid(col), border: None }));
+                            }
                         }
                     }
                 }
@@ -316,9 +566,9 @@ impl<'a> Painter<'a> {
                     self.list.push(Item::PopClip);
                 }
                 // Hit regions for inline elements nested in the paragraph.
-                let para = engine.text_borrow().paragraph(content, Some(width));
+                let para = engine.text_borrow().paragraph(&display_content, Some(width));
                 for seg in &para.segments {
-                    let Some(run) = content.runs.get(seg.run) else { continue };
+                    let Some(run) = display_content.runs.get(seg.run) else { continue };
                     if run.node != node.id && run.node & ANON == 0 {
                         let r = [tx + seg.x, content_y + seg.line_top, seg.w, seg.line_height];
                         self.add_hit(run.node as NodeId, r, &run.style);
@@ -361,6 +611,56 @@ impl<'a> Painter<'a> {
                             self.list.push(Item::Image(ImageItem { image: img.id, rect: r, radii, uv }));
                         }
                     }
+                }
+                // Inline `<svg>`: rasterized on the CPU at the content-box size (viewBox
+                // letterboxing happens inside the rasterizer) and composited as one
+                // textured quad, so clips/transforms/opacity apply like any image.
+                // The raster is cached by markup + size; DOM or layout changes re-rasterize.
+                if engine.doc.tag(tag) == Some("svg") {
+                    if content_w > 0.0 && content_h > 0.0 {
+                        let html = engine.doc.outer_html(tag);
+                        let (tw, th) = (content_w.round().clamp(1.0, 2048.0) as u32, content_h.round().clamp(1.0, 2048.0) as u32);
+                        if let Some(img) = engine.inline_svg_entry(tag, &html, tw, th) {
+                            let radii = resolve_radii(style, b.width, b.height);
+                            self.list.push(Item::Image(ImageItem { image: img.id, rect: [content_x, content_y, content_w, content_h], radii, uv: [0.0, 0.0, 1.0, 1.0] }));
+                        }
+                    }
+                }
+                // 3D scene viewport (R6.2 v1): `<rendrix-scene>` or `<canvas data-3d>`
+                // hosts the GPU scene registered under this node's id. The scene takes
+                // over the surface (no 2D bitmap composite for data-3d canvases) and
+                // composites into the border-box rect.
+                let is_scene = engine.doc.tag(tag) == Some("rendrix-scene")
+                    || (engine.doc.tag(tag) == Some("canvas") && engine.doc.has_attr(tag, "data-3d"));
+                if is_scene {
+                    if rect[2] > 0.0 && rect[3] > 0.0 {
+                        self.list.push(Item::Scene3D(Scene3DItem { scene_id: tag as u64, rect }));
+                    }
+                // Canvas 2D (A3): composite the GPU target as a plain textured quad. Clips,
+                // transforms and opacity apply through the shared flatten path; the intrinsic
+                // size comes from the width/height attributes (default 300x150). Zero-area
+                // canvases emit nothing and own no texture.
+                } else if engine.doc.tag(tag) == Some("canvas") {
+                    let dim = |name: &str, def: f32| {
+                        engine
+                            .doc
+                            .get_attr(tag, name)
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .map(|v| v.max(0.0))
+                            .unwrap_or(def)
+                    };
+                    if dim("width", 300.0) > 0.0 && dim("height", 150.0) > 0.0 && content_w > 0.0 && content_h > 0.0 {
+                        let radii = resolve_radii(style, b.width, b.height);
+                        self.list.push(Item::Image(ImageItem {
+                            image: canvas_image_id(tag),
+                            rect: [content_x, content_y, content_w, content_h],
+                            radii,
+                            uv: [0.0, 0.0, 1.0, 1.0],
+                        }));
+                    }
+                    // Drain this canvas from the pending set: its draws are now displayed.
+                    let doc_key = (&engine.doc as *const rendrix_dom::Document) as usize;
+                    rendrix_gfx::canvas::note_painted(doc_key, tag);
                 }
             }
             LayoutKind::Box => {

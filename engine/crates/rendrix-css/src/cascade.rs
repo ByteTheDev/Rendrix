@@ -5,7 +5,7 @@ use crate::parser::{Declaration, FontFace, Keyframes, MediaContext, Rule, StyleR
 use crate::properties::{apply_declaration, StyleContext};
 use crate::selector::{PseudoElement, Selector, SelectorElement};
 use crate::style::{ComputedStyle, Display, Position};
-use crate::values::substitute_vars;
+use crate::values::{substitute_env, substitute_vars, value_uses_viewport_units};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -38,6 +38,15 @@ pub struct RuleSet {
     pub state_deps_nonlocal: bool,
     /// Some selector depends on sibling position or siblings (`:nth-child`, `:first-child`, `+`, `~`, `:empty`).
     pub structural_deps: bool,
+    /// The stylesheet contains at least one `@media` rule (whether or not it matched).
+    pub has_media_rules: bool,
+    /// Some declaration value can resolve against the viewport size (`vw`/`vh`/`vmin`/`vmax`,
+    /// or a `var()` that might substitute one). Checked on resize to decide whether computed
+    /// styles can be reused.
+    pub uses_viewport_units: bool,
+    /// Some declaration value contains a `%` (informational; percentages resolve at layout time
+    /// and never force a restyle by themselves).
+    pub uses_percent: bool,
 }
 
 impl RuleSet {
@@ -55,11 +64,15 @@ impl RuleSet {
             match rule {
                 Rule::Style(r) => self.add_style_rule(r, origin),
                 Rule::Media(q, inner) => {
+                    self.has_media_rules = true;
                     if q.matches(media) {
                         self.add_rules(inner, origin, media);
                     }
                 }
                 Rule::Keyframes(k) => {
+                    for (_, decls) in &k.frames {
+                        self.note_viewport_flags(decls);
+                    }
                     self.keyframes.insert(k.name.clone(), k.clone());
                 }
                 Rule::FontFace(f) => self.font_faces.push(f.clone()),
@@ -67,8 +80,24 @@ impl RuleSet {
         }
     }
 
+    /// Fold declaration dependency flags into the ruleset.
+    fn note_viewport_flags(&mut self, decls: &[Declaration]) {
+        for d in decls {
+            if value_uses_viewport_units(&d.value) {
+                self.uses_viewport_units = true;
+            }
+            if d.value.contains('%') {
+                self.uses_percent = true;
+            }
+            if self.uses_viewport_units && self.uses_percent {
+                break;
+            }
+        }
+    }
+
     fn add_style_rule(&mut self, r: &StyleRule, origin: Origin) {
         let decls: Arc<[Declaration]> = r.declarations.clone().into();
+        self.note_viewport_flags(&r.declarations);
         for sel in &r.selectors {
             let state = |c: &crate::selector::Compound| {
                 fn has(p: &crate::selector::PseudoClass) -> bool {
@@ -76,6 +105,7 @@ impl RuleSet {
                     match p {
                         Hover | Active | Focus | FocusVisible | FocusWithin | Checked => true,
                         Not(l) | Is(l) | Where(l) => l.iter().any(|s| s.compounds.iter().any(|c| c.pseudos.iter().any(has))),
+                        Has(h) => h.iter().any(|x| x.selector.compounds.iter().any(|c| c.pseudos.iter().any(has))),
                         _ => false,
                     }
                 }
@@ -87,6 +117,7 @@ impl RuleSet {
                     match p {
                         FirstChild | LastChild | OnlyChild | NthChild(..) | NthLastChild(..) | NthOfType(..) | FirstOfType | LastOfType | Empty => true,
                         Not(l) | Is(l) | Where(l) => l.iter().any(|s| s.compounds.iter().any(|c| c.pseudos.iter().any(has))),
+                        Has(_) => true,
                         _ => false,
                     }
                 }
@@ -98,6 +129,19 @@ impl RuleSet {
             }
             if sel.compounds.len() > 1 && sel.compounds[..sel.compounds.len() - 1].iter().any(state) {
                 self.state_deps_nonlocal = true;
+            }
+            // `:has()` always observes other elements; state inside it is nonlocal
+            // even when the `:has()` itself sits on the subject.
+            {
+                let has_inner_state = sel.compounds.iter().any(|c| {
+                    c.pseudos.iter().any(|p| match p {
+                        crate::selector::PseudoClass::Has(h) => h.iter().any(|x| x.selector.compounds.iter().any(state)),
+                        _ => false,
+                    })
+                });
+                if has_inner_state {
+                    self.state_deps_nonlocal = true;
+                }
             }
             let idx = self.rules.len() as u32;
             let subject = sel.compounds.last().unwrap();
@@ -132,8 +176,15 @@ impl RuleSet {
                 candidates.extend_from_slice(v);
             }
         }
-        // Class buckets: probe each class the element could carry via a class attribute scan.
-        if let Some(class_attr) = el.attr("class") {
+        // Class buckets: probe each class the element carries via a class attribute scan.
+        // Elements that cache their split classes (the DOM does) skip the re-split.
+        if let Some(cached) = el.classes() {
+            for c in cached {
+                if let Some(v) = self.by_class.get(c.as_str()) {
+                    candidates.extend_from_slice(v);
+                }
+            }
+        } else if let Some(class_attr) = el.attr("class") {
             for c in class_attr.split_whitespace() {
                 if let Some(v) = self.by_class.get(c) {
                     candidates.extend_from_slice(v);
@@ -196,26 +247,38 @@ pub fn compute_style<E: SelectorElement>(
     let ordered: Vec<&Declaration> = tiers.into_iter().flatten().collect();
 
     // Custom properties (inherited): start from the parent's, then apply in cascade order.
-    let mut custom: BTreeMap<String, String> = (*parent_style.custom).clone();
+    // P5: the common case defines no `--x` at all, so scan first and only clone the map
+    // when something will actually be inserted. `inherit_from` already shared the parent's Arc.
     let mut any_custom = false;
     for d in &ordered {
         if d.name.starts_with("--") {
-            custom.insert(d.name.clone(), d.value.clone());
             any_custom = true;
+            break;
         }
     }
+    let mut owned_custom: Option<BTreeMap<String, String>> = None;
+    let custom: &BTreeMap<String, String> = if any_custom {
+        let mut m = (*parent_style.custom).clone();
+        for d in &ordered {
+            if d.name.starts_with("--") {
+                m.insert(d.name.clone(), d.value.clone());
+            }
+        }
+        owned_custom = Some(m);
+        owned_custom.as_ref().unwrap()
+    } else {
+        &parent_style.custom
+    };
 
     let mut style = ComputedStyle::inherit_from(parent_style);
-    if any_custom {
-        style.custom = Arc::new(custom.clone());
-    }
     // Un-inherit nothing else: inherit_from already gave initial values for non-inherited props.
 
     let value_of = |d: &Declaration| -> Option<String> {
-        if d.value.contains("var(") {
-            substitute_vars(&d.value, &custom)
+        let v = if d.value.contains("env(") { substitute_env(&d.value, sc.safe_area, sc.keyboard_h)? } else { d.value.clone() };
+        if v.contains("var(") {
+            substitute_vars(&v, &custom)
         } else {
-            Some(d.value.clone())
+            Some(v)
         }
     };
 
@@ -241,13 +304,19 @@ pub fn compute_style<E: SelectorElement>(
     }
 
     // Used-value adjustments that CSS applies at computed-value time.
-    if matches!(style.position, Position::Absolute | Position::Fixed) {
+    if matches!(style.position, Position::Absolute | Position::Fixed) || !matches!(style.float, crate::style::Float::None) {
         style.display = match style.display {
             Display::Inline | Display::InlineBlock => Display::Block,
             Display::InlineFlex => Display::Flex,
             Display::InlineGrid => Display::Grid,
+            Display::InlineTable => Display::Table,
+            // Floated internal table boxes and columns lose their table role.
+            Display::TableCell | Display::TableCaption | Display::ListItem => Display::Block,
             d => d,
         };
+    }
+    if let Some(m) = owned_custom {
+        style.custom = Arc::new(m);
     }
     style
 }
@@ -328,6 +397,30 @@ mod tests {
     }
 
     #[test]
+    fn ruleset_tracks_media_and_viewport_dependencies() {
+        // P2/P3: presence of @media / viewport-relative declarations is recorded even when
+        // the media does not currently match, so resize can decide whether restyle is needed.
+        let plain = rules("div { color: red; width: 50% }");
+        assert!(!plain.has_media_rules && !plain.uses_viewport_units);
+        assert!(plain.uses_percent, "percent is tracked (layout-resolved, informational)");
+
+        let with_media = rules("@media (max-width: 100px) { div { color: green } }");
+        assert!(with_media.has_media_rules);
+
+        let vw = rules("div { width: 50vw; height: 10vh }");
+        assert!(vw.uses_viewport_units);
+
+        let var_indirect = rules("div { width: var(--w) }");
+        assert!(var_indirect.uses_viewport_units, "var() may substitute viewport units");
+
+        let kf = rules("@keyframes k { from { width: 0vw } to { width: 10vw } }");
+        assert!(kf.uses_viewport_units, "keyframe declarations count too");
+
+        let ua = RuleSet::new();
+        assert!(!ua.has_media_rules && !ua.uses_viewport_units);
+    }
+
+    #[test]
     fn specificity_beats_order() {
         let (_, span) = tree(false);
         let rs = rules("#app span { color: red } span.a { color: blue } span { color: green }");
@@ -405,5 +498,14 @@ mod tests {
         let (_, span) = tree(false);
         let rs = rules("span { position: absolute }");
         assert_eq!(compute(&span, &rs, None).display, Display::Block);
+    }
+
+    #[test]
+    fn float_blockifies_inline_level_boxes() {
+        let (_, span) = tree(false);
+        let rs = rules("span { float: left }");
+        assert_eq!(compute(&span, &rs, None).display, Display::Block, "floated inlines become blocks");
+        let rs = rules("span { float: none }");
+        assert_eq!(compute(&span, &rs, None).display, Display::Inline);
     }
 }

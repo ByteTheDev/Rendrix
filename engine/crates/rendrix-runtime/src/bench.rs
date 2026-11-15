@@ -42,6 +42,12 @@ struct Sample {
     layout_ms: f64,
     paint_ms: f64,
     gpu_ms: f64,
+    /// M0: median newly shaped paragraphs per frame (`TextSystem::shape_count` delta).
+    shapes: f64,
+    /// M0: median engine restyles per frame (`EngineStats::restyles` delta).
+    restyles: f64,
+    /// M0: median engine layouts per frame (`EngineStats::layouts` delta).
+    layouts_n: f64,
 }
 
 pub fn run(items: usize, iterations: usize) -> Result<(), String> {
@@ -59,26 +65,36 @@ pub fn run(items: usize, iterations: usize) -> Result<(), String> {
     let mut results: Vec<Sample> = Vec::new();
     let mut measure = |h: &mut Headless, name: &'static str, mut mutate: Box<dyn FnMut(&mut Headless, usize)>| {
         let (mut total, mut style, mut layout, mut paint, mut gpu) = (vec![], vec![], vec![], vec![], vec![]);
+        // M0 counters: per-frame deltas of shaping work and pipeline counters.
+        let (mut shapes, mut restyles, mut layouts_n) = (vec![], vec![], vec![]);
         // Warm up caches (glyph atlas, paragraph cache) before measuring.
         for i in 0..3 {
             mutate(h, i);
             h.session.frame();
             h.render_timed();
         }
+        let mut prev_shapes = h.session.engine.borrow().text_system().shape_count;
+        let mut prev_stats = h.session.engine.borrow().stats.clone();
         for i in 0..iterations {
             mutate(h, i + 3);
             let t = Instant::now();
             h.session.frame();
             let cpu = t.elapsed().as_secs_f64() * 1000.0;
             let st = h.session.engine.borrow().stats.clone();
+            let cur_shapes = h.session.engine.borrow().text_system().shape_count;
             let g = h.render_timed().as_secs_f64() * 1000.0;
             total.push(cpu + g);
             style.push(st.last_style_micros as f64 / 1000.0);
             layout.push(st.last_layout_micros as f64 / 1000.0);
             paint.push(st.last_paint_micros as f64 / 1000.0);
             gpu.push(g);
+            shapes.push((cur_shapes - prev_shapes) as f64);
+            restyles.push((st.restyles - prev_stats.restyles) as f64);
+            layouts_n.push((st.layouts - prev_stats.layouts) as f64);
+            prev_shapes = cur_shapes;
+            prev_stats = st;
         }
-        results.push(Sample { name, total_ms: median(&mut total), style_ms: median(&mut style), layout_ms: median(&mut layout), paint_ms: median(&mut paint), gpu_ms: median(&mut gpu) });
+        results.push(Sample { name, total_ms: median(&mut total), style_ms: median(&mut style), layout_ms: median(&mut layout), paint_ms: median(&mut paint), gpu_ms: median(&mut gpu), shapes: median(&mut shapes), restyles: median(&mut restyles), layouts_n: median(&mut layouts_n) });
     };
 
     measure(&mut h, "idle frame (nothing changed)", Box::new(|_, _| {}));
@@ -147,10 +163,14 @@ pub fn run(items: usize, iterations: usize) -> Result<(), String> {
         }),
     );
 
-    println!("{:<44} {:>9} {:>8} {:>8} {:>8} {:>8}", "scenario (median of N)", "total ms", "style", "layout", "paint", "GPU");
+    println!("{:<44} {:>9} {:>8} {:>8} {:>8} {:>8} {:>7} {:>8} {:>8}", "scenario (median of N)", "total ms", "style", "layout", "paint", "GPU", "shapes", "restyles", "layouts");
     for r in &results {
-        println!("{:<44} {:>9.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}", r.name, r.total_ms, r.style_ms, r.layout_ms, r.paint_ms, r.gpu_ms);
+        println!("{:<44} {:>9.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>7.1} {:>8.1} {:>8.1}", r.name, r.total_ms, r.style_ms, r.layout_ms, r.paint_ms, r.gpu_ms, r.shapes, r.restyles, r.layouts_n);
     }
+    // NOTE (M0 gaps, need production accessors — filed to main agent):
+    // Taffy `last_new_nodes`/`last_restyled_nodes` and atlas `evictions` are not reachable
+    // from here (`Engine.layout` and `Renderer.atlas` are private). This table records every
+    // counter that IS public today: shape_count, restyles/layouts/frames/full_restyles.
     let e = h.session.engine.borrow();
     let list = e.display_list();
     println!("\nlast display list: {} items; GPU batches {}, instances {}", list.items.len(), h.render_stats().1, h.render_stats().0);

@@ -8,6 +8,7 @@ members = [
     "crates/rendrix-core",
     "crates/rendrix-js",
     "crates/rendrix-runtime",
+    "crates/rendrix-web",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+criterion = "0.5"
 taffy = { version = "0.9", default-features = false, features = ["std", "flexbox", "grid", "block_layout", "content_size", "taffy_tree"] }
 cosmic-text = "0.14"
 wgpu = "25"
@@ -26,6 +28,8 @@ rquickjs = { version = "=0.14.0", features = ["loader", "futures"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sys-locale = "0.3"
+glam = "0.34"
 
 rendrix-css = { path = "crates/rendrix-css" }
 rendrix-dom = { path = "crates/rendrix-dom" }

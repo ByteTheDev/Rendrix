@@ -3,12 +3,16 @@
 
 pub mod engine_trait;
 pub mod host;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod quickjs;
 pub mod runtime;
+pub mod scene3d;
+pub mod sourcemap;
+pub mod canvas_ops;
 
 pub use engine_trait::{Host, JsEngine, JsError, Val};
-pub use host::{DomHost, Permissions, WindowCommand};
-pub use runtime::{JsRuntime, TickInfo};
+pub use host::{DomHost, Permissions, WindowCommand, WindowOpenRequest};
+pub use runtime::{JsRuntime, TickInfo, WorkerEvent, WorkerRegistry, WORKER_MAX_PER_TICK};
 
 #[cfg(test)]
 mod tests;

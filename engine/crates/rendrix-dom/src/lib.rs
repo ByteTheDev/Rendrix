@@ -151,6 +151,11 @@ pub struct Document {
     gc_pending: bool,
     /// A `<style>`/`<link>` element or its content changed; stylesheets must be re-collected.
     pub sheets_dirty: bool,
+    /// Whether any inline `style=""` attribute in the document may depend on the viewport
+    /// (`vw`/`vh`/`vmin`/`vmax` or `var()`). Sticky: set when such a style is parsed, never
+    /// cleared (clearing would need a full scan; a stale `true` only costs a full restyle on
+    /// resize, never correctness). P3 reads this to decide whether resize can skip restyle.
+    pub inline_viewport_units: bool,
     /// Bumped whenever a node leaves its parent (lets wrapper caches know to re-check connectivity).
     pub detach_epoch: u64,
 }
@@ -191,6 +196,7 @@ impl Document {
             freed: Vec::new(),
             gc_pending: false,
             sheets_dirty: true,
+            inline_viewport_units: false,
             detach_epoch: 0,
         }
     }
@@ -657,6 +663,11 @@ impl Document {
             None => e.attrs.push((name.clone(), value.to_string())),
         }
         Self::sync_cached_attr(e, &name, Some(value));
+        // P3: remember viewport-dependent inline styles so resize can decide whether
+        // computed styles are provably unaffected (html.rs parses through here too).
+        if name == "style" && rendrix_css::values::value_uses_viewport_units(value) {
+            self.inline_viewport_units = true;
+        }
         self.record(MutationRecord {
             kind: MutationKind::Attributes,
             ancestors: Vec::new(),
@@ -1058,6 +1069,21 @@ mod tests {
         // moving re-parents
         d.append_child(body, a).unwrap();
         assert_eq!(d.children(body).collect::<Vec<_>>(), vec![c, a]);
+    }
+
+    #[test]
+    fn inline_viewport_units_tracks_style_attr() {
+        // P3: the engine skips resize restyles only when no inline style can depend on it.
+        let mut d = Document::new();
+        assert!(!d.inline_viewport_units);
+        let e = el(&mut d, "div");
+        d.set_attr(e, "style", "width: 10px; color: red");
+        assert!(!d.inline_viewport_units);
+        d.set_attr(e, "style", "width: 50vw");
+        assert!(d.inline_viewport_units);
+        // Sticky and conservative: removing the declaration keeps the flag (still correct).
+        d.remove_attr(e, "style");
+        assert!(d.inline_viewport_units);
     }
 
     #[test]

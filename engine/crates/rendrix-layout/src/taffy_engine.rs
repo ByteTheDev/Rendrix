@@ -3,11 +3,11 @@
 use crate::{BoxLayout, InlineContent, LayoutEngine, LayoutKind, LayoutNode, LayoutResult, TextMeasurer};
 use rendrix_css as css;
 use rendrix_css::{Dim, TrackItem, TrackSize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use taffy::prelude::*;
 use taffy::geometry::Point;
-use taffy::style::{Overflow, GridTemplateComponent, GridTemplateRepetition, MaxTrackSizingFunction, MinTrackSizingFunction, RepetitionCount, TrackSizingFunction};
+use taffy::style::{GridTemplateArea, Overflow, GridTemplateComponent, GridTemplateRepetition, MaxTrackSizingFunction, MinTrackSizingFunction, RepetitionCount, TrackSizingFunction};
 
 #[derive(Clone)]
 enum Ctx {
@@ -42,16 +42,23 @@ impl TaffyEngine {
         TaffyEngine { tree: TaffyTree::new(), nodes: HashMap::new(), last_new_nodes: 0, last_restyled_nodes: 0 }
     }
 
-    fn sync(&mut self, n: &LayoutNode, stats: &mut (usize, usize)) -> NodeId {
-        let style = to_taffy(&n.style, &n.kind);
+    fn sync(&mut self, n: &LayoutNode, parent_areas: Option<&Vec<Vec<String>>>, stats: &mut (usize, usize), tmp: &mut Vec<NodeId>) -> NodeId {
+        let style = to_taffy(&n.style, &n.kind, parent_areas);
         let (kind_sig, ctx) = match &n.kind {
             LayoutKind::Box => (0, None),
             LayoutKind::Text(c) => (c.key() | 1, Some(Ctx::Text(c.clone()))),
             LayoutKind::Replaced { width, height } => ((width.to_bits() as u64) << 32 | height.to_bits() as u64 | 2, Some(Ctx::Replaced(*width, *height))),
         };
-        // Children first (post-order) so ids exist.
-        let child_ids: Vec<NodeId> = n.children.iter().map(|c| self.sync(c, stats)).collect();
-        let child_keys: Vec<u64> = n.children.iter().map(|c| c.id).collect();
+        // Children first (post-order) so ids exist. Child ids accumulate in the scratch
+        // buffer (P5: one reused allocation per layout instead of two vecs per node);
+        // `set_children`/`new_with_children` only borrow the slice during the call.
+        let base = tmp.len();
+        // This node's areas are the containing-block areas for its children.
+        let my_areas = if n.style.grid_template_areas.is_empty() { None } else { Some(&n.style.grid_template_areas) };
+        for c in &n.children {
+            let id = self.sync(c, my_areas, stats, tmp);
+            tmp.push(id);
+        }
 
         if let Some(c) = self.nodes.get_mut(&n.id) {
             c.seen = true;
@@ -70,18 +77,27 @@ impl TaffyEngine {
                 c.kind_sig = kind_sig;
                 stats.1 += 1;
             }
-            if c.children != child_keys {
-                self.tree.set_children(c.node, &child_ids).unwrap();
-                c.children = child_keys;
+            // P5: compare child identity in place; only allocate the stored vec on change.
+            let same_children =
+                c.children.len() == n.children.len() && c.children.iter().zip(n.children.iter()).all(|(a, b)| *a == b.id);
+            if !same_children {
+                self.tree.set_children(c.node, &tmp[base..]).unwrap();
+                c.children = n.children.iter().map(|c| c.id).collect();
                 stats.1 += 1;
             }
-            c.node
+            let node = c.node;
+            tmp.truncate(base);
+            node
         } else {
             let node = match ctx {
                 Some(ctx) => self.tree.new_leaf_with_context(style.clone(), ctx).unwrap(),
-                None => self.tree.new_with_children(style.clone(), &child_ids).unwrap(),
+                None => self.tree.new_with_children(style.clone(), &tmp[base..]).unwrap(),
             };
-            self.nodes.insert(n.id, Cached { node, style, kind_sig, children: child_keys, seen: true });
+            self.nodes.insert(
+                n.id,
+                Cached { node, style, kind_sig, children: n.children.iter().map(|c| c.id).collect(), seen: true },
+            );
+            tmp.truncate(base);
             stats.0 += 1;
             node
         }
@@ -94,7 +110,8 @@ impl LayoutEngine for TaffyEngine {
             c.seen = false;
         }
         let mut stats = (0usize, 0usize);
-        let root_node = self.sync(root, &mut stats);
+        let mut tmp = Vec::new();
+        let root_node = self.sync(root, None, &mut stats, &mut tmp);
         // Drop nodes that disappeared.
         let stale: Vec<u64> = self.nodes.iter().filter(|(_, c)| !c.seen).map(|(k, _)| *k).collect();
         for k in stale {
@@ -102,40 +119,35 @@ impl LayoutEngine for TaffyEngine {
                 let _ = self.tree.remove(c.node);
             }
         }
-        self.last_new_nodes = stats.0;
-        self.last_restyled_nodes = stats.1;
 
         let avail = Size { width: AvailableSpace::Definite(viewport.0), height: AvailableSpace::Definite(viewport.1) };
-        self.tree
-            .compute_layout_with_measure(root_node, avail, |known, available, _id, ctx, _style| match ctx {
-                None => Size::ZERO,
-                Some(Ctx::Replaced(w, h)) => {
-                    // Preserve aspect ratio when only one dimension is constrained.
-                    let (iw, ih) = (*w, *h);
-                    match (known.width, known.height) {
-                        (Some(w), Some(h)) => Size { width: w, height: h },
-                        (Some(w), None) => Size { width: w, height: if iw > 0.0 { w * ih / iw } else { ih } },
-                        (None, Some(h)) => Size { width: if ih > 0.0 { h * iw / ih } else { iw }, height: h },
-                        (None, None) => Size { width: iw, height: ih },
-                    }
-                }
-                Some(Ctx::Text(content)) => {
-                    let max_w = match known.width {
-                        Some(w) => Some(w),
-                        None => match available.width {
-                            AvailableSpace::Definite(w) => Some(w),
-                            AvailableSpace::MinContent => Some(0.0),
-                            AvailableSpace::MaxContent => None,
-                        },
-                    };
-                    let (w, h) = measurer.measure(content, max_w);
-                    Size { width: known.width.unwrap_or(w), height: known.height.unwrap_or(h) }
-                }
-            })
-            .unwrap();
-
+        compute_with_measure(&mut self.tree, root_node, avail, measurer);
         let mut out = LayoutResult::default();
         collect(&self.tree, root, &self.nodes, &mut out);
+
+        // Mixed calc(): the first pass approximated Calc as its percent part to obtain
+        // containing-block sizes; resolve to px and lay out again for exact geometry.
+        if has_calc_in_tree(root) {
+            let resolved = resolve_tree_calcs(root, viewport.0, viewport.1, &out.boxes);
+            for c in self.nodes.values_mut() {
+                c.seen = false;
+            }
+            let mut tmp2 = Vec::new();
+            let root_node2 = self.sync(&resolved, None, &mut stats, &mut tmp2);
+            let stale2: Vec<u64> = self.nodes.iter().filter(|(_, c)| !c.seen).map(|(k, _)| *k).collect();
+            for k in stale2 {
+                if let Some(c) = self.nodes.remove(&k) {
+                    let _ = self.tree.remove(c.node);
+                }
+            }
+            compute_with_measure(&mut self.tree, root_node2, avail, measurer);
+            let mut out2 = LayoutResult::default();
+            collect(&self.tree, &resolved, &self.nodes, &mut out2);
+            out = out2;
+        }
+
+        self.last_new_nodes = stats.0;
+        self.last_restyled_nodes = stats.1;
         out
     }
 }
@@ -160,6 +172,150 @@ fn collect(tree: &TaffyTree<Ctx>, n: &LayoutNode, nodes: &HashMap<u64, Cached>, 
     }
 }
 
+fn compute_with_measure(tree: &mut TaffyTree<Ctx>, root_node: NodeId, avail: Size<AvailableSpace>, measurer: &mut dyn TextMeasurer) {
+    tree.compute_layout_with_measure(root_node, avail, |known, available, _id, ctx, _style| match ctx {
+        None => Size::ZERO,
+        Some(Ctx::Replaced(w, h)) => {
+            let (iw, ih) = (*w, *h);
+            match (known.width, known.height) {
+                (Some(w), Some(h)) => Size { width: w, height: h },
+                (Some(w), None) => Size { width: w, height: if iw > 0.0 { w * ih / iw } else { ih } },
+                (None, Some(h)) => Size { width: if ih > 0.0 { h * iw / ih } else { iw }, height: h },
+                (None, None) => Size { width: iw, height: ih },
+            }
+        }
+        Some(Ctx::Text(content)) => {
+            let max_w = match known.width {
+                Some(w) => Some(w),
+                None => match available.width {
+                    AvailableSpace::Definite(w) => Some(w),
+                    AvailableSpace::MinContent => Some(0.0),
+                    AvailableSpace::MaxContent => None,
+                },
+            };
+            let (w, h) = measurer.measure(content, max_w);
+            Size { width: known.width.unwrap_or(w), height: known.height.unwrap_or(h) }
+        }
+    })
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mixed calc() resolution (second layout pass)
+// ---------------------------------------------------------------------------------------------
+
+fn is_layout_calc(d: Dim) -> bool {
+    matches!(d, Dim::Calc(..))
+}
+
+fn has_calc_in_style(s: &css::ComputedStyle) -> bool {
+    let any = |ds: &[Dim]| ds.iter().any(|d| is_layout_calc(*d));
+    any(&[s.width, s.height, s.min_width, s.min_height, s.max_width, s.max_height, s.flex_basis, s.row_gap, s.column_gap])
+        || any(&s.margin)
+        || any(&s.padding)
+        || any(&s.inset)
+}
+
+fn has_calc_in_tree(n: &LayoutNode) -> bool {
+    if has_calc_in_style(&n.style) {
+        return true;
+    }
+    n.children.iter().any(has_calc_in_tree)
+}
+
+fn resolve_calc_dim(d: Dim, basis: f32) -> Dim {
+    match d {
+        Dim::Calc(p, px) => Dim::Px(basis * p / 100.0 + px),
+        d => d,
+    }
+}
+
+/// Replace layout-relevant `Calc` dims with px resolved against the containing block.
+/// Horizontal dims resolve against `parent_w`, vertical against `parent_h`;
+/// margin/padding resolve against the width per CSS.
+fn resolve_style_calcs(s: &css::ComputedStyle, parent_w: f32, parent_h: f32) -> css::ComputedStyle {
+    let mut out = s.clone();
+    out.width = resolve_calc_dim(s.width, parent_w);
+    out.min_width = resolve_calc_dim(s.min_width, parent_w);
+    out.max_width = resolve_calc_dim(s.max_width, parent_w);
+    out.height = resolve_calc_dim(s.height, parent_h);
+    out.min_height = resolve_calc_dim(s.min_height, parent_h);
+    out.max_height = resolve_calc_dim(s.max_height, parent_h);
+    out.flex_basis = resolve_calc_dim(s.flex_basis, parent_w);
+    for i in 0..4 {
+        out.margin[i] = resolve_calc_dim(s.margin[i], parent_w);
+        out.padding[i] = resolve_calc_dim(s.padding[i], parent_w);
+    }
+    out.inset[0] = resolve_calc_dim(s.inset[0], parent_h);
+    out.inset[2] = resolve_calc_dim(s.inset[2], parent_h);
+    out.inset[1] = resolve_calc_dim(s.inset[1], parent_w);
+    out.inset[3] = resolve_calc_dim(s.inset[3], parent_w);
+    out.row_gap = resolve_calc_dim(s.row_gap, parent_h);
+    out.column_gap = resolve_calc_dim(s.column_gap, parent_w);
+    out
+}
+
+fn content_box_size(b: &BoxLayout) -> (f32, f32) {
+    let w = (b.width - b.border[1] - b.border[3] - b.padding[1] - b.padding[3]).max(0.0);
+    let h = (b.height - b.border[0] - b.border[2] - b.padding[0] - b.padding[2]).max(0.0);
+    (w, h)
+}
+
+fn resolve_tree_calcs(n: &LayoutNode, parent_w: f32, parent_h: f32, boxes: &HashMap<u64, BoxLayout>) -> LayoutNode {
+    let style = std::sync::Arc::new(resolve_style_calcs(&n.style, parent_w, parent_h));
+    let (my_w, my_h) = boxes.get(&n.id).map(content_box_size).unwrap_or((parent_w, parent_h));
+    let children = n.children.iter().map(|c| resolve_tree_calcs(c, my_w, my_h, boxes)).collect();
+    LayoutNode { id: n.id, style, kind: n.kind.clone(), children }
+}
+
+// ---------------------------------------------------------------------------------------------
+// grid-template-areas
+// ---------------------------------------------------------------------------------------------
+
+/// CSS line numbers (1-indexed, end exclusive) of a named area.
+fn area_bounds(areas: &[Vec<String>], name: &str) -> Option<(i16, i16, i16, i16)> {
+    let mut rows = (usize::MAX, 0usize);
+    let mut cols = (usize::MAX, 0usize);
+    let mut found = false;
+    for (r, row) in areas.iter().enumerate() {
+        for (c, n) in row.iter().enumerate() {
+            if n == name {
+                found = true;
+                rows.0 = rows.0.min(r);
+                rows.1 = rows.1.max(r);
+                cols.0 = cols.0.min(c);
+                cols.1 = cols.1.max(c);
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    Some((rows.0 as i16 + 1, rows.1 as i16 + 2, cols.0 as i16 + 1, cols.1 as i16 + 2))
+}
+
+fn grid_areas_for_taffy(areas: &[Vec<String>]) -> Vec<GridTemplateArea<String>> {
+    use std::collections::BTreeMap;
+    let mut bounds: BTreeMap<&str, (u16, u16, u16, u16)> = BTreeMap::new();
+    for (r, row) in areas.iter().enumerate() {
+        for (c, name) in row.iter().enumerate() {
+            if name == "." {
+                continue;
+            }
+            bounds
+                .entry(name.as_str())
+                .and_modify(|b| {
+                    b.0 = b.0.min(r as u16);
+                    b.1 = b.1.max(r as u16 + 1);
+                    b.2 = b.2.min(c as u16);
+                    b.3 = b.3.max(c as u16 + 1);
+                })
+                .or_insert((r as u16, r as u16 + 1, c as u16, c as u16 + 1));
+        }
+    }
+    bounds.into_iter().map(|(name, (rs, re, cs, ce))| GridTemplateArea { name: name.to_string(), row_start: rs, row_end: re, column_start: cs, column_end: ce }).collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // CSS → Taffy
 // ---------------------------------------------------------------------------------------------
@@ -169,6 +325,9 @@ fn dim(d: Dim) -> Dimension {
         Dim::Auto => Dimension::auto(),
         Dim::Px(v) => Dimension::length(v),
         Dim::Percent(p) => Dimension::percent(p / 100.0),
+        // Mixed calc(): first-pass approximation uses the percent part; a second layout
+        // pass resolves it to px against the containing-block size (see `layout`).
+        Dim::Calc(p, _) => Dimension::percent(p / 100.0),
     }
 }
 
@@ -177,6 +336,7 @@ fn lpa(d: Dim) -> LengthPercentageAuto {
         Dim::Auto => LengthPercentageAuto::auto(),
         Dim::Px(v) => LengthPercentageAuto::length(v),
         Dim::Percent(p) => LengthPercentageAuto::percent(p / 100.0),
+        Dim::Calc(p, _) => LengthPercentageAuto::percent(p / 100.0),
     }
 }
 
@@ -185,6 +345,7 @@ fn lp(d: Dim) -> LengthPercentage {
         Dim::Auto => LengthPercentage::length(0.0),
         Dim::Px(v) => LengthPercentage::length(v),
         Dim::Percent(p) => LengthPercentage::percent(p / 100.0),
+        Dim::Calc(p, _) => LengthPercentage::percent(p / 100.0),
     }
 }
 
@@ -281,13 +442,18 @@ fn placement(l: css::GridLine) -> GridPlacement<String> {
     }
 }
 
-pub(crate) fn to_taffy(s: &css::ComputedStyle, kind: &LayoutKind) -> Style {
+pub(crate) fn to_taffy(s: &css::ComputedStyle, kind: &LayoutKind, parent_areas: Option<&Vec<Vec<String>>>) -> Style {
     use css::Display as D;
     let display = match s.display {
         D::None => Display::None,
         D::Flex | D::InlineFlex => Display::Flex,
         D::Grid | D::InlineGrid => Display::Grid,
         D::Block | D::Inline | D::InlineBlock | D::Contents => Display::Block,
+        // Tables collapse to a grid-like layout (boxtree normalises the container and
+        // dissolves rows/groups); columns generate no box. Lists keep a block + marker run.
+        D::Table | D::InlineTable => Display::Grid,
+        D::TableColumn | D::TableColumnGroup => Display::None,
+        D::TableCaption | D::TableHeaderGroup | D::TableRowGroup | D::TableFooterGroup | D::TableRow | D::TableCell | D::ListItem => Display::Block,
     };
     let mut st = Style {
         display,
@@ -301,7 +467,14 @@ pub(crate) fn to_taffy(s: &css::ComputedStyle, kind: &LayoutKind) -> Style {
             css::Position::Absolute | css::Position::Fixed => Position::Absolute,
             _ => Position::Relative,
         },
-        inset: Rect { top: lpa(s.inset[0]), right: lpa(s.inset[1]), bottom: lpa(s.inset[2]), left: lpa(s.inset[3]) },
+        // `position: sticky` lays out at its static position: the insets are thresholds
+        // applied as a paint-time clamp in the nearest scrollport (see `sticky_rect`),
+        // not relative offsets. Zeroing them here keeps Taffy from shifting the box.
+        inset: if matches!(s.position, css::Position::Sticky) {
+            Rect { top: lpa(Dim::Auto), right: lpa(Dim::Auto), bottom: lpa(Dim::Auto), left: lpa(Dim::Auto) }
+        } else {
+            Rect { top: lpa(s.inset[0]), right: lpa(s.inset[1]), bottom: lpa(s.inset[2]), left: lpa(s.inset[3]) }
+        },
         size: Size { width: dim(s.width), height: dim(s.height) },
         min_size: Size { width: dim(s.min_width), height: dim(s.min_height) },
         max_size: Size { width: dim(s.max_width), height: dim(s.max_height) },
@@ -340,6 +513,7 @@ pub(crate) fn to_taffy(s: &css::ComputedStyle, kind: &LayoutKind) -> Style {
     if matches!(display, Display::Grid) {
         st.grid_template_columns = template(&s.grid_template_columns);
         st.grid_template_rows = template(&s.grid_template_rows);
+        st.grid_template_areas = grid_areas_for_taffy(&s.grid_template_areas);
         st.grid_auto_columns = s.grid_auto_columns.iter().map(track).collect();
         st.grid_auto_rows = s.grid_auto_rows.iter().map(track).collect();
         st.grid_auto_flow = match s.grid_auto_flow {
@@ -350,10 +524,20 @@ pub(crate) fn to_taffy(s: &css::ComputedStyle, kind: &LayoutKind) -> Style {
         };
     }
     // Grid placement applies to *items*, regardless of this node's own display.
-    st.grid_column = Line { start: placement(s.grid_column.0), end: placement(s.grid_column.1) };
-    st.grid_row = Line { start: placement(s.grid_row.0), end: placement(s.grid_row.1) };
+    // `grid-area: <name>` resolves against the parent's template areas to explicit lines.
+    if let (Some(name), Some(areas)) = (s.grid_area.as_ref(), parent_areas) {
+        if let Some((rs, re, cs, ce)) = area_bounds(areas, name) {
+            st.grid_row = Line { start: placement(css::GridLine::Line(rs)), end: placement(css::GridLine::Line(re)) };
+            st.grid_column = Line { start: placement(css::GridLine::Line(cs)), end: placement(css::GridLine::Line(ce)) };
+        } else {
+            st.grid_column = Line { start: placement(s.grid_column.0), end: placement(s.grid_column.1) };
+            st.grid_row = Line { start: placement(s.grid_row.0), end: placement(s.grid_row.1) };
+        }
+    } else {
+        st.grid_column = Line { start: placement(s.grid_column.0), end: placement(s.grid_column.1) };
+        st.grid_row = Line { start: placement(s.grid_row.0), end: placement(s.grid_row.1) };
+    }
     st.item_is_replaced = matches!(kind, LayoutKind::Replaced { .. });
-    let _ = HashSet::<u8>::new();
     st
 }
 
@@ -396,10 +580,10 @@ mod tests {
 
     fn text(id: u64, decls: &[(&str, &str)], s: &str) -> LayoutNode {
         let st = style(decls);
-        let content = Arc::new(InlineContent {
-            runs: vec![crate::InlineRun { text: s.into(), style: st.clone(), node: id, is_break: false }],
-            container: st.clone(),
-        });
+        let content = Arc::new(InlineContent::new(
+            vec![crate::InlineRun { text: s.into(), style: st.clone(), node: id, is_break: false }],
+            st.clone(),
+        ));
         LayoutNode { id, style: st, kind: LayoutKind::Text(content), children: vec![] }
     }
 
@@ -511,5 +695,69 @@ mod tests {
         let c = node(1, &[("width", "100px")], vec![node(3, &[("height", "10px")], vec![])]);
         e.layout(&c, (800.0, 600.0), &mut FixedText);
         assert_eq!(e.nodes.len(), 2, "removed nodes are dropped from the persistent tree");
+    }
+
+    #[test]
+    fn calc_mixed_width_resolves_against_parent() {
+        // `calc(100% - 20px)` inside a 400px parent leaves 380px.
+        let root = node(
+            1,
+            &[("width", "400px")],
+            vec![node(2, &[("width", "calc(100% - 20px)"), ("height", "10px")], vec![])],
+        );
+        let r = TaffyEngine::new().layout(&root, (800.0, 600.0), &mut FixedText);
+        assert!((r.boxes[&2].width - 380.0).abs() < 0.6, "mixed calc width: {:?}", r.boxes[&2]);
+        assert!((r.boxes[&2].x - 0.0).abs() < 0.6);
+    }
+
+    #[test]
+    fn grid_template_areas_place_items() {
+        let root = node(
+            1,
+            &[
+                ("display", "grid"),
+                ("width", "300px"),
+                ("grid-template-columns", "100px 1fr"),
+                ("grid-template-rows", "50px 50px"),
+                ("grid-template-areas", "\"header header\" \"sidebar main\""),
+            ],
+            vec![
+                node(2, &[("grid-area", "header"), ("height", "10px")], vec![]),
+                node(3, &[("grid-area", "sidebar"), ("height", "10px")], vec![]),
+                node(4, &[("grid-area", "main"), ("height", "10px")], vec![]),
+            ],
+        );
+        let r = TaffyEngine::new().layout(&root, (800.0, 600.0), &mut FixedText);
+        let (h, s, m) = (&r.boxes[&2], &r.boxes[&3], &r.boxes[&4]);
+        assert!((h.x - 0.0).abs() < 0.6 && (h.width - 300.0).abs() < 0.6, "header spans both columns: {h:?}");
+        assert!((h.y - 0.0).abs() < 0.6, "header in the first row: {h:?}");
+        assert!((s.x - 0.0).abs() < 0.6 && (s.width - 100.0).abs() < 0.6, "sidebar in the first column: {s:?}");
+        assert!((s.y - 50.0).abs() < 0.6, "sidebar in the second row: {s:?}");
+        assert!((m.x - 100.0).abs() < 0.6 && (m.width - 200.0).abs() < 0.6, "main in the second column: {m:?}");
+        assert!((m.y - 50.0).abs() < 0.6, "main in the second row: {m:?}");
+    }
+
+    #[test]
+    fn table_display_maps_to_grid_and_keeps_explicit_tracks() {
+        // What boxtree generates for a table: Grid display, so cells share the row.
+        let kids = (2..=5).map(|i| node(i, &[("height", "10px")], vec![])).collect();
+        let root = node(1, &[("display", "table"), ("width", "300px"), ("grid-template-columns", "100px 1fr")], kids);
+        let r = TaffyEngine::new().layout(&root, (800.0, 600.0), &mut FixedText);
+        assert_eq!(r.boxes[&2].width, 100.0);
+        assert_eq!(r.boxes[&3].x, 100.0);
+        assert_eq!(r.boxes[&4].y, 10.0, "third cell wraps to the next row");
+    }
+
+    #[test]
+    fn table_display_mapping_covers_all_internal_boxes() {
+        let mut table = ComputedStyle::inherit_from(&ComputedStyle::default());
+        table.display = css::Display::Table;
+        assert_eq!(to_taffy(&table, &LayoutKind::Box, None).display, Display::Grid);
+        let mut col = ComputedStyle::inherit_from(&ComputedStyle::default());
+        col.display = css::Display::TableColumn;
+        assert_eq!(to_taffy(&col, &LayoutKind::Box, None).display, Display::None, "columns generate no box");
+        let mut cell = ComputedStyle::inherit_from(&ComputedStyle::default());
+        cell.display = css::Display::TableCell;
+        assert_eq!(to_taffy(&cell, &LayoutKind::Box, None).display, Display::Block, "cells are grid items");
     }
 }

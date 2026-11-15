@@ -47,6 +47,10 @@ pub struct AppBundle {
     /// ES modules (and classic scripts) by normalised path, e.g. `main.js`, `lib/util.js`.
     #[serde(default)]
     pub modules: BTreeMap<String, String>,
+    /// Bundler-emitted source maps by module path (D1). Old bundles simply omit this;
+    /// old runtimes ignore it (serde default). Never required for execution.
+    #[serde(default)]
+    pub source_maps: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub assets: BTreeMap<String, Asset>,
     #[serde(default)]
@@ -122,11 +126,16 @@ impl AppBundle {
         let html = std::fs::read_to_string(dir.join("index.html")).map_err(|e| format!("{}: {e}", dir.join("index.html").display()))?;
         let mut modules = BTreeMap::new();
         let mut assets = BTreeMap::new();
+        let mut ts_sources = Vec::new();
         walk(dir, dir, &mut |rel, path| {
             if rel == "index.html" || rel == "rendrix.json" {
                 return;
             }
             let ext = rel.rsplit('.').next().unwrap_or("");
+            if matches!(ext, "ts" | "tsx" | "mts" | "cts" | "jsx") {
+                ts_sources.push(rel.to_string());
+                return;
+            }
             if matches!(ext, "js" | "mjs") {
                 if let Ok(t) = std::fs::read_to_string(path) {
                     modules.insert(rel.to_string(), t);
@@ -139,7 +148,15 @@ impl AppBundle {
                 assets.insert(rel.to_string(), asset);
             }
         })?;
-        Ok(AppBundle { format: FORMAT.into(), name, title, width, height, html, modules, assets, permissions: perms })
+        if !ts_sources.is_empty() {
+            ts_sources.sort();
+            return Err(format!(
+                "directory {} contains TypeScript/JSX sources ({}) which from_directory does not compile. Run `rendrix dev`/`rendrix build` so the TypeScript compiler API transpiles them, or keep this path JS-only.",
+                dir.display(),
+                ts_sources.join(", ")
+            ));
+        }
+        Ok(AppBundle { format: FORMAT.into(), name, title, width, height, html, modules, source_maps: BTreeMap::new(), assets, permissions: perms })
     }
 
     /// Load from a `.rdxapp` file, a directory, or the trailer of the running executable.

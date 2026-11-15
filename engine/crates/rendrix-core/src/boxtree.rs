@@ -6,9 +6,10 @@
 //! absolutely positioned boxes.
 
 use crate::Engine;
-use rendrix_css::{Align, ComputedStyle, Dim, Display, TextAlign, WhiteSpace};
+use rendrix_css::{Align, ComputedStyle, Dim, Display, GridLine, RepeatCount, TextAlign, TrackItem, TrackSize, WhiteSpace};
 use rendrix_dom::{NodeId, NodeKind};
 use rendrix_layout::{InlineContent, InlineRun, LayoutKind, LayoutNode};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub const ANON: u64 = 1 << 40;
@@ -27,6 +28,11 @@ pub(crate) struct Builder<'a> {
     pub engine: &'a Engine,
     /// Collection points for absolutely positioned descendants, innermost positioned ancestor last.
     abs_stack: Vec<Vec<LayoutNode>>,
+    /// P1: fragments of the previous frame's box tree available for reuse, keyed by box id.
+    /// Anonymous leaves are never pooled (they always rebuild cheaply from runs).
+    taken: HashMap<u64, LayoutNode>,
+    /// P1: DOM ids whose box subtree must be rebuilt (this frame's style/state roots).
+    dirty: HashSet<NodeId>,
 }
 
 fn is_text_input(engine: &Engine, id: NodeId) -> bool {
@@ -35,7 +41,7 @@ fn is_text_input(engine: &Engine, id: NodeId) -> bool {
 
 impl<'a> Builder<'a> {
     pub fn new(engine: &'a Engine) -> Self {
-        Builder { engine, abs_stack: vec![Vec::new()] }
+        Builder { engine, abs_stack: vec![Vec::new()], taken: HashMap::new(), dirty: HashSet::new() }
     }
 
     pub fn build_root(mut self) -> Option<LayoutNode> {
@@ -54,11 +60,58 @@ impl<'a> Builder<'a> {
     fn anon_block_style(&self, parent: &ComputedStyle) -> Arc<ComputedStyle> {
         let mut s = ComputedStyle::inherit_from(parent);
         s.display = Display::Block;
+        // `text-overflow` is non-inherited but anonymous text leaves must honour the
+        // originating block's ellipsis (they are that block's inline content).
+        s.text_overflow_ellipsis = parent.text_overflow_ellipsis;
         Arc::new(s)
     }
 
     fn is_replaced(tag: &str) -> bool {
-        matches!(tag, "img" | "canvas" | "video" | "svg" | "iframe" | "object" | "embed")
+        matches!(tag, "img" | "canvas" | "video" | "svg" | "iframe" | "object" | "embed" | "rendrix-scene")
+    }
+
+    /// Rewrite a `display: table` style into its grid-backed equivalent.
+    fn table_grid_style(engine: &Engine, id: NodeId, style: &Arc<ComputedStyle>) -> Arc<ComputedStyle> {
+        let mut s = (**style).clone();
+        s.display = Display::Grid;
+        if s.grid_template_columns.is_empty() {
+            let cols = Self::table_columns(engine, id).max(1);
+            s.grid_template_columns = vec![TrackItem::Repeat(RepeatCount::Count(cols), vec![TrackSize::Fr(1.0)])];
+        }
+        Arc::new(s)
+    }
+
+    /// Widest row of the table in cells (through row groups; bare cells count as
+    /// one-column rows). Capped: pathological tables still lay out.
+    fn table_columns(engine: &Engine, id: NodeId) -> u16 {
+        let mut max = 0u16;
+        for row in engine.doc.child_elements(id) {
+            match engine.style_of(row).map(|s| s.display) {
+                Some(Display::TableRow) => max = max.max(Self::row_cells(engine, row)),
+                Some(Display::TableHeaderGroup) | Some(Display::TableRowGroup) | Some(Display::TableFooterGroup) => {
+                    for r in engine.doc.child_elements(row) {
+                        if engine.style_of(r).map(|s| s.display) == Some(Display::TableRow) {
+                            max = max.max(Self::row_cells(engine, r));
+                        }
+                    }
+                }
+                // Cells outside any row (invalid HTML the parser kept): each starts a row.
+                Some(Display::TableCell) => max = max.max(1),
+                _ => {}
+            }
+        }
+        max.max(1).min(64)
+    }
+
+    fn row_cells(engine: &Engine, row: NodeId) -> u16 {
+        let mut n = 0u16;
+        for c in engine.doc.child_elements(row) {
+            if engine.style_of(c).map(|s| s.display) == Some(Display::TableCell) {
+                // `colspan` is not modelled: one cell, one column.
+                n += 1;
+            }
+        }
+        n.max(1).min(64)
     }
 
     fn is_box_like(s: &ComputedStyle) -> bool {
@@ -76,14 +129,52 @@ impl<'a> Builder<'a> {
     }
 
     fn has_block_child(&self, id: NodeId) -> bool {
-        self.engine.doc.child_elements(id).any(|c| match self.style(c) {
-            Some(s) => match s.display {
-                Display::Block | Display::Flex | Display::Grid => true,
-                Display::Inline => self.has_block_child(c),
-                _ => false,
-            },
-            None => false,
-        })
+        has_block_child(self.engine, id)
+    }
+
+    /// P1: reuse a whole persisted subtree when its computed style is unchanged and nothing
+    /// inside it is dirty; otherwise rebuild the box (clean children are still reconciled from
+    /// the pool, so a style-only change to a parent reuses them instead of rebuilding).
+    /// Only called for children that generate a box under the *current* styles (collect()
+    /// classifies first), so a display change can never reuse a stale shape.
+    fn build_box_cached(&mut self, id: NodeId) -> Option<LayoutNode> {
+        if !self.taken.is_empty() {
+            if let Some(old) = self.taken.remove(&(id as u64)) {
+                match self.style(id) {
+                    None => return None, // display:none now (or removed): drop the stale box
+                    Some(new_style) => {
+                        if Arc::ptr_eq(&new_style, &old.style) && !self.dirty_at_or_inside(id) {
+                            return Some(old);
+                        }
+                        // Shell changed (or something inside is dirty): offer the descendants
+                        // for reuse and rebuild this box from the current styles.
+                        drain_into(&mut self.taken, old);
+                    }
+                }
+            }
+        }
+        self.build_box(id)
+    }
+
+    /// P1: true when this node or anything in its DOM subtree must be rebuilt.
+    fn dirty_at_or_inside(&self, id: NodeId) -> bool {
+        if self.dirty.is_empty() {
+            return false;
+        }
+        if self.dirty.contains(&id) {
+            return true;
+        }
+        let doc = &self.engine.doc;
+        for d in &self.dirty {
+            let mut cur = doc.parent(*d);
+            while let Some(p) = cur {
+                if p == id {
+                    return true;
+                }
+                cur = doc.parent(p);
+            }
+        }
+        false
     }
 
     /// Build the box for element `id`, or `None` if it generates none (`display: none`).
@@ -93,18 +184,69 @@ impl<'a> Builder<'a> {
         if style.display == Display::None {
             return None;
         }
-        let tag = engine.doc.tag(id)?.to_string();
+        let tag: &str = engine.doc.tag(id)?;
         let lid = id as u64;
 
+        // --- tables: internal column boxes generate no box (widths are not modelled) ---
+        if matches!(style.display, Display::TableColumn | Display::TableColumnGroup) {
+            return None;
+        }
+        if style.display == Display::InlineTable {
+            let mut s = (*style).clone();
+            s.display = Display::Table;
+            style = Arc::new(s);
+        }
+        // `display: table` collapses to a grid-like layout: the table becomes a grid
+        // container (explicit `grid-template-*` wins; otherwise one `1fr` track per
+        // column, counted from the rows), rows and row groups dissolve, cells are items.
+        // `colspan`/`rowspan`, automatic column sizing and anonymous table objects are ❌.
+        if style.display == Display::Table {
+            style = Self::table_grid_style(engine, id, &style);
+        }
+        // Multi-column basics: `column-count` (or a `column-width` that yields > 1
+        // column against the viewport width) lays children out in N equal grid tracks.
+        // No balancing, no `column-fill`; `column-span: all` stretches (see below).
+        if style.display == Display::Block && (style.column_count.is_some() || !matches!(style.column_width, Dim::Auto)) {
+            if let Some(n) = style.multicol_count(engine.viewport.0) {
+                let mut s = (*style).clone();
+                s.display = Display::Grid;
+                if s.grid_template_columns.is_empty() {
+                    s.grid_template_columns = vec![TrackItem::Repeat(RepeatCount::Count(n), vec![TrackSize::Fr(1.0)])];
+                }
+                style = Arc::new(s);
+            }
+        }
+        // `column-span: all` and table captions stretch across every track of a
+        // synthesized grid (a multicol container, or a collapsed table for captions).
+        // Both are ignored inside real grids, per CSS.
+        if style.column_span_all || style.display == Display::TableCaption {
+            if let Some(pid) = engine.doc.parent(id) {
+                if let Some(ps) = engine.style_of(pid) {
+                    let span_all = style.column_span_all
+                        && ps.display == Display::Block
+                        && (ps.column_count.is_some_and(|n| n > 1)
+                            || (!matches!(ps.column_width, Dim::Auto) && ps.multicol_count(engine.viewport.0).is_some()));
+                    let caption = style.display == Display::TableCaption && ps.is_table();
+                    if span_all || caption {
+                        let mut s = (*style).clone();
+                        s.grid_column = (GridLine::Line(1), GridLine::Line(-1));
+                        style = Arc::new(s);
+                    }
+                }
+            }
+        }
+
         // --- replaced elements ---
-        if Self::is_replaced(&tag) {
+        if Self::is_replaced(tag) {
             let attr_px = |name: &str| engine.doc.get_attr(id, name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok());
-            let (mut w, mut h) = match tag.as_str() {
+            let (mut w, mut h) = match tag {
                 "img" => {
                     let natural = engine.doc.get_attr(id, "src").and_then(|src| engine.image_entry(src));
                     natural.map(|e| (e.width as f32, e.height as f32)).unwrap_or((0.0, 0.0))
                 }
-                "canvas" | "svg" | "iframe" | "video" | "object" | "embed" => (300.0, 150.0),
+                // 3D scene host (`<rendrix-scene>`): a layout box with a scene viewport,
+                // same intrinsic size as other replaced elements without natural size.
+                "canvas" | "svg" | "iframe" | "video" | "object" | "embed" | "rendrix-scene" => (300.0, 150.0),
                 _ => (0.0, 0.0),
             };
             if let Some(a) = attr_px("width") {
@@ -132,9 +274,9 @@ impl<'a> Builder<'a> {
             self.abs_stack.push(Vec::new());
         }
 
-        let (mut kind, mut children) = if let Some(content) = self.control_content(id, &tag, &style) {
+        let (mut kind, mut children) = if let Some(content) = self.control_content(id, tag, &style) {
             (LayoutKind::Text(Arc::new(content)), vec![])
-        } else if matches!(tag.as_str(), "input") && !is_text_input(engine, id) {
+        } else if matches!(tag, "input") && !is_text_input(engine, id) {
             (LayoutKind::Box, vec![]) // checkbox, radio, hidden …
         } else {
             let flex = matches!(style.display, Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid);
@@ -150,7 +292,7 @@ impl<'a> Builder<'a> {
         if matches!(kind, LayoutKind::Text(_)) && !children.is_empty() {
             if let LayoutKind::Text(content) = std::mem::replace(&mut kind, LayoutKind::Box) {
                 let leaf_style = self.anon_block_style(&style);
-                let content = Arc::new(InlineContent { runs: content.runs.clone(), container: style.clone() });
+                let content = Arc::new(InlineContent::new(content.runs.clone(), style.clone()));
                 children.insert(0, LayoutNode { id: anon_id(lid, 0), style: leaf_style, kind: LayoutKind::Text(content), children: vec![] });
             }
         }
@@ -179,7 +321,7 @@ impl<'a> Builder<'a> {
                 } else {
                     (value, container.clone())
                 };
-                Some(InlineContent { runs: vec![InlineRun { text, style: run_style, node: id as u64, is_break: false }], container })
+                Some(InlineContent::new(vec![InlineRun { text, style: run_style, node: id as u64, is_break: false }], container))
             }
             "input" if matches!(doc.get_attr(id, "type").map(|t| t.to_ascii_lowercase()).as_deref(), Some("button" | "submit" | "reset")) => {
                 let label = doc.get_attr(id, "value").unwrap_or(match doc.get_attr(id, "type") {
@@ -190,7 +332,7 @@ impl<'a> Builder<'a> {
                 let mut c = (**style).clone();
                 c.white_space = WhiteSpace::Pre;
                 let c = Arc::new(c);
-                Some(InlineContent { runs: vec![InlineRun { text: label.to_string(), style: c.clone(), node: id as u64, is_break: false }], container: c })
+                Some(InlineContent::new(vec![InlineRun { text: label.to_string(), style: c.clone(), node: id as u64, is_break: false }], c))
             }
             "textarea" => {
                 let value = doc.value(id);
@@ -201,7 +343,7 @@ impl<'a> Builder<'a> {
                 } else {
                     (value, style.clone())
                 };
-                Some(InlineContent { runs: vec![InlineRun { text, style: rs, node: id as u64, is_break: false }], container: style.clone() })
+                Some(InlineContent::new(vec![InlineRun { text, style: rs, node: id as u64, is_break: false }], style.clone()))
             }
             "select" => {
                 let opts = doc.get_elements_by_tag_name(id, "option");
@@ -210,7 +352,7 @@ impl<'a> Builder<'a> {
                 let mut c = (**style).clone();
                 c.white_space = WhiteSpace::Pre;
                 let c = Arc::new(c);
-                Some(InlineContent { runs: vec![InlineRun { text: format!("{label}  \u{25be}"), style: c.clone(), node: id as u64, is_break: false }], container: c })
+                Some(InlineContent::new(vec![InlineRun { text: format!("{label}  \u{25be}"), style: c.clone(), node: id as u64, is_break: false }], c))
             }
             _ => None,
         }
@@ -226,7 +368,7 @@ impl<'a> Builder<'a> {
         if !flex && matches!(ps.display, Display::Inline) {
             items.push(Item::Run(run));
         } else {
-            let content = Arc::new(InlineContent { runs: vec![run], container: ps.clone() });
+            let content = Arc::new(InlineContent::new(vec![run], ps.clone()));
             let id = anon_id(parent as u64, if before { 250 } else { 251 });
             items.push(Item::Block(LayoutNode { id, style: ps, kind: LayoutKind::Text(content), children: vec![] }));
         }
@@ -253,8 +395,10 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        let kids: Vec<NodeId> = doc.children(parent).collect();
-        for c in kids {
+        // P5: iterate children directly instead of collecting ids first; the iterator borrows
+        // the document through the engine's shared reference, so it stays valid across the
+        // `&mut self` calls below.
+        for c in doc.children(parent) {
             match &doc.node(c).kind {
                 NodeKind::Text(t) => {
                     items.push(Item::Run(InlineRun { text: t.clone(), style: parent_style.clone(), node: parent as u64, is_break: false }));
@@ -263,14 +407,22 @@ impl<'a> Builder<'a> {
                     let Some(cs) = self.style(c) else { continue };
                     match cs.display {
                         Display::None => continue,
+                        // Internal column boxes generate no box at all.
+                        Display::TableColumn | Display::TableColumnGroup => continue,
                         Display::Contents => {
+                            self.collect(c, &cs, flex, items);
+                            continue;
+                        }
+                        // Table rows and row groups dissolve: their cells lift into the
+                        // table's grid (the grid-like collapse of `display: table`).
+                        Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
                             self.collect(c, &cs, flex, items);
                             continue;
                         }
                         _ => {}
                     }
                     if cs.is_out_of_flow() {
-                        if let Some(n) = self.build_box(c) {
+                        if let Some(n) = self.build_box_cached(c) {
                             let idx = if cs.position == rendrix_css::Position::Fixed { 0 } else { self.abs_stack.len() - 1 };
                             self.abs_stack[idx].push(n);
                         }
@@ -281,7 +433,7 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     if flex {
-                        if let Some(n) = self.build_box(c) {
+                        if let Some(n) = self.build_box_cached(c) {
                             items.push(Item::Block(n));
                         }
                         continue;
@@ -291,10 +443,10 @@ impl<'a> Builder<'a> {
                     if inline_flow {
                         self.collect(c, &cs, false, items);
                     } else if matches!(cs.display, Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineGrid) {
-                        if let Some(n) = self.build_box(c) {
+                        if let Some(n) = self.build_box_cached(c) {
                             items.push(Item::Atomic(n));
                         }
-                    } else if let Some(n) = self.build_box(c) {
+                    } else if let Some(n) = self.build_box_cached(c) {
                         items.push(Item::Block(n));
                     }
                 }
@@ -306,7 +458,7 @@ impl<'a> Builder<'a> {
 
     fn text_leaf(&self, parent: u64, idx: u64, style: &Arc<ComputedStyle>, runs: Vec<InlineRun>) -> LayoutNode {
         let leaf_style = self.anon_block_style(style);
-        let content = Arc::new(InlineContent { runs, container: leaf_style.clone() });
+        let content = Arc::new(InlineContent::new(runs, leaf_style.clone()));
         LayoutNode { id: anon_id(parent, idx), style: leaf_style, kind: LayoutKind::Text(content), children: vec![] }
     }
 
@@ -345,7 +497,7 @@ impl<'a> Builder<'a> {
             if runs.is_empty() || runs.iter().all(|r| !r.is_break && r.text.trim().is_empty() && r.style.white_space != WhiteSpace::Pre && r.style.white_space != WhiteSpace::PreWrap) {
                 return (LayoutKind::Box, vec![]);
             }
-            return (LayoutKind::Text(Arc::new(InlineContent { runs, container: style.clone() })), vec![]);
+            return (LayoutKind::Text(Arc::new(InlineContent::new(runs, style.clone()))), vec![]);
         }
 
         // Mixed content: group consecutive inline-level items into anonymous boxes.
@@ -387,7 +539,7 @@ impl<'a> Builder<'a> {
                 if runs.iter().any(|r| r.is_break || !r.text.trim().is_empty()) {
                     sub += 1;
                     let ls = this.anon_block_style(style);
-                    let content = Arc::new(InlineContent { runs, container: ls.clone() });
+                    let content = Arc::new(InlineContent::new(runs, ls.clone()));
                     kids.push(LayoutNode { id: anon_id(row_id, sub), style: ls, kind: LayoutKind::Text(content), children: vec![] });
                 }
             };
@@ -482,6 +634,252 @@ fn collapsible(ws: WhiteSpace) -> bool {
     matches!(ws, WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::PreLine)
 }
 
+// ---------------------------------------------------------------------------------------------
+// P1: incremental box generation.
+// ---------------------------------------------------------------------------------------------
+//
+// The previous frame's box tree persists in `Engine::layout_tree`. On a style/structure change
+// only the affected units are rebuilt: each dirty DOM node resolves to the box-parent of its
+// box owner (so `arrange` re-runs in the same parent context as a full build), that unit is
+// rebuilt with clean style-identical subtrees reused by NodeId, and the result is spliced back
+// in. Anonymous ids stay deterministic, so the patched tree is structurally identical to a
+// full `build_root` (asserted by the equivalence fuzz below).
+//
+// Soundness notes:
+// - `build_box_cached` is only called for children that generate a box under the *current*
+//   styles (collect() classifies first), so a display/category change always rebuilds.
+// - Whole-subtree reuse additionally requires style `Arc` equality and no dirty node at or
+//   inside the subtree. DOM mutations always mark dirty roots, so unmarked subtrees are frozen.
+// - Out-of-flow boxes that would escape the rebuilt unit (fixed positioning, or absolutes
+//   above a non-positioned unit) are detected through the builder's `abs_stack`: the patch
+//   bails out (`false`) and the caller falls back to `build_root` — identical output.
+
+/// P1: return a dropped box's descendants to the reuse pool (anonymous leaves always rebuild).
+fn drain_into(pool: &mut HashMap<u64, LayoutNode>, mut node: LayoutNode) {
+    for child in node.children.drain(..) {
+        drain_into(pool, child);
+    }
+    if node.id & ANON == 0 {
+        pool.insert(node.id, node);
+    }
+}
+
+fn has_block_child(engine: &Engine, id: NodeId) -> bool {
+    engine.doc.child_elements(id).any(|c| match engine.style_of(c) {
+        Some(s) => match s.display {
+            Display::Block | Display::Flex | Display::Grid => true,
+            Display::Table | Display::TableCell | Display::TableCaption | Display::ListItem => true,
+            Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => true,
+            Display::Inline => has_block_child(engine, c),
+            _ => false,
+        },
+        None => false,
+    })
+}
+
+/// P1: does this element dissolve into its parent's inline content (or vanish structurally)?
+fn is_transparent(engine: &Engine, id: NodeId, s: &Arc<ComputedStyle>) -> bool {
+    if s.display == Display::Contents {
+        return true;
+    }
+    // Dissolved table internals belong to the table's grid, not to their own box.
+    if matches!(
+        s.display,
+        Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup
+    ) {
+        return true;
+    }
+    if s.display != Display::Inline {
+        return false;
+    }
+    let tag = match engine.doc.tag(id) {
+        Some(t) => t,
+        None => return false,
+    };
+    if matches!(tag, "input" | "button" | "select" | "textarea") {
+        return false;
+    }
+    if Builder::is_replaced(tag) || Builder::is_box_like(s) {
+        return false;
+    }
+    if has_block_child(engine, id) {
+        return false;
+    }
+    true
+}
+
+/// P1: nearest box-generating ancestor-or-self of `start`, or `None` when styles are missing.
+fn box_ancestor(engine: &Engine, mut start: Option<NodeId>) -> Option<NodeId> {
+    while let Some(n) = start {
+        if engine.doc.element(n).is_none() {
+            start = engine.doc.parent(n);
+            continue;
+        }
+        let s = engine.style_of(n)?;
+        if is_transparent(engine, n, &s) {
+            start = engine.doc.parent(n);
+            continue;
+        }
+        return Some(n);
+    }
+    None
+}
+
+/// P1: candidate rebuild units for a dirty DOM node, innermost first: the box owner itself
+/// when the dirty node generates a box (rebuilding it re-runs its own collect), otherwise the
+/// box its contribution dissolves into, then successively outer boxes. The patcher takes the
+/// first candidate present in the old tree, so a display change that alters grouping simply
+/// escalates to the parent instead of falling back to a full rebuild.
+fn unit_candidates(engine: &Engine, id: NodeId) -> Vec<NodeId> {
+    let start = if engine.doc.element(id).is_some() { Some(id) } else { engine.doc.parent(id) };
+    let mut out = Vec::new();
+    let mut cur = box_ancestor(engine, start);
+    while let Some(n) = cur {
+        out.push(n);
+        cur = box_ancestor(engine, engine.doc.parent(n));
+    }
+    out
+}
+
+fn contains(engine: &Engine, anc: NodeId, desc: NodeId) -> bool {
+    let mut cur = Some(desc);
+    while let Some(n) = cur {
+        if n == anc {
+            return true;
+        }
+        cur = engine.doc.parent(n);
+    }
+    false
+}
+
+fn find_node<'t>(root: &'t LayoutNode, id: u64) -> Option<&'t LayoutNode> {
+    if root.id == id {
+        return Some(root);
+    }
+    for c in &root.children {
+        if let Some(found) = find_node(c, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_node_mut<'t>(root: &'t mut LayoutNode, id: u64) -> Option<&'t mut LayoutNode> {
+    if root.id == id {
+        return Some(root);
+    }
+    for c in &mut root.children {
+        if let Some(found) = find_node_mut(c, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn remove_node(node: &mut LayoutNode, id: u64) -> bool {
+    if let Some(pos) = node.children.iter().position(|c| c.id == id) {
+        node.children.remove(pos);
+        return true;
+    }
+    for c in &mut node.children {
+        if remove_node(c, id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// P1: remove the box with `id` from the old tree and pool it (with descendants) for reuse.
+fn take_unit_node(root: &mut LayoutNode, id: u64, pool: &mut HashMap<u64, LayoutNode>) -> bool {
+    if let Some(pos) = root.children.iter().position(|c| c.id == id) {
+        let node = root.children.remove(pos);
+        drain_into(pool, node);
+        return true;
+    }
+    for c in &mut root.children {
+        if take_unit_node(c, id, pool) {
+            return true;
+        }
+    }
+    false
+}
+
+/// P1: patch the previous frame's box tree in place. Returns `false` when the patch cannot
+/// preserve full-build semantics (stale shape, escaping out-of-flow boxes); the caller then
+/// discards the tree and runs `build_root`.
+pub(crate) fn patch_tree(engine: &Engine, old_root: &mut LayoutNode, dirty_ids: &[NodeId]) -> bool {
+    // Resolve dirty DOM nodes to rebuild units (innermost candidate present in the old tree),
+    // dropping units nested inside another unit.
+    let mut units: Vec<NodeId> = Vec::new();
+    for id in dirty_ids {
+        if !engine.doc.is_alive(*id) || !engine.doc.is_connected(*id) {
+            continue; // removed; the surviving parent covers it via its own dirty root
+        }
+        let mut chosen = None;
+        for cand in unit_candidates(engine, *id) {
+            if old_root.id == cand as u64 || find_node(old_root, cand as u64).is_some() {
+                chosen = Some(cand);
+                break;
+            }
+        }
+        let Some(u) = chosen else { return false };
+        if units.iter().any(|kept| contains(engine, *kept, u)) {
+            continue;
+        }
+        units.retain(|kept| !contains(engine, u, *kept));
+        units.push(u);
+    }
+    if units.is_empty() {
+        return true;
+    }
+    let dirty: HashSet<NodeId> = dirty_ids.iter().copied().collect();
+    let mut pool: HashMap<u64, LayoutNode> = HashMap::new();
+    for u in units {
+        if old_root.id == u as u64 {
+            let children = std::mem::take(&mut old_root.children);
+            for ch in children {
+                drain_into(&mut pool, ch);
+            }
+        } else if !take_unit_node(old_root, u as u64, &mut pool) {
+            return false; // unit not in the old tree: full rebuild
+        }
+        let mut builder = Builder { engine, abs_stack: vec![Vec::new()], taken: std::mem::take(&mut pool), dirty: dirty.clone() };
+        let rebuilt = builder.build_box_cached(u);
+        if !builder.abs_stack[0].is_empty() {
+            return false; // escaping out-of-flow boxes: full rebuild re-hangs them
+        }
+        pool = std::mem::take(&mut builder.taken);
+        match rebuilt {
+            Some(node) => {
+                if old_root.id == u as u64 {
+                    *old_root = node;
+                } else if let Some(slot) = find_node_mut(old_root, u as u64) {
+                    *slot = node;
+                } else {
+                    return false;
+                }
+            }
+            None => {
+                // The whole unit is now `display: none`: drop it.
+                if old_root.id == u as u64 {
+                    return false; // root `display: none`: let build_root produce None
+                }
+                remove_node(old_root, u as u64);
+            }
+        }
+    }
+    true
+}
+
+/// P1: keep a reused root box's viewport width in sync when boxes survive a resize.
+pub(crate) fn refresh_root_width(root: &mut LayoutNode, viewport_w: f32) {
+    if root.style.width != Dim::Px(viewport_w) {
+        let mut s = (*root.style).clone();
+        s.width = Dim::Px(viewport_w);
+        root.style = Arc::new(s);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +917,208 @@ mod tests {
     #[test]
     fn nbsp_is_not_collapsed() {
         assert_eq!(text(&collapse(vec![run("a\u{a0}\u{a0}b")])), "a\u{a0}\u{a0}b");
+    }
+
+    // P1 equivalence fuzz: the incrementally patched tree must equal a full rebuild
+    // (structural + computed-style equality) across inserts, removes, moves, class, text,
+    // `:nth-child` and abs-pos mutations. The reference engine forces a full rebuild every
+    // frame via `mark_all_style_dirty`; geometry is compared through the public rect API.
+    mod patch_equivalence {
+        use crate::{Engine, MapAssets};
+        use rendrix_css::ComputedStyle;
+        use rendrix_dom::Document;
+        use rendrix_layout::{LayoutKind, LayoutNode};
+        use std::sync::Arc;
+
+        const HTML: &str = r#"<div id="list"><div class="item" id="i0"><span class="label">zero</span><button>Go</button></div><div class="item" id="i1"><span class="label">one</span></div><div class="item" id="i2"><span class="label">two</span></div></div><ul id="nums"><li id="l0">a</li><li id="l1">b</li></ul><div id="stage"><div id="abs">float</div></div><div id="fix">fixed</div><p id="para">Hello <b id="bold">bold</b> world</p><input id="name" value="hi">"#;
+        const CSS: &str = "body{margin:0} #list{display:flex;flex-direction:column;gap:4px} .item{display:flex;background:#eee} .item.hot{background:#cfc} .label{flex:1} li{height:10px} li:first-child{color:rgb(1,1,1)} li:nth-child(2){font-weight:700} #stage{position:relative;width:300px;height:200px} #abs{position:absolute;right:10px;bottom:10px;width:50px;height:50px} #fix{position:fixed;top:0;left:0;width:20px;height:20px} #para{width:200px} #para.q::before{content:'['} #para.q::after{content:']'}";
+        const IDS: &[&str] = &["i0", "i1", "i2", "l0", "l1", "abs", "fix", "para", "bold", "name", "list", "stage"];
+
+        fn pair() -> (Engine, Engine) {
+            let mk = || {
+                let src = format!("<html><head><style>{CSS}</style></head><body>{HTML}</body></html>");
+                let mut e = Engine::with_document(Document::parse(&src), Box::new(MapAssets::default()));
+                e.set_viewport(800.0, 600.0, 1.0);
+                e
+            };
+            let (mut a, mut b) = (mk(), mk());
+            a.update(0.0);
+            b.doc.mark_all_style_dirty();
+            b.update(0.0);
+            (a, b)
+        }
+
+        fn assert_same_tree(a: &LayoutNode, b: &LayoutNode) {
+            assert_eq!(a.id, b.id, "box id");
+            assert_eq!(a.style.as_ref(), b.style.as_ref(), "computed style of box {}", a.id);
+            match (&a.kind, &b.kind) {
+                (LayoutKind::Box, LayoutKind::Box) => {}
+                (LayoutKind::Text(x), LayoutKind::Text(y)) => {
+                    assert_eq!(x.runs.len(), y.runs.len(), "run count of box {}", a.id);
+                    for (r1, r2) in x.runs.iter().zip(y.runs.iter()) {
+                        assert_eq!((r1.text.as_str(), r1.is_break, r1.node), (r2.text.as_str(), r2.is_break, r2.node));
+                        assert_eq!(r1.style.as_ref(), r2.style.as_ref());
+                    }
+                    assert_eq!(x.container.as_ref(), y.container.as_ref());
+                }
+                (
+                    LayoutKind::Replaced { width: w1, height: h1 },
+                    LayoutKind::Replaced { width: w2, height: h2 },
+                ) => assert_eq!((*w1, *h1), (*w2, *h2)),
+                _ => panic!("kind mismatch for box {}", a.id),
+            }
+            assert_eq!(a.children.len(), b.children.len(), "children of box {}", a.id);
+            for (ca, cb) in a.children.iter().zip(b.children.iter()) {
+                assert_same_tree(ca, cb);
+            }
+        }
+
+        fn style_ptr(e: &Engine, id: &str) -> *const ComputedStyle {
+            let dom = e.doc.get_element_by_id(id).unwrap();
+            fn find(n: &LayoutNode, id: u64) -> Option<&LayoutNode> {
+                if n.id == id {
+                    return Some(n);
+                }
+                n.children.iter().find_map(|c| find(c, id))
+            }
+            let tree = e.layout_tree.as_ref().unwrap();
+            Arc::as_ptr(&find(tree, dom as u64).unwrap().style)
+        }
+
+        fn step(a: &mut Engine, b: &mut Engine, t: f64) {
+            b.doc.mark_all_style_dirty();
+            a.update(t);
+            b.update(t);
+            assert_same_tree(a.layout_tree.as_ref().unwrap(), b.layout_tree.as_ref().unwrap());
+            for id in IDS {
+                let ra = a.doc.get_element_by_id(id).and_then(|n| a.element_rect(n));
+                let rb = b.doc.get_element_by_id(id).and_then(|n| b.element_rect(n));
+                assert_eq!(ra, rb, "rect of #{id}");
+            }
+        }
+
+        fn mutate_both(a: &mut Engine, b: &mut Engine, f: impl Fn(&mut Document)) {
+            f(&mut a.doc);
+            f(&mut b.doc);
+        }
+
+        #[test]
+        fn patched_tree_matches_full_rebuild_across_mutations() {
+            let (mut a, mut b) = pair();
+            let mut t = 0.1;
+            let mut go = |a: &mut Engine, b: &mut Engine| {
+                t += 0.1;
+                step(a, b, t);
+            };
+
+            // 1. class toggle: style-only change to one item.
+            let (p0, p1) = (style_ptr(&a, "i0"), style_ptr(&a, "i1"));
+            mutate_both(&mut a, &mut b, |d| {
+                let i1 = d.get_element_by_id("i1").unwrap();
+                d.toggle_class(i1, "hot", None);
+            });
+            go(&mut a, &mut b);
+            assert_eq!(style_ptr(&a, "i0"), p0, "clean sibling box is reused, not rebuilt");
+            assert_ne!(style_ptr(&a, "i1"), p1, "changed box gets a fresh style");
+
+            // 2. text change inside a flex item.
+            mutate_both(&mut a, &mut b, |d| {
+                let label = d.query_selector(d.get_element_by_id("i0").unwrap(), ".label").unwrap().unwrap();
+                d.set_text_content(label, "zero updated with a longer line");
+            });
+            go(&mut a, &mut b);
+
+            // 3. append a new item (new box under a reused parent).
+            mutate_both(&mut a, &mut b, |d| {
+                let list = d.get_element_by_id("list").unwrap();
+                let it = d.create_element("div");
+                d.set_attr(it, "class", "item");
+                d.set_attr(it, "id", "i3");
+                let s = d.create_element("span");
+                d.set_attr(s, "class", "label");
+                let tx = d.create_text("three");
+                d.append_child(s, tx).unwrap();
+                d.append_child(it, s).unwrap();
+                d.append_child(list, it).unwrap();
+            });
+            go(&mut a, &mut b);
+
+            // 4. prepend to the nth-child list (structural restyle of siblings).
+            mutate_both(&mut a, &mut b, |d| {
+                let nums = d.get_element_by_id("nums").unwrap();
+                let li = d.create_element("li");
+                let tx = d.create_text("z");
+                d.append_child(li, tx).unwrap();
+                let first = d.children(nums).next();
+                d.insert_before(nums, li, first).unwrap();
+            });
+            go(&mut a, &mut b);
+
+            // 5. remove an item.
+            mutate_both(&mut a, &mut b, |d| {
+                let i2 = d.get_element_by_id("i2").unwrap();
+                d.remove(i2);
+            });
+            go(&mut a, &mut b);
+
+            // 6. move a node (re-parent under the same list).
+            mutate_both(&mut a, &mut b, |d| {
+                let (list, i0) = (d.get_element_by_id("list").unwrap(), d.get_element_by_id("i0").unwrap());
+                d.append_child(list, i0).unwrap();
+            });
+            go(&mut a, &mut b);
+
+            // 7. inline display change regroups the paragraph (block <-> inline).
+            mutate_both(&mut a, &mut b, |d| {
+                let bold = d.get_element_by_id("bold").unwrap();
+                d.set_attr(bold, "style", "display:block");
+            });
+            go(&mut a, &mut b);
+            mutate_both(&mut a, &mut b, |d| {
+                let bold = d.get_element_by_id("bold").unwrap();
+                d.set_attr(bold, "style", "display:inline");
+            });
+            go(&mut a, &mut b);
+
+            // 8. abs-pos child style change (contained: stays incremental).
+            mutate_both(&mut a, &mut b, |d| {
+                let abs = d.get_element_by_id("abs").unwrap();
+                d.set_attr(abs, "style", "left:5px;top:5px");
+            });
+            go(&mut a, &mut b);
+
+            // 9. form control value (control-content path).
+            mutate_both(&mut a, &mut b, |d| {
+                let name = d.get_element_by_id("name").unwrap();
+                d.set_form_value(name, "hello world");
+            });
+            go(&mut a, &mut b);
+
+            // 10. generated content toggled by a class.
+            mutate_both(&mut a, &mut b, |d| {
+                let para = d.get_element_by_id("para").unwrap();
+                d.toggle_class(para, "q", Some(true));
+            });
+            go(&mut a, &mut b);
+
+            // 11. paragraph children replaced wholesale (stale inline boxes dropped).
+            mutate_both(&mut a, &mut b, |d| {
+                let para = d.get_element_by_id("para").unwrap();
+                d.set_text_content(para, "Hello world, rewritten");
+            });
+            go(&mut a, &mut b);
+
+            // 12. fixed-position text change (escapes the unit: falls back to full build).
+            mutate_both(&mut a, &mut b, |d| {
+                let fix = d.get_element_by_id("fix").unwrap();
+                d.set_text_content(fix, "fixed!");
+            });
+            go(&mut a, &mut b);
+
+            // 13. viewport resize with neutral CSS: P3 skips restyle, boxes are reused.
+            a.set_viewport(750.0, 600.0, 1.0);
+            b.set_viewport(750.0, 600.0, 1.0);
+            go(&mut a, &mut b);
+        }
     }
 }

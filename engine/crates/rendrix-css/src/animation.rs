@@ -119,7 +119,11 @@ fn lerp_dim(a: Dim, b: Dim, t: f32) -> Dim {
     match (a, b) {
         (Dim::Px(x), Dim::Px(y)) => Dim::Px(lerp(x, y, t)),
         (Dim::Percent(x), Dim::Percent(y)) => Dim::Percent(lerp(x, y, t)),
-        // Mixed units / auto are discrete in this engine (no calc() mixing), flipping at the midpoint.
+        (Dim::Calc(p1, x1), Dim::Calc(p2, x2)) => Dim::Calc(lerp(p1, p2, t), lerp(x1, x2, t)),
+        // A Calc with a zero component is effectively pure, so it interpolates.
+        (Dim::Calc(p, 0.0), Dim::Percent(q)) | (Dim::Percent(q), Dim::Calc(p, 0.0)) => Dim::Percent(lerp(p, q, t)),
+        (Dim::Calc(0.0, x), Dim::Px(y)) | (Dim::Px(y), Dim::Calc(0.0, x)) => Dim::Px(lerp(x, y, t)),
+        // Mixed units / auto are discrete, flipping at the midpoint.
         _ => {
             if t < 0.5 {
                 a

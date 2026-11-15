@@ -11,8 +11,27 @@ doctest = false
 rendrix-core.workspace = true
 rendrix-dom.workspace = true
 rendrix-css.workspace = true
-rquickjs.workspace = true
+rendrix-gfx.workspace = true
+rendrix-layout.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+accesskit = "0.25"
+# `std::time::Instant` panics on wasm32-unknown-unknown; this is std's Instant everywhere else.
+web-time = "1"
+
+# Native-only: the QuickJS engine, OS networking, file dialogs, and worker threads. On wasm32 the
+# browser provides the JavaScript engine (see `rendrix-web`) and network/dialog hooks.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rquickjs.workspace = true
 getrandom = "0.2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+rfd = "0.18"
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "js"
+harness = false

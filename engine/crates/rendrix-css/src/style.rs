@@ -22,6 +22,11 @@ macro_rules! keyword_enum {
 keyword_enum!(Display {
     None => "none", Block => "block", Inline => "inline", InlineBlock => "inline-block",
     Flex => "flex", InlineFlex => "inline-flex", Grid => "grid", InlineGrid => "inline-grid", Contents => "contents",
+    Table => "table", InlineTable => "inline-table", TableCaption => "table-caption",
+    TableColumnGroup => "table-column-group", TableColumn => "table-column",
+    TableHeaderGroup => "table-header-group", TableRowGroup => "table-row-group",
+    TableFooterGroup => "table-footer-group", TableRow => "table-row", TableCell => "table-cell",
+    ListItem => "list-item",
 } default Inline);
 keyword_enum!(Position {
     Static => "static", Relative => "relative", Absolute => "absolute", Fixed => "fixed", Sticky => "sticky",
@@ -69,6 +74,8 @@ keyword_enum!(BackgroundRepeat {
     Repeat => "repeat", NoRepeat => "no-repeat", RepeatX => "repeat-x", RepeatY => "repeat-y",
 } default Repeat);
 keyword_enum!(UserSelect { Auto => "auto", None => "none", Text => "text", All => "all" } default Auto);
+keyword_enum!(Float { None => "none", Left => "left", Right => "right" } default None);
+keyword_enum!(Clear { None => "none", Left => "left", Right => "right", Both => "both" } default None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TextDecoration {
@@ -135,6 +142,49 @@ pub struct Shadow {
     pub spread: f32,
     pub color: Color,
     pub inset: bool,
+}
+
+/// A single `filter` / `backdrop-filter` function (approved subset).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FilterOp {
+    /// `blur(<length>)`: radius in px.
+    Blur(f32),
+    /// `brightness(<number> | <percentage>)`: 1 = unchanged.
+    Brightness(f32),
+    /// `grayscale(<number> | <percentage>)`: 1 = fully desaturated.
+    Grayscale(f32),
+}
+
+impl FilterOp {
+    /// True when this op visibly changes rendering (lets paint skip no-op lists).
+    pub fn is_noop(self) -> bool {
+        match self {
+            FilterOp::Blur(r) => r <= 0.0,
+            FilterOp::Brightness(b) => (b - 1.0).abs() < 1e-6,
+            FilterOp::Grayscale(g) => g <= 0.0,
+        }
+    }
+}
+
+/// `clip-path` (approved subset: basic shapes; `none` disables clipping).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClipPath {
+    None,
+    /// `inset(top right bottom left)` offsets from the border box (`round` is accepted and ignored).
+    Inset { top: Dim, right: Dim, bottom: Dim, left: Dim },
+    /// `circle(<r> [at <cx> <cy>])`; centre defaults to 50%/50%.
+    Circle { r: Dim, cx: Dim, cy: Dim },
+    /// `ellipse(<rx> <ry> [at <cx> <cy>])`; centre defaults to 50%/50%.
+    Ellipse { rx: Dim, ry: Dim, cx: Dim, cy: Dim },
+    /// `polygon(<x1> <y1>, ...)` in px/`%` pairs. Paint culls to the bounding box;
+    /// per-pixel polygon clipping is a documented gap (needs an offscreen pass).
+    Polygon(Vec<(Dim, Dim)>),
+}
+
+impl Default for ClipPath {
+    fn default() -> Self {
+        ClipPath::None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -232,7 +282,13 @@ pub struct ComputedStyle {
     pub position: Position,
     pub inset: [Dim; 4], // top right bottom left
     pub z_index: Option<i32>,
-    pub float_none: bool,
+    /// `float: left | right | none`. Layout effect: floated boxes are pinned to the
+    /// inline-start/end edge of their containing block (explicit widths only; auto-width
+    /// floats size like blocks) and do not wrap inline content around themselves.
+    pub float: Float,
+    /// `clear: left | right | both | none`. Cleared boxes start below preceding floats
+    /// in the same containing block (post-layout adjustment; see `rendrix-core`).
+    pub clear: Clear,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub box_sizing: BoxSizing,
@@ -241,6 +297,8 @@ pub struct ComputedStyle {
     pub pointer_events: PointerEvents,
     pub cursor: Cursor,
     pub user_select: UserSelect,
+    /// `touch-action` as a bitmask: 1 = pan-x, 2 = pan-y, 4 = pinch-zoom (7 = auto/manipulation, 0 = none). Not inherited; effective value is the intersection along the ancestor chain.
+    pub touch_action: u8,
 
     // sizing
     pub width: Dim,
@@ -276,15 +334,26 @@ pub struct ComputedStyle {
     pub justify_self: Align,
     pub row_gap: Dim,
     pub column_gap: Dim,
+    /// Multi-column basics (`column-count`, `column-width`, `columns`). A container with
+    /// `column-count > 1` (or an explicit `column-width` that yields > 1 column) lays its
+    /// children out in N equal columns (grid-backed; no balancing, no spanners, fills rows).
+    pub column_count: Option<u16>,
+    pub column_width: Dim,
+    /// `column-span: all` pulls a child across every column; `none` (default) keeps it in one.
+    pub column_span_all: bool,
 
     // grid
     pub grid_template_columns: Vec<TrackItem>,
     pub grid_template_rows: Vec<TrackItem>,
+    /// `grid-template-areas` as rows of area names (`.` = empty cell).
+    pub grid_template_areas: Vec<Vec<String>>,
     pub grid_auto_columns: Vec<TrackSize>,
     pub grid_auto_rows: Vec<TrackSize>,
     pub grid_auto_flow: GridAutoFlow,
     pub grid_column: (GridLine, GridLine),
     pub grid_row: (GridLine, GridLine),
+    /// `grid-area: <name>` placement (explicit `row / column` goes to grid_row/grid_column).
+    pub grid_area: Option<String>,
 
     // paint
     pub color: Color,
@@ -293,6 +362,12 @@ pub struct ComputedStyle {
     pub background_size: BackgroundSize,
     pub background_repeat: BackgroundRepeat,
     pub box_shadow: Vec<Shadow>,
+    pub text_shadow: Vec<Shadow>,
+    pub filter: Vec<FilterOp>,
+    pub backdrop_filter: Vec<FilterOp>,
+    pub clip_path: ClipPath,
+    /// `mask-image: url(...)` (alpha masking; see paint). `None` = no mask.
+    pub mask_image: Option<String>,
     pub transform: Vec<TransformOp>,
     pub transform_origin: (Dim, Dim),
     pub object_fit: ObjectFit,
@@ -330,7 +405,8 @@ impl Default for ComputedStyle {
             position: Position::Static,
             inset: [Dim::Auto; 4],
             z_index: None,
-            float_none: true,
+            float: Float::None,
+            clear: Clear::None,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             box_sizing: BoxSizing::ContentBox,
@@ -339,6 +415,7 @@ impl Default for ComputedStyle {
             pointer_events: PointerEvents::Auto,
             cursor: Cursor::Auto,
             user_select: UserSelect::Auto,
+            touch_action: 7,
             width: Dim::Auto,
             height: Dim::Auto,
             min_width: Dim::Auto,
@@ -369,19 +446,29 @@ impl Default for ComputedStyle {
             justify_self: Align::Auto,
             row_gap: Dim::Px(0.0),
             column_gap: Dim::Px(0.0),
+            column_count: None,
+            column_width: Dim::Auto,
+            column_span_all: false,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            grid_template_areas: Vec::new(),
             grid_auto_columns: Vec::new(),
             grid_auto_rows: Vec::new(),
             grid_auto_flow: GridAutoFlow::Row,
             grid_column: (GridLine::Auto, GridLine::Auto),
             grid_row: (GridLine::Auto, GridLine::Auto),
+            grid_area: None,
             color: Color::BLACK,
             background_color: Color::TRANSPARENT,
             background_images: Vec::new(),
             background_size: BackgroundSize::Auto,
             background_repeat: BackgroundRepeat::Repeat,
             box_shadow: Vec::new(),
+            text_shadow: Vec::new(),
+            filter: Vec::new(),
+            backdrop_filter: Vec::new(),
+            clip_path: ClipPath::None,
+            mask_image: None,
             transform: Vec::new(),
             transform_origin: (Dim::Percent(50.0), Dim::Percent(50.0)),
             object_fit: ObjectFit::Fill,
@@ -421,6 +508,7 @@ impl ComputedStyle {
             word_spacing: parent.word_spacing,
             text_align: parent.text_align,
             text_transform: parent.text_transform,
+            text_shadow: parent.text_shadow.clone(),
             white_space: parent.white_space,
             visibility: parent.visibility,
             cursor: parent.cursor,
@@ -445,6 +533,37 @@ impl ComputedStyle {
         !self.transform.is_empty()
     }
 
+    /// Number of multi-column tracks, if this box establishes a column container.
+    /// `column-count` wins; otherwise `column-width` derives a count against `basis`
+    /// (the containing-block width estimate) and `column-gap`.
+    pub fn multicol_count(&self, basis: f32) -> Option<u16> {
+        if let Some(n) = self.column_count {
+            return (n > 1).then_some(n);
+        }
+        let w = match self.column_width {
+            Dim::Px(w) if w > 0.0 => w,
+            _ => return None,
+        };
+        let gap = match self.column_gap {
+            Dim::Px(g) => g.max(0.0),
+            _ => 0.0,
+        };
+        let n = ((basis + gap) / (w + gap)).floor() as u16;
+        (n > 1).then_some(n.min(16))
+    }
+
+    pub fn is_table(&self) -> bool {
+        matches!(self.display, Display::Table | Display::InlineTable)
+    }
+
+    /// Internal table rows/groups dissolve so their cells become direct grid items.
+    pub fn is_table_row_or_group(&self) -> bool {
+        matches!(
+            self.display,
+            Display::TableRow | Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup
+        )
+    }
+
     pub fn is_scroll_container(&self) -> bool {
         matches!(self.overflow_x, Overflow::Scroll | Overflow::Auto | Overflow::Hidden | Overflow::Clip)
             || matches!(self.overflow_y, Overflow::Scroll | Overflow::Auto | Overflow::Hidden | Overflow::Clip)
@@ -460,5 +579,11 @@ impl ComputedStyle {
             || self.has_transform()
             || (self.position != Position::Static && self.z_index.is_some())
             || matches!(self.position, Position::Fixed | Position::Sticky)
+            // Filter, backdrop-filter, clip-path and mask effects isolate their subtree,
+            // so they establish a stacking context like opacity does.
+            || !self.filter.is_empty()
+            || !self.backdrop_filter.is_empty()
+            || !matches!(self.clip_path, ClipPath::None)
+            || self.mask_image.is_some()
     }
 }

@@ -13,3 +13,12 @@ rendrix-dom.workspace = true
 rendrix-layout.workspace = true
 rendrix-gfx.workspace = true
 image.workspace = true
+web-time = "1"
+
+[dev-dependencies]
+criterion.workspace = true
+wgpu.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false

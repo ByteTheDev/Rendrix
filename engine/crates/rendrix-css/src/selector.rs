@@ -18,9 +18,29 @@ pub trait SelectorElement: Sized + Clone {
     fn id(&self) -> Option<&str>;
     fn has_class(&self, class: &str) -> bool;
     fn attr(&self, name: &str) -> Option<&str>;
+    /// Pre-split class list, when the implementor caches it (avoids re-splitting the
+    /// `class` attribute on every candidate lookup). Defaults to `None`, which falls
+    /// back to splitting `attr("class")`.
+    fn classes(&self) -> Option<&[String]> {
+        None
+    }
     fn parent_element(&self) -> Option<Self>;
     fn prev_sibling_element(&self) -> Option<Self>;
     fn next_sibling_element(&self) -> Option<Self>;
+    /// Direct element children, for `:has()` (default: none; DOM overrides).
+    fn child_elements(&self) -> Vec<Self> {
+        Vec::new()
+    }
+    /// All element descendants, derived from [`child_elements`](Self::child_elements).
+    fn descendant_elements(&self) -> Vec<Self> {
+        let mut out = Vec::new();
+        let mut stack = self.child_elements();
+        while let Some(n) = stack.pop() {
+            out.push(n.clone());
+            stack.extend(n.child_elements());
+        }
+        out
+    }
     fn has_state(&self, state: ElementState) -> bool;
     fn is_root(&self) -> bool;
     fn is_empty(&self) -> bool;
@@ -54,6 +74,14 @@ pub struct AttrSelector {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct HasSelector {
+    /// Leading combinator of the relative selector: `None` = descendant,
+    /// `Some(Child)` = `>`, `Some(NextSibling)` = `+`, `Some(SubsequentSibling)` = `~`.
+    pub combinator: Option<Combinator>,
+    pub selector: Selector,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum PseudoClass {
     Hover,
     Active,
@@ -76,6 +104,7 @@ pub enum PseudoClass {
     Not(Vec<Selector>),
     Is(Vec<Selector>),
     Where(Vec<Selector>),
+    Has(Vec<HasSelector>),
     /// Recognised but never matching (e.g. `:visited`, `:link` is treated as `a[href]`).
     Never,
 }
@@ -298,7 +327,26 @@ fn pseudo_matches<E: SelectorElement>(p: &PseudoClass, el: &E) -> bool {
         PseudoClass::NthOfType(a, b) => nth_matches(*a, *b, sibling_position(el, true, false)),
         PseudoClass::Not(list) => !list.iter().any(|s| s.matches(el)),
         PseudoClass::Is(list) | PseudoClass::Where(list) => list.iter().any(|s| s.matches(el)),
+        PseudoClass::Has(list) => list.iter().any(|h| has_matches(h, el)),
         PseudoClass::Never => false,
+    }
+}
+
+fn has_matches<E: SelectorElement>(h: &HasSelector, el: &E) -> bool {
+    match h.combinator {
+        None | Some(Combinator::Descendant) => el.descendant_elements().iter().any(|d| h.selector.matches(d)),
+        Some(Combinator::Child) => el.child_elements().iter().any(|c| h.selector.matches(c)),
+        Some(Combinator::NextSibling) => el.next_sibling_element().is_some_and(|s| h.selector.matches(&s)),
+        Some(Combinator::SubsequentSibling) => {
+            let mut cur = el.next_sibling_element();
+            while let Some(s) = cur {
+                if h.selector.matches(&s) {
+                    return true;
+                }
+                cur = s.next_sibling_element();
+            }
+            false
+        }
     }
 }
 
@@ -441,6 +489,13 @@ fn parse_compound(chars: &[char], mut i: usize) -> Option<CompoundParse> {
                         c.pseudos.push(PseudoClass::Where(Selector::parse_list(&a)));
                         continue;
                     }
+                    ("has", Some(a)) => {
+                        let list = parse_has(&a)?;
+                        let m = list.iter().map(|h| h.selector.specificity).max().unwrap_or_default();
+                        spec = (spec.0 + m.0, spec.1 + m.1, spec.2 + m.2);
+                        c.pseudos.push(PseudoClass::Has(list));
+                        continue;
+                    }
                     ("link", None) | ("any-link", None) => {
                         c.attrs.push(AttrSelector {
                             name: "href".into(),
@@ -524,6 +579,33 @@ pub fn parse_nth(arg: &str) -> Option<(i32, i32)> {
     }
 }
 
+/// Parse `:has()` arguments as relative selectors: `[> | + | ~]? <selector>` per comma part.
+fn parse_has(arg: &str) -> Option<Vec<HasSelector>> {
+    let parts = split_top_level(arg, ',');
+    if parts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for p in parts {
+        let t = p.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let (comb, rest) = match t.chars().next() {
+            Some('>') => (Some(Combinator::Child), t[1..].trim()),
+            Some('+') => (Some(Combinator::NextSibling), t[1..].trim()),
+            Some('~') => (Some(Combinator::SubsequentSibling), t[1..].trim()),
+            _ => (None, t),
+        };
+        if rest.is_empty() {
+            return None;
+        }
+        let sel = Selector::parse(rest)?;
+        out.push(HasSelector { combinator: comb, selector: sel });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Split on `sep` ignoring separators inside (), [] and quotes.
 pub fn split_top_level(input: &str, sep: char) -> Vec<String> {
     let mut out = Vec::new();
@@ -601,5 +683,103 @@ mod tests {
         assert!(Selector::parse("> a").is_none());
         assert!(Selector::parse("a >").is_none());
         assert!(Selector::parse("").is_none());
+    }
+
+    /// Minimal element tree for `:has()` matching tests.
+    #[derive(Clone)]
+    struct HasEl {
+        tree: std::rc::Rc<Vec<HasNode>>,
+        idx: usize,
+    }
+    struct HasNode {
+        tag: &'static str,
+        id: Option<&'static str>,
+        class: Option<&'static str>,
+        parent: Option<usize>,
+        children: Vec<usize>,
+        prev: Option<usize>,
+        next: Option<usize>,
+    }
+    impl SelectorElement for HasEl {
+        fn tag(&self) -> &str {
+            self.tree[self.idx].tag
+        }
+        fn id(&self) -> Option<&str> {
+            self.tree[self.idx].id
+        }
+        fn has_class(&self, c: &str) -> bool {
+            self.tree[self.idx].class.is_some_and(|cl| cl.split_whitespace().any(|x| x == c))
+        }
+        fn attr(&self, name: &str) -> Option<&str> {
+            match name {
+                "class" => self.tree[self.idx].class,
+                "id" => self.tree[self.idx].id,
+                _ => None,
+            }
+        }
+        fn parent_element(&self) -> Option<Self> {
+            self.tree[self.idx].parent.map(|p| HasEl { tree: self.tree.clone(), idx: p })
+        }
+        fn prev_sibling_element(&self) -> Option<Self> {
+            self.tree[self.idx].prev.map(|p| HasEl { tree: self.tree.clone(), idx: p })
+        }
+        fn next_sibling_element(&self) -> Option<Self> {
+            self.tree[self.idx].next.map(|p| HasEl { tree: self.tree.clone(), idx: p })
+        }
+        fn child_elements(&self) -> Vec<Self> {
+            self.tree[self.idx].children.iter().map(|c| HasEl { tree: self.tree.clone(), idx: *c }).collect()
+        }
+        fn has_state(&self, _: ElementState) -> bool {
+            false
+        }
+        fn is_root(&self) -> bool {
+            self.tree[self.idx].parent.is_none()
+        }
+        fn is_empty(&self) -> bool {
+            self.tree[self.idx].children.is_empty()
+        }
+    }
+
+    fn has_tree() -> Vec<HasEl> {
+        // <div id=a><span id=b class=x></span><p id=c></p></div><div id=d></div>
+        // a children: b, c (siblings); d sibling of a.
+        let nodes = vec![
+            HasNode { tag: "div", id: Some("a"), class: None, parent: None, children: vec![1, 2], prev: None, next: Some(3) },
+            HasNode { tag: "span", id: Some("b"), class: Some("x"), parent: Some(0), children: vec![], prev: None, next: Some(2) },
+            HasNode { tag: "p", id: Some("c"), class: None, parent: Some(0), children: vec![], prev: Some(1), next: None },
+            HasNode { tag: "div", id: Some("d"), class: None, parent: None, children: vec![], prev: Some(0), next: None },
+        ];
+        let rc = std::rc::Rc::new(nodes);
+        (0..4).map(|i| HasEl { tree: rc.clone(), idx: i }).collect()
+    }
+
+    #[test]
+    fn has_specificity_takes_max_argument() {
+        assert_eq!(Selector::parse("div:has(.a)").unwrap().specificity, (0, 1, 1));
+        assert_eq!(Selector::parse(":has(#a, .b)").unwrap().specificity, (1, 0, 0));
+        assert_eq!(Selector::parse("div:has(> .a)").unwrap().specificity, (0, 1, 1));
+        assert_eq!(Selector::parse(":where(:has(.a))").unwrap().specificity, (0, 0, 0), ":where() zeroes even :has()");
+    }
+
+    #[test]
+    fn has_matches_descendants_and_combinators() {
+        let els = has_tree();
+        let (a, b, _c, d) = (&els[0], &els[1], &els[2], &els[3]);
+        assert!(Selector::parse("div:has(.x)").unwrap().matches(a));
+        assert!(!Selector::parse("div:has(.x)").unwrap().matches(d));
+        assert!(!Selector::parse("div:has(.x)").unwrap().matches(b), ":has() does not match self");
+        assert!(Selector::parse("div:has(> span)").unwrap().matches(a));
+        assert!(Selector::parse("div:has(> p)").unwrap().matches(a));
+        assert!(!Selector::parse("div:has(> div)").unwrap().matches(a));
+        assert!(Selector::parse("span:has(+ p)").unwrap().matches(b), "adjacent sibling");
+        assert!(!Selector::parse("p:has(+ span)").unwrap().matches(&els[2]));
+        assert!(Selector::parse("span:has(~ p)").unwrap().matches(b));
+        assert!(Selector::parse("div:has(span.x)").unwrap().matches(a));
+        assert!(!Selector::parse("div:has(span.y)").unwrap().matches(a));
+        // Multiple selectors: any match wins.
+        assert!(Selector::parse("div:has(.missing, .x)").unwrap().matches(a));
+        // Universal: matches elements with any element descendant.
+        assert!(Selector::parse("div:has(*)").unwrap().matches(a));
+        assert!(!Selector::parse("div:has(*)").unwrap().matches(d));
     }
 }

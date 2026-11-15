@@ -5,7 +5,7 @@
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { BuildError } from '../src/app/build.mjs';
-import { build, check, dev, doctor, init, pack, run } from '../src/app/commands.mjs';
+import { build, check, dev, doctor, init, pack, render, run } from '../src/app/commands.mjs';
 
 const require = createRequire(import.meta.url);
 const VERSION = require('../package.json').version;
@@ -15,10 +15,13 @@ const HELP = `rendrix ${VERSION}: build native apps with TypeScript, DOM and CSS
 Usage:
   rendrix init <dir> [--name N] [--template app]   create a new project
   rendrix dev [dir]                                 build, run, and rebuild on every change
-  rendrix build [dir] [--out file] [--no-typecheck] compile to a .rdxapp bundle
+  rendrix build [dir] [--out file] [--no-typecheck] [--check-js] compile to a .rdxapp bundle
   rendrix run [dir]                                 build and run once
-  rendrix check [dir]                               type-check only
-  rendrix package [dir] [--out file] [--runtime P]  build a standalone executable
+  rendrix check [dir] [--check-js]                  type-check only
+  rendrix package [dir] [--out file] [--runtime P] [--installer none|nsis] [--sign] [--manifest file] [--manifest-key key.pem] [--publish-url url] [--app-version x.y.z]
+  build a standalone executable
+  rendrix render <page.html|dir> -o out.png|out.pdf|frames/ [--size WxH] [--scale S] [--frames N] [--frame-ms MS] [--script steps.json]
+  render a page headlessly (PNG, PDF, or a PNG frame sequence for the /video pipeline)
   rendrix doctor [dir]                              verify the toolchain, GPU and runtime
   rendrix help | version
 
@@ -31,12 +34,29 @@ function parse(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--no-typecheck') opts.typecheck = false;
-    else if (a === '--out') opts.out = argv[++i];
+    else if (a === '--check-js') opts.checkJs = true;
+    else if (a === '--no-hot') opts.hot = false;
+    else if (a === '--hot') opts.hot = true;
+    else if (a === '--out' || a === '-o') opts.out = argv[++i];
+    else if (a === '--frames') opts.frames = argv[++i];
+    else if (a === '--frame-ms') opts.frameMs = argv[++i];
     else if (a === '--name') opts.name = argv[++i];
     else if (a === '--template') opts.template = argv[++i];
     else if (a === '--runtime') opts.runtime = argv[++i];
+    else if (a === '--installer') opts.installer = argv[++i];
+    else if (a === '--sign') opts.sign = true;
+    else if (a === '--manifest') opts.manifest = argv[++i];
+    else if (a === '--manifest-key') opts.manifestKey = argv[++i];
+    else if (a === '--publish-url') opts.publishUrl = argv[++i];
+    else if (a === '--app-version') opts.appVersion = argv[++i];
     else if (a === '--headless') opts.runtimeArgs.push(a);
-    else if (['--screenshot', '--script', '--size', '--scale'].includes(a)) opts.runtimeArgs.push(a, argv[++i]);
+    else if (['--screenshot', '--script', '--size', '--scale'].includes(a)) {
+      const v = argv[++i];
+      opts.runtimeArgs.push(a, v);
+      if (a === '--size') opts.size = v;
+      else if (a === '--scale') opts.scale = v;
+      else if (a === '--script') opts.script = v;
+    }
     else if (a.startsWith('--')) throw new BuildError(`unknown option ${a}. Try \`rendrix help\`.`);
     else opts._.push(a);
   }
@@ -51,10 +71,11 @@ async function main() {
   switch (cmd) {
     case 'init': if (!opts._[0]) throw new BuildError('usage: rendrix init <dir>'); return init(opts._[0], opts);
     case 'build': await build(dir, opts); return 0;
-    case 'check': await check(dir); return 0;
+    case 'check': await check(dir, opts); return 0;
     case 'run': return run(dir, opts);
     case 'dev': await dev(dir, opts); return 0;
     case 'package': await pack(dir, opts); return 0;
+    case 'render': if (!opts._[0]) throw new BuildError('usage: rendrix render <page.html|dir> -o out.png|out.pdf|frames/'); await render(opts._[0], opts); return 0;
     case 'doctor': return doctor(dir);
     case 'version': case '--version': console.log(VERSION); return 0;
     case 'help': default: console.log(HELP); return cmd === 'help' ? 0 : 2;

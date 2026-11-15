@@ -3,6 +3,11 @@
 
 use crate::selector::{split_top_level, Selector};
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Declaration {
     /// Lower-cased property name; custom properties (`--x`) keep their case.
@@ -50,6 +55,37 @@ impl Stylesheet {
         let clean = strip_comments(source);
         Stylesheet { rules: parse_rules(&clean) }
     }
+}
+
+/// P2: parse-once cache keyed by content hash. `refresh_rules` used to re-tokenise every
+/// stylesheet on every resize; now unchanged sheets are parsed once and only the cheap
+/// `RuleSet` filter is rebuilt under the new `MediaContext`.
+pub fn parse_cached(source: &str) -> Arc<Stylesheet> {
+    thread_local! {
+        static CACHE: RefCell<HashMap<u64, Arc<Stylesheet>>> = RefCell::new(HashMap::new());
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut h);
+    let key = h.finish();
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(hit) = c.get(&key) {
+            return hit.clone();
+        }
+        // Bounded: drop the whole generation if it grows without bound (e.g. HMR churn).
+        if c.len() >= 64 {
+            c.clear();
+        }
+        let sheet = Arc::new(Stylesheet::parse(source));
+        c.insert(key, sheet.clone());
+        sheet
+    })
+}
+
+/// The user-agent stylesheet, parsed once per thread instead of on every style refresh.
+pub fn ua_sheet() -> Arc<Stylesheet> {
+    static UA: OnceLock<Arc<Stylesheet>> = OnceLock::new();
+    UA.get_or_init(|| Arc::new(Stylesheet::parse(crate::ua::USER_AGENT_CSS))).clone()
 }
 
 pub fn strip_comments(s: &str) -> String {
@@ -209,13 +245,13 @@ fn parse_at_rule(prelude: &str, body: &str, out: &mut Vec<Rule>) {
                         "to" => Some(1.0),
                         t => t.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()).map(|v| v / 100.0),
                     };
-                    if let Some(o) = off {
+                    if let Some(o) = off.filter(|o| o.is_finite()) {
                         frames.push((o.clamp(0.0, 1.0), decls.clone()));
                     }
                 }
                 i = close + 1;
             }
-            frames.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            frames.sort_by(|a, b| a.0.total_cmp(&b.0));
             out.push(Rule::Keyframes(Keyframes { name: args.trim_matches(|c| c == '"' || c == '\'').to_string(), frames }));
         }
         "font-face" => {
@@ -401,6 +437,25 @@ mod tests {
         let kf = sheet.rules.iter().find_map(|r| if let Rule::Keyframes(k) = r { Some(k) } else { None }).unwrap();
         assert_eq!(kf.frames.len(), 3);
         assert_eq!(kf.frames[1].0, 0.5);
+    }
+
+    #[test]
+    fn keyframes_with_non_finite_offsets_do_not_panic() {
+        let sheet = Stylesheet::parse("@keyframes k { nan% { opacity: 0 } inf% { opacity: 1 } to { opacity: 1 } 50% { opacity: .5 } }");
+        let kf = sheet.rules.iter().find_map(|r| if let Rule::Keyframes(k) = r { Some(k) } else { None }).unwrap();
+        assert_eq!(kf.frames.len(), 2);
+    }
+
+    #[test]
+    fn parse_cache_returns_shared_instances() {
+        // P2: identical source parses once; different sources do not alias.
+        let a = parse_cached(".a { color: red }");
+        let b = parse_cached(".a { color: red }");
+        assert!(Arc::ptr_eq(&a, &b));
+        let c = parse_cached(".a { color: blue }");
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert!(ua_sheet().rules.len() > 10);
+        assert!(Arc::ptr_eq(&ua_sheet(), &ua_sheet()));
     }
 
     #[test]

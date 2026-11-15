@@ -52,6 +52,11 @@ pub struct EngineStats {
     pub last_layout_micros: u64,
     pub last_style_micros: u64,
     pub last_paint_micros: u64,
+    /// M0 shaping signals (populated per frame; Taffy new/restyled node counts
+    /// stay inside `TaffyEngine` until its layout API exposes them).
+    pub shape_count: usize,
+    pub cache_hits: usize,
+    pub cache_len: usize,
 }
 
 pub struct Engine {
@@ -63,6 +68,10 @@ pub struct Engine {
     pub viewport: (f32, f32),
     pub scale: f32,
     pub dark: bool,
+    /// Safe-area insets (top, right, bottom, left) in CSS px, exposed as `env(safe-area-inset-*)`.
+    pub safe_area: [f32; 4],
+    /// On-screen keyboard height in CSS px, exposed as `env(keyboard-inset-height)`.
+    pub keyboard_h: f32,
 
     pub(crate) rules: RuleSet,
     pub(crate) rules_dirty: bool,
@@ -74,7 +83,9 @@ pub struct Engine {
     pub(crate) anim: HashMap<NodeId, style::AnimState>,
     pub now: f64,
 
-    layout_tree: Option<LayoutNode>,
+    /// P1: the previous frame's box tree persists across `update` calls so dirty regions can
+    /// be rebuilt and spliced by NodeId instead of rebuilding the whole tree.
+    pub(crate) layout_tree: Option<LayoutNode>,
     layout_result: LayoutResult,
     display: DisplayList,
     hits: Vec<HitEntry>,
@@ -107,6 +118,8 @@ impl Engine {
             viewport: (800.0, 600.0),
             scale: 1.0,
             dark: false,
+            safe_area: [0.0; 4],
+            keyboard_h: 0.0,
             rules: RuleSet::new(),
             rules_dirty: true,
             rules_media_sig: None,
@@ -143,6 +156,22 @@ impl Engine {
         }
     }
 
+    /// Safe-area insets in CSS px: `[top, right, bottom, left]`.
+    pub fn set_safe_area(&mut self, insets: [f32; 4]) {
+        if insets != self.safe_area {
+            self.safe_area = insets;
+            self.viewport_changed = true;
+        }
+    }
+
+    /// On-screen keyboard height in CSS px (0 when hidden).
+    pub fn set_keyboard_inset(&mut self, height: f32) {
+        if height != self.keyboard_h {
+            self.keyboard_h = height;
+            self.viewport_changed = true;
+        }
+    }
+
     pub fn set_dark(&mut self, dark: bool) {
         if self.dark != dark {
             self.dark = dark;
@@ -170,6 +199,11 @@ impl Engine {
 
     pub fn image_entry(&self, url: &str) -> Option<ImageEntry> {
         self.images.borrow_mut().get(url, self.assets.as_ref())
+    }
+
+    /// Rasterized inline `<svg>` for `node` at `w`×`h` px (cached by markup + size).
+    pub fn inline_svg_entry(&self, node: NodeId, html: &str, w: u32, h: u32) -> Option<ImageEntry> {
+        self.images.borrow_mut().svg(node, html, w, h)
     }
 
     /// Ids of nodes freed since the last call (so script-side state keyed by id can be dropped).
@@ -268,7 +302,8 @@ impl Engine {
         self.stats.last_style_micros = 0;
         self.stats.last_layout_micros = 0;
         self.stats.last_paint_micros = 0;
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
+        let sheets_were_dirty = self.doc.sheets_dirty || self.rules_dirty;
         let rules_rebuilt = self.refresh_rules();
         // Sweep detached, unreferenced subtrees at most once a second.
         if now - self.last_gc >= 1.0 {
@@ -298,7 +333,17 @@ impl Engine {
                 self.pseudo.remove(&(n, false));
             }
         }
-        let all = dirty.all_style || rules_rebuilt || self.viewport_changed;
+        // P3 phase-1: a rebuild caused only by the media-context change (resize, DPR, dark
+        // mode) with no `@media` rules, no viewport-relative declarations and no inline
+        // viewport styles provably changes no computed style: percentages resolve at layout
+        // time, never in the cascade. Skip the restyle; layout still reruns below.
+        let viewport_neutral =
+            !self.rules.has_media_rules && !self.rules.uses_viewport_units && !self.doc.inline_viewport_units;
+        let media_only_rebuild = rules_rebuilt && !sheets_were_dirty && !dirty.all_style;
+        let mut all = dirty.all_style || rules_rebuilt || self.viewport_changed;
+        if media_only_rebuild && self.viewport_changed && viewport_neutral {
+            all = dirty.all_style;
+        }
         let mut restyled = false;
         if all || !dirty.style_roots.is_empty() || !dirty.state_roots.is_empty() {
             restyled = self.restyle(all, dirty.style_roots.clone(), dirty.state_roots.clone());
@@ -320,30 +365,70 @@ impl Engine {
             return UpdateInfo { repainted: false, animating: false, next_wake: self.next_wake() };
         }
         let relayout = restyled || dirty.layout || self.viewport_changed || self.layout_tree.is_none() || animating;
+        let vp_changed = self.viewport_changed;
         self.viewport_changed = false;
         self.force_repaint = false;
 
         if relayout {
-            let t1 = std::time::Instant::now();
-            let tree = boxtree::Builder::new(self).build_root();
-            if let Some(mut tree) = tree {
-                // The root fills the viewport width.
-                let mut s = (*tree.style).clone();
-                s.width = rendrix_css::Dim::Px(self.viewport.0);
-                tree.style = Arc::new(s);
-                self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
-                self.layout_tree = Some(tree);
-            } else {
-                self.layout_tree = None;
-                self.layout_result = LayoutResult::default();
+            let t1 = web_time::Instant::now();
+            // P1: incremental box generation. The previous frame's tree persists in
+            // `layout_tree`; dirty regions are rebuilt and spliced by NodeId while clean
+            // style-identical subtrees are reused. Falls back to `build_root` whenever the
+            // patch cannot preserve full-build semantics (then output is still identical).
+            let mut patched = false;
+            if !all && !animating {
+                if let Some(mut tree) = self.layout_tree.take() {
+                    let mut roots: Vec<NodeId> =
+                        dirty.style_roots.iter().chain(dirty.state_roots.iter()).copied().collect();
+                    roots.retain(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n));
+                    if roots.is_empty() {
+                        // No style-affecting change (e.g. a viewport-only resize whose
+                        // restyle P3 skipped): styles — hence boxes — are identical, so the
+                        // persisted tree is reused and only Taffy re-solves.
+                        patched = true;
+                    } else {
+                        patched = boxtree::patch_tree(self, &mut tree, &roots);
+                    }
+                    if patched {
+                        if vp_changed {
+                            boxtree::refresh_root_width(&mut tree, self.viewport.0);
+                        }
+                        self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
+                        self.layout_tree = Some(tree);
+                        self.apply_float_clear();
+                    }
+                    // else: `tree` may have been partially drained into the reuse pool, so it
+                    // is dropped here and the full rebuild below replaces it.
+                }
+            }
+            if !patched {
+                let tree = boxtree::Builder::new(self).build_root();
+                if let Some(mut tree) = tree {
+                    // The root fills the viewport width.
+                    let mut s = (*tree.style).clone();
+                    s.width = rendrix_css::Dim::Px(self.viewport.0);
+                    tree.style = Arc::new(s);
+                    self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
+                    self.layout_tree = Some(tree);
+                    self.apply_float_clear();
+                } else {
+                    self.layout_tree = None;
+                    self.layout_result = LayoutResult::default();
+                }
             }
             self.stats.layouts += 1;
             self.stats.last_layout_micros = t1.elapsed().as_micros() as u64;
         }
 
-        let t2 = std::time::Instant::now();
+        let t2 = web_time::Instant::now();
         self.paint();
         self.stats.last_paint_micros = t2.elapsed().as_micros() as u64;
+        {
+            let text = self.text.borrow();
+            self.stats.shape_count = text.shape_count;
+            self.stats.cache_hits = text.cache_hits;
+            self.stats.cache_len = text.cache_len();
+        }
         self.stats.frames += 1;
         UpdateInfo { repainted: true, animating, next_wake: self.next_wake() }
     }
@@ -434,6 +519,30 @@ impl Engine {
     /// Untransformed layout size and offset within the offset parent chain (offsetWidth/Height).
     pub fn layout_size(&self, id: NodeId) -> Option<(f32, f32)> {
         self.layout_result.boxes.get(&(id as u64)).map(|b| (b.width, b.height))
+    }
+
+    /// Post-layout float/clear adjustment, applied to one containing block at a time.
+    ///
+    /// Taffy lays every child in-flow; this pass pins `float: left | right` boxes to the
+    /// content edge and pushes `clear` boxes (and everything laid out after them) below the
+    /// relevant floats. Limitations (documented in COMPATIBILITY.md): floats need an explicit
+    /// width (auto-width floats size like blocks), containers do not auto-expand around
+    /// floats, floats never interact across containing blocks, and inline content does not
+    /// wrap around a float.
+    pub(crate) fn apply_float_clear(&mut self) {
+        if let Some(tree) = self.layout_tree.as_ref() {
+            apply_float_clear(tree, &mut self.layout_result);
+        }
+    }
+
+    /// Border-box and content-box sizes for `ResizeObserver` box options.
+    /// Returns `(border_w, border_h, content_w, content_h)`; `None` when the node
+    /// has no box (e.g. `display:none` or a non-element).
+    pub fn box_sizes(&self, id: NodeId) -> Option<(f32, f32, f32, f32)> {
+        let b = self.layout_result.boxes.get(&(id as u64))?;
+        let cw = (b.width - b.padding[1] - b.padding[3] - b.border[1] - b.border[3]).max(0.0);
+        let ch = (b.height - b.padding[0] - b.padding[2] - b.border[0] - b.border[2]).max(0.0);
+        Some((b.width, b.height, cw, ch))
     }
 
     /// Topmost element under a viewport point, honouring clips, transforms, z-order and `pointer-events`.
@@ -545,6 +654,7 @@ impl Engine {
             rendrix_css::Dim::Auto => "auto".to_string(),
             rendrix_css::Dim::Px(v) => px(v),
             rendrix_css::Dim::Percent(p) => format!("{p}%"),
+            rendrix_css::Dim::Calc(p, v) => format!("calc({p}% + {}px)", (v * 1000.0).round() / 1000.0),
         };
         let color = |c: Color| {
             let (r, g, b) = ((c.r * 255.0).round(), (c.g * 255.0).round(), (c.b * 255.0).round());
@@ -557,47 +667,442 @@ impl Engine {
         if let Some(v) = name.strip_prefix("--") {
             return s.custom.get(&format!("--{v}")).cloned().unwrap_or_default();
         }
+        // Compact 4-side shorthands like browsers (`margin: 10px` not `10px 10px 10px 10px`).
+        let sides = |vals: [String; 4]| {
+            let [t, r, b, l] = vals;
+            if t == r && t == b && t == l {
+                t
+            } else if t == b && r == l {
+                format!("{t} {r}")
+            } else if r == l {
+                format!("{t} {r} {b}")
+            } else {
+                format!("{t} {r} {b} {l}")
+            }
+        };
+        let display = match s.display {
+            rendrix_css::Display::None => "none",
+            rendrix_css::Display::Block => "block",
+            rendrix_css::Display::Inline => "inline",
+            rendrix_css::Display::InlineBlock => "inline-block",
+            rendrix_css::Display::Flex => "flex",
+            rendrix_css::Display::InlineFlex => "inline-flex",
+            rendrix_css::Display::Grid => "grid",
+            rendrix_css::Display::InlineGrid => "inline-grid",
+            rendrix_css::Display::Contents => "contents",
+            rendrix_css::Display::Table => "table",
+            rendrix_css::Display::InlineTable => "inline-table",
+            rendrix_css::Display::TableCaption => "table-caption",
+            rendrix_css::Display::TableColumnGroup => "table-column-group",
+            rendrix_css::Display::TableColumn => "table-column",
+            rendrix_css::Display::TableHeaderGroup => "table-header-group",
+            rendrix_css::Display::TableRowGroup => "table-row-group",
+            rendrix_css::Display::TableFooterGroup => "table-footer-group",
+            rendrix_css::Display::TableRow => "table-row",
+            rendrix_css::Display::TableCell => "table-cell",
+            rendrix_css::Display::ListItem => "list-item",
+        };
+        let position = match s.position {
+            rendrix_css::Position::Static => "static",
+            rendrix_css::Position::Relative => "relative",
+            rendrix_css::Position::Absolute => "absolute",
+            rendrix_css::Position::Fixed => "fixed",
+            rendrix_css::Position::Sticky => "sticky",
+        };
+        let overflow = |o: rendrix_css::Overflow| match o {
+            rendrix_css::Overflow::Visible => "visible",
+            rendrix_css::Overflow::Hidden => "hidden",
+            rendrix_css::Overflow::Scroll => "scroll",
+            rendrix_css::Overflow::Auto => "auto",
+            rendrix_css::Overflow::Clip => "clip",
+        };
+        let box_sizing = match s.box_sizing {
+            rendrix_css::BoxSizing::ContentBox => "content-box",
+            rendrix_css::BoxSizing::BorderBox => "border-box",
+        };
+        let visibility = match s.visibility {
+            rendrix_css::Visibility::Visible => "visible",
+            rendrix_css::Visibility::Hidden => "hidden",
+            rendrix_css::Visibility::Collapse => "collapse",
+        };
+        let cursor = match s.cursor {
+            rendrix_css::Cursor::Auto => "auto",
+            rendrix_css::Cursor::Default => "default",
+            rendrix_css::Cursor::Pointer => "pointer",
+            rendrix_css::Cursor::Text => "text",
+            rendrix_css::Cursor::Move => "move",
+            rendrix_css::Cursor::NotAllowed => "not-allowed",
+            rendrix_css::Cursor::Grab => "grab",
+            rendrix_css::Cursor::Grabbing => "grabbing",
+            rendrix_css::Cursor::Crosshair => "crosshair",
+            rendrix_css::Cursor::Wait => "wait",
+            rendrix_css::Cursor::Help => "help",
+            rendrix_css::Cursor::ColResize => "col-resize",
+            rendrix_css::Cursor::RowResize => "row-resize",
+        };
+        let pointer_events = match s.pointer_events {
+            rendrix_css::PointerEvents::Auto => "auto",
+            rendrix_css::PointerEvents::None => "none",
+        };
+        let text_align = match s.text_align {
+            rendrix_css::TextAlign::Left => "left",
+            rendrix_css::TextAlign::Right => "right",
+            rendrix_css::TextAlign::Center => "center",
+            rendrix_css::TextAlign::Justify => "justify",
+            rendrix_css::TextAlign::Start => "start",
+            rendrix_css::TextAlign::End => "end",
+        };
+        let flex_direction = match s.flex_direction {
+            rendrix_css::FlexDirection::Row => "row",
+            rendrix_css::FlexDirection::RowReverse => "row-reverse",
+            rendrix_css::FlexDirection::Column => "column",
+            rendrix_css::FlexDirection::ColumnReverse => "column-reverse",
+        };
+        let flex_wrap = match s.flex_wrap {
+            rendrix_css::FlexWrap::NoWrap => "nowrap",
+            rendrix_css::FlexWrap::Wrap => "wrap",
+            rendrix_css::FlexWrap::WrapReverse => "wrap-reverse",
+        };
+        let align = |a: rendrix_css::Align| match a {
+            rendrix_css::Align::Auto => "auto",
+            rendrix_css::Align::Normal => "normal",
+            rendrix_css::Align::Start => "start",
+            rendrix_css::Align::End => "end",
+            rendrix_css::Align::FlexStart => "flex-start",
+            rendrix_css::Align::FlexEnd => "flex-end",
+            rendrix_css::Align::Center => "center",
+            rendrix_css::Align::Stretch => "stretch",
+            rendrix_css::Align::Baseline => "baseline",
+            rendrix_css::Align::SpaceBetween => "space-between",
+            rendrix_css::Align::SpaceAround => "space-around",
+            rendrix_css::Align::SpaceEvenly => "space-evenly",
+        };
+        let font_style = match s.font_style {
+            rendrix_css::FontStyle::Normal => "normal",
+            rendrix_css::FontStyle::Italic => "italic",
+            rendrix_css::FontStyle::Oblique => "oblique",
+        };
+        let text_transform = match s.text_transform {
+            rendrix_css::TextTransform::None => "none",
+            rendrix_css::TextTransform::Uppercase => "uppercase",
+            rendrix_css::TextTransform::Lowercase => "lowercase",
+            rendrix_css::TextTransform::Capitalize => "capitalize",
+        };
+        let white_space = match s.white_space {
+            rendrix_css::WhiteSpace::Normal => "normal",
+            rendrix_css::WhiteSpace::NoWrap => "nowrap",
+            rendrix_css::WhiteSpace::Pre => "pre",
+            rendrix_css::WhiteSpace::PreWrap => "pre-wrap",
+            rendrix_css::WhiteSpace::PreLine => "pre-line",
+        };
+        let border_style = |b: rendrix_css::BorderStyle| match b {
+            rendrix_css::BorderStyle::None => "none",
+            rendrix_css::BorderStyle::Hidden => "hidden",
+            rendrix_css::BorderStyle::Solid => "solid",
+            rendrix_css::BorderStyle::Dashed => "dashed",
+            rendrix_css::BorderStyle::Dotted => "dotted",
+            rendrix_css::BorderStyle::Double => "double",
+        };
+        let object_fit = match s.object_fit {
+            rendrix_css::ObjectFit::Fill => "fill",
+            rendrix_css::ObjectFit::Contain => "contain",
+            rendrix_css::ObjectFit::Cover => "cover",
+            rendrix_css::ObjectFit::None => "none",
+            rendrix_css::ObjectFit::ScaleDown => "scale-down",
+        };
+        let user_select = match s.user_select {
+            rendrix_css::UserSelect::Auto => "auto",
+            rendrix_css::UserSelect::None => "none",
+            rendrix_css::UserSelect::Text => "text",
+            rendrix_css::UserSelect::All => "all",
+        };
+        let line_height = match s.line_height {
+            rendrix_css::LineHeight::Normal => "normal".to_string(),
+            rendrix_css::LineHeight::Number(n) => px(n * s.font_size),
+            rendrix_css::LineHeight::Px(p) => px(p),
+        };
+        let decoration_line = {
+            let mut parts = Vec::new();
+            if s.text_decoration.underline {
+                parts.push("underline");
+            }
+            if s.text_decoration.overline {
+                parts.push("overline");
+            }
+            if s.text_decoration.line_through {
+                parts.push("line-through");
+            }
+            if parts.is_empty() { "none".to_string() } else { parts.join(" ") }
+        };
         let box_size = self.layout_result.boxes.get(&(id as u64));
         match name {
-            "display" => format!("{:?}", s.display).to_lowercase().replace("inlineblock", "inline-block").replace("inlineflex", "inline-flex").replace("inlinegrid", "inline-grid"),
-            "position" => format!("{:?}", s.position).to_lowercase(),
+            "display" => display.into(),
+            "position" => position.into(),
+            "float" => match s.float {
+                rendrix_css::Float::None => "none",
+                rendrix_css::Float::Left => "left",
+                rendrix_css::Float::Right => "right",
+            }
+            .into(),
+            "clear" => match s.clear {
+                rendrix_css::Clear::None => "none",
+                rendrix_css::Clear::Left => "left",
+                rendrix_css::Clear::Right => "right",
+                rendrix_css::Clear::Both => "both",
+            }
+            .into(),
+            "column-count" => s.column_count.map(|n| n.to_string()).unwrap_or_else(|| "auto".into()),
+            "column-width" => dim(s.column_width),
+            "column-span" => {
+                if s.column_span_all {
+                    "all".into()
+                } else {
+                    "none".into()
+                }
+            }
+            "columns" => {
+                let w = if matches!(s.column_width, rendrix_css::Dim::Auto) { "auto".to_string() } else { dim(s.column_width) };
+                let n = s.column_count.map(|n| n.to_string()).unwrap_or_else(|| "auto".to_string());
+                if w == "auto" && n == "auto" {
+                    "auto".into()
+                } else if w == "auto" {
+                    n
+                } else if n == "auto" {
+                    w
+                } else {
+                    format!("{w} {n}")
+                }
+            }
+            "box-sizing" => box_sizing.into(),
             "color" => color(s.color),
             "background-color" => color(s.background_color),
+            "background" => color(s.background_color),
+            "background-image" => {
+                if s.background_images.is_empty() {
+                    "none".into()
+                } else {
+                    s.background_images
+                        .iter()
+                        .map(|img| match img {
+                            rendrix_css::BackgroundImage::Url(u) => format!("url(\"{u}\")"),
+                            rendrix_css::BackgroundImage::LinearGradient { angle, stops } => {
+                                let deg = angle * 180.0 / std::f32::consts::PI;
+                                let stops = stops
+                                    .iter()
+                                    .map(|st| {
+                                        let c = color(st.color);
+                                        match st.pos {
+                                            Some(p) => format!("{c} {}%", (p * 100.0).round()),
+                                            None => c,
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("linear-gradient({deg}deg, {stops})")
+                            }
+                            rendrix_css::BackgroundImage::RadialGradient { stops } => {
+                                let stops = stops
+                                    .iter()
+                                    .map(|st| {
+                                        let c = color(st.color);
+                                        match st.pos {
+                                            Some(p) => format!("{c} {}%", (p * 100.0).round()),
+                                            None => c,
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("radial-gradient({stops})")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            }
+            "background-repeat" => match s.background_repeat {
+                rendrix_css::BackgroundRepeat::Repeat => "repeat",
+                rendrix_css::BackgroundRepeat::NoRepeat => "no-repeat",
+                rendrix_css::BackgroundRepeat::RepeatX => "repeat-x",
+                rendrix_css::BackgroundRepeat::RepeatY => "repeat-y",
+            }
+            .into(),
+            "box-shadow" => {
+                if s.box_shadow.is_empty() {
+                    "none".into()
+                } else {
+                    s.box_shadow
+                        .iter()
+                        .map(|sh| {
+                            let mut v = format!("{} {} {} {} {}", px(sh.dx), px(sh.dy), px(sh.blur), px(sh.spread), color(sh.color));
+                            if sh.inset {
+                                v.push_str(" inset");
+                            }
+                            v
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            }
             "opacity" => format!("{}", s.opacity),
-            "visibility" => format!("{:?}", s.visibility).to_lowercase(),
+            "visibility" => visibility.into(),
             "font-size" => px(s.font_size),
             "font-weight" => s.font_weight.to_string(),
             "font-family" => s.font_family.join(", "),
-            "line-height" => match s.line_height {
-                rendrix_css::LineHeight::Normal => "normal".into(),
-                rendrix_css::LineHeight::Number(n) => px(n * s.font_size),
-                rendrix_css::LineHeight::Px(p) => px(p),
-            },
+            "font-style" => font_style.into(),
+            "line-height" => line_height.clone(),
+            "letter-spacing" => px(s.letter_spacing),
+            "word-spacing" => px(s.word_spacing),
+            "font" => {
+                let size_line = format!("{}/{}", px(s.font_size), line_height);
+                if font_style == "normal" {
+                    format!("{} {} {}", s.font_weight, size_line, s.font_family.join(", "))
+                } else {
+                    format!("{font_style} {} {} {}", s.font_weight, size_line, s.font_family.join(", "))
+                }
+            }
+            "text-align" => text_align.into(),
+            "text-decoration-line" => decoration_line.clone(),
+            "text-decoration-style" => "solid".into(),
+            "text-decoration-color" => color(s.color),
+            "text-decoration" => decoration_line.clone(),
+            "text-transform" => text_transform.into(),
+            "white-space" => white_space.into(),
+            "text-overflow" => {
+                if s.text_overflow_ellipsis { "ellipsis".into() } else { "clip".into() }
+            }
+            "text-shadow" => {
+                if s.text_shadow.is_empty() {
+                    "none".into()
+                } else {
+                    s.text_shadow
+                        .iter()
+                        .map(|sh| format!("{} {} {} {}", px(sh.dx), px(sh.dy), px(sh.blur), color(sh.color)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            }
+            "filter" => serialize_filter(&s.filter),
+            "backdrop-filter" | "-webkit-backdrop-filter" => serialize_filter(&s.backdrop_filter),
+            "clip-path" => {
+                use rendrix_css::ClipPath as CP;
+                match &s.clip_path {
+                    CP::None => "none".into(),
+                    CP::Inset { top, right, bottom, left } => format!("inset({}, {}, {}, {})", dim(*top), dim(*right), dim(*bottom), dim(*left)),
+                    CP::Circle { r, cx, cy } => format!("circle({} at {} {})", dim(*r), dim(*cx), dim(*cy)),
+                    CP::Ellipse { rx, ry, cx, cy } => format!("ellipse({} {} at {} {})", dim(*rx), dim(*ry), dim(*cx), dim(*cy)),
+                    CP::Polygon(pts) => format!("polygon({})", pts.iter().map(|(x, y)| format!("{} {}", dim(*x), dim(*y))).collect::<Vec<_>>().join(", ")),
+                }
+            }
+            "mask-image" | "-webkit-mask-image" | "mask" => s.mask_image.as_deref().map(|u| format!("url(\"{u}\")")).unwrap_or_else(|| "none".into()),
+            "caret-color" => s.caret_color.map(color).unwrap_or_else(|| "auto".into()),
+            "user-select" => user_select.into(),
+            "touch-action" => match s.touch_action { 7 => "auto".to_string(), 0 => "none".to_string(), m => [(1u8, "pan-x"), (2, "pan-y"), (4, "pinch-zoom")].iter().filter(|(b, _)| m & b != 0).map(|(_, n)| *n).collect::<Vec<_>>().join(" ") },
+            "list-style-type" => {
+                if s.list_style_none { "none".into() } else { "disc".into() }
+            }
             "width" => box_size.map(|b| px(b.width - if s.box_sizing == rendrix_css::BoxSizing::ContentBox { b.padding[1] + b.padding[3] + b.border[1] + b.border[3] } else { 0.0 })).unwrap_or_else(|| dim(s.width)),
             "height" => box_size.map(|b| px(b.height - if s.box_sizing == rendrix_css::BoxSizing::ContentBox { b.padding[0] + b.padding[2] + b.border[0] + b.border[2] } else { 0.0 })).unwrap_or_else(|| dim(s.height)),
+            "min-width" => dim(s.min_width),
+            "min-height" => dim(s.min_height),
+            "max-width" => dim(s.max_width),
+            "max-height" => dim(s.max_height),
+            "aspect-ratio" => s.aspect_ratio.map(|v| format!("{v}")).unwrap_or_else(|| "auto".into()),
+            "margin" => sides([dim(s.margin[0]), dim(s.margin[1]), dim(s.margin[2]), dim(s.margin[3])]),
             "margin-top" => dim(s.margin[0]),
             "margin-right" => dim(s.margin[1]),
             "margin-bottom" => dim(s.margin[2]),
             "margin-left" => dim(s.margin[3]),
+            "padding" => sides([dim(s.padding[0]), dim(s.padding[1]), dim(s.padding[2]), dim(s.padding[3])]),
             "padding-top" => dim(s.padding[0]),
             "padding-right" => dim(s.padding[1]),
             "padding-bottom" => dim(s.padding[2]),
             "padding-left" => dim(s.padding[3]),
+            "inset" => sides([dim(s.inset[0]), dim(s.inset[1]), dim(s.inset[2]), dim(s.inset[3])]),
             "top" => dim(s.inset[0]),
             "right" => dim(s.inset[1]),
             "bottom" => dim(s.inset[2]),
             "left" => dim(s.inset[3]),
+            "border-width" => sides([px(s.border_width[0]), px(s.border_width[1]), px(s.border_width[2]), px(s.border_width[3])]),
             "border-top-width" => px(s.border_width[0]),
             "border-right-width" => px(s.border_width[1]),
             "border-bottom-width" => px(s.border_width[2]),
             "border-left-width" => px(s.border_width[3]),
+            "border-style" => sides([
+                border_style(s.border_style[0]).to_string(),
+                border_style(s.border_style[1]).to_string(),
+                border_style(s.border_style[2]).to_string(),
+                border_style(s.border_style[3]).to_string(),
+            ]),
+            "border-top-style" => border_style(s.border_style[0]).into(),
+            "border-right-style" => border_style(s.border_style[1]).into(),
+            "border-bottom-style" => border_style(s.border_style[2]).into(),
+            "border-left-style" => border_style(s.border_style[3]).into(),
+            "border-color" => sides([color(s.border_color[0]), color(s.border_color[1]), color(s.border_color[2]), color(s.border_color[3])]),
+            "border-top-color" => color(s.border_color[0]),
+            "border-right-color" => color(s.border_color[1]),
+            "border-bottom-color" => color(s.border_color[2]),
+            "border-left-color" => color(s.border_color[3]),
+            "border" => format!(
+                "{} {} {}",
+                sides([px(s.border_width[0]), px(s.border_width[1]), px(s.border_width[2]), px(s.border_width[3])]),
+                sides([
+                    border_style(s.border_style[0]).to_string(),
+                    border_style(s.border_style[1]).to_string(),
+                    border_style(s.border_style[2]).to_string(),
+                    border_style(s.border_style[3]).to_string(),
+                ]),
+                sides([color(s.border_color[0]), color(s.border_color[1]), color(s.border_color[2]), color(s.border_color[3])]),
+            ),
+            "border-radius" => sides([dim(s.border_radius[0]), dim(s.border_radius[1]), dim(s.border_radius[2]), dim(s.border_radius[3])]),
+            "border-top-left-radius" => dim(s.border_radius[0]),
+            "border-top-right-radius" => dim(s.border_radius[1]),
+            "border-bottom-right-radius" => dim(s.border_radius[2]),
+            "border-bottom-left-radius" => dim(s.border_radius[3]),
+            "outline-width" => px(s.outline_width),
+            "outline-style" => {
+                if s.outline_width <= 0.0 { "none".into() } else { "solid".into() }
+            }
+            "outline-color" => color(s.outline_color),
+            "outline-offset" => px(s.outline_offset),
+            "outline" => format!(
+                "{} {} {}",
+                px(s.outline_width),
+                if s.outline_width <= 0.0 { "none" } else { "solid" },
+                color(s.outline_color),
+            ),
             "z-index" => s.z_index.map(|z| z.to_string()).unwrap_or_else(|| "auto".into()),
-            "overflow-x" => format!("{:?}", s.overflow_x).to_lowercase(),
-            "overflow-y" => format!("{:?}", s.overflow_y).to_lowercase(),
-            "cursor" => format!("{:?}", s.cursor).to_lowercase(),
-            "pointer-events" => format!("{:?}", s.pointer_events).to_lowercase(),
-            "text-align" => format!("{:?}", s.text_align).to_lowercase(),
-            "flex-direction" => format!("{:?}", s.flex_direction).to_lowercase(),
+            "overflow" => {
+                let x = overflow(s.overflow_x);
+                let y = overflow(s.overflow_y);
+                if x == y { x.into() } else { format!("{x} {y}") }
+            },
+            "overflow-x" => overflow(s.overflow_x).into(),
+            "overflow-y" => overflow(s.overflow_y).into(),
+            "cursor" => cursor.into(),
+            "pointer-events" => pointer_events.into(),
+            "flex-direction" => flex_direction.into(),
+            "flex-wrap" => flex_wrap.into(),
+            "flex-flow" => format!("{flex_direction} {flex_wrap}"),
+            "flex-grow" => format!("{}", s.flex_grow),
+            "flex-shrink" => format!("{}", s.flex_shrink),
+            "flex-basis" => dim(s.flex_basis),
+            "flex" => format!("{} {} {}", s.flex_grow, s.flex_shrink, dim(s.flex_basis)),
+            "order" => format!("{}", s.order),
+            "align-items" => align(s.align_items).into(),
+            "align-self" => align(s.align_self).into(),
+            "align-content" => align(s.align_content).into(),
+            "justify-content" => align(s.justify_content).into(),
+            "justify-items" => align(s.justify_items).into(),
+            "justify-self" => align(s.justify_self).into(),
+            "row-gap" => dim(s.row_gap),
+            "column-gap" => dim(s.column_gap),
+            "gap" => {
+                let r = dim(s.row_gap);
+                let c = dim(s.column_gap);
+                if r == c { r } else { format!("{r} {c}") }
+            },
+            "object-fit" => object_fit.into(),
+            "content" => s.content.clone().map(|v| format!("\"{v}\"")).unwrap_or_else(|| "normal".into()),
             "transform" => {
                 if s.transform.is_empty() {
                     "none".into()
@@ -606,9 +1111,81 @@ impl Engine {
                     format!("matrix({}, {}, {}, {}, {}, {})", m[0], m[1], m[2], m[3], m[4], m[5])
                 }
             }
+            "transform-origin" => format!("{} {}", dim(s.transform_origin.0), dim(s.transform_origin.1)),
             _ => String::new(),
         }
     }
+}
+
+/// One containing block of the float/clear post-pass; see
+/// [`Engine::apply_float_clear`].
+fn apply_float_clear(tree: &LayoutNode, out: &mut LayoutResult) {
+    use rendrix_css::{Clear, Float};
+
+    fn adjust(parent: &LayoutNode, out: &mut LayoutResult) {
+        if let Some(pbox) = out.boxes.get(&parent.id).copied() {
+            let cx = pbox.border[3] + pbox.padding[3];
+            let cw = (pbox.width - pbox.border[1] - pbox.border[3] - pbox.padding[1] - pbox.padding[3]).max(0.0);
+            let mut kids: Vec<(u64, f32, f32)> = parent
+                .children
+                .iter()
+                .filter(|c| out.boxes.contains_key(&c.id))
+                .map(|c| {
+                    let b = &out.boxes[&c.id];
+                    (c.id, b.y, b.x)
+                })
+                .collect();
+            kids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(a.2.partial_cmp(&b.2).unwrap()));
+            let mut push = 0.0f32;
+            let (mut left_bottom, mut right_bottom) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for (id, _, _) in kids {
+                let Some(st) = parent.children.iter().find(|c| c.id == id).map(|c| c.style.clone()) else { continue };
+                let Some(b) = out.boxes.get_mut(&id) else { continue };
+                b.y += push;
+                let req = match st.clear {
+                    Clear::Left => left_bottom,
+                    Clear::Right => right_bottom,
+                    Clear::Both => left_bottom.max(right_bottom),
+                    Clear::None => f32::NEG_INFINITY,
+                };
+                if b.y < req {
+                    let dy = req - b.y;
+                    b.y += dy;
+                    push += dy;
+                }
+                match st.float {
+                    Float::Left => {
+                        b.x = cx;
+                        left_bottom = left_bottom.max(b.y + b.height);
+                    }
+                    Float::Right => {
+                        b.x = cx + cw - b.width;
+                        right_bottom = right_bottom.max(b.y + b.height);
+                    }
+                    Float::None => {}
+                }
+            }
+        }
+        for c in &parent.children {
+            adjust(c, out);
+        }
+    }
+
+    adjust(tree, out);
+}
+
+fn serialize_filter(ops: &[rendrix_css::FilterOp]) -> String {
+    if ops.is_empty() {
+        return "none".into();
+    }
+    ops.iter()
+        .map(|op| match op {
+            rendrix_css::FilterOp::Blur(r) => format!("blur({}px)", (r * 1000.0).round() / 1000.0),
+            rendrix_css::FilterOp::Brightness(b) => format!("brightness({b})"),
+            rendrix_css::FilterOp::Grayscale(g) => format!("grayscale({g})"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]

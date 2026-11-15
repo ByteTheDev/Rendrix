@@ -7,6 +7,7 @@ rendrix init my-app     # new project from the `app` template
 rendrix dev             # build, open a native window, rebuild + restart on change
 rendrix build           # type-check + compile to dist/<name>.rdxapp
 rendrix run             # build and run once   (--headless --screenshot out.png --script steps.json --size WxH)
+rendrix render page.html -o out.png   # headless page render: PNG, PDF (-o out.pdf), or PNG frames (-o dir/ for /video)
 rendrix check           # type-check only
 rendrix package         # standalone executable (needs a built runtime; see below)
 rendrix doctor          # toolchain, GPU adapter and project checks

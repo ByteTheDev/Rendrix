@@ -4,6 +4,7 @@
 //! layout and drawing during paint hit the same cache, so text is shaped once per change.
 
 use cosmic_text::{Align, Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight, Wrap};
+use cosmic_text::fontdb;
 use rendrix_css::{FontStyle, TextAlign, TextTransform, WhiteSpace};
 use rendrix_layout::{InlineContent, TextMeasurer};
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,10 @@ pub struct Paragraph {
     buffer: Buffer,
     /// Byte offset in `text` where each cosmic line (split on '\n') starts.
     line_starts: Vec<usize>,
+    /// Width constraint the buffer was shaped with (`None` = unconstrained).
+    /// Paint/layout reuse a cached paragraph only for requested widths this
+    /// fits, so coarse cache keys can never produce an overflowing paragraph.
+    pub wrap: Option<f32>,
 }
 
 pub struct Raster {
@@ -54,13 +59,45 @@ struct ParaKey {
     width_bits: u32,
 }
 
+/// Paragraph cache capacity. When full the least-recently-used entry is evicted
+/// (never a full `clear()`, so a shaping storm cannot drop the whole hot set).
+pub const PARA_CACHE_CAP: usize = 2048;
+/// Width quantisation step for the paragraph cache: widths falling in the same
+/// step share one shaping. Shaping always uses the step's floor, so a cached
+/// paragraph was wrapped at a width ≤ the requested one and can never overflow
+/// it (at most it keeps one extra break near a bucket boundary).
+pub const PARA_CACHE_QUANT: f32 = 0.5;
+
+/// Quantise a layout width down to the cache grid. Non-finite/negative widths
+/// (should not happen) map to zero instead of producing garbage keys.
+fn quantize_width(w: f32) -> f32 {
+    if !w.is_finite() {
+        return 0.0;
+    }
+    ((w / PARA_CACHE_QUANT).floor() * PARA_CACHE_QUANT).max(0.0)
+}
+
+fn width_bits(q: f32) -> u32 {
+    // `q` is already a multiple of PARA_CACHE_QUANT, so this is exact for any
+    // realistic viewport width.
+    ((q / PARA_CACHE_QUANT).round() as u32).wrapping_add(1)
+}
+
+struct CacheEntry {
+    para: Rc<Paragraph>,
+    last_used: u64,
+}
+
 pub struct TextSystem {
     pub fonts: FontSystem,
     swash: SwashCache,
-    cache: HashMap<ParaKey, Rc<Paragraph>>,
+    cache: HashMap<ParaKey, CacheEntry>,
+    clock: u64,
     installed: HashSet<String>,
     /// Stats for tests/profiling.
     pub shape_count: usize,
+    /// Paragraph-cache lookups served without shaping.
+    pub cache_hits: usize,
 }
 
 impl Default for TextSystem {
@@ -92,14 +129,58 @@ fn transform_text(s: &str, t: TextTransform) -> String {
 }
 
 impl TextSystem {
+    /// Web: browsers expose no system fonts to a worker, so ship a default family (Inter, SIL OFL,
+    /// see `fonts/OFL.txt`) and map every generic family to it. Apps add their own with `@font-face`.
+    #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(include_bytes!("../fonts/Inter_400Regular.ttf").to_vec());
+        db.load_font_data(include_bytes!("../fonts/Inter_700Bold.ttf").to_vec());
+        db.set_sans_serif_family("Inter");
+        db.set_serif_family("Inter");
+        db.set_monospace_family("Inter");
+        db.set_cursive_family("Inter");
+        db.set_fantasy_family("Inter");
+        Self::from_font_system(FontSystem::new_with_locale_and_db("en-US".to_string(), db))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new() -> Self {
+        // Cold-start fast path (R1.3): rebuilding the font DB from the on-disk
+        // metadata cache skips re-scanning + re-parsing every system font
+        // (~0.75s). A miss pays the full scan once and populates the cache.
+        let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+        if let Some(db) = load_font_db_cache(&locale) {
+            return Self::from_font_system(FontSystem::new_with_locale_and_db(locale, db));
+        }
         let fonts = FontSystem::new();
+        let locale = fonts.locale().to_string();
+        save_font_db_cache(&locale, fonts.db());
+        Self::from_font_system(fonts)
+    }
+
+    fn from_font_system(fonts: FontSystem) -> Self {
         let installed = fonts
             .db()
             .faces()
             .flat_map(|f| f.families.iter().map(|(n, _)| n.to_lowercase()).collect::<Vec<_>>())
             .collect();
-        TextSystem { fonts, swash: SwashCache::new(), cache: HashMap::new(), installed, shape_count: 0 }
+        TextSystem { fonts, swash: SwashCache::new(), cache: HashMap::new(), clock: 0, installed, shape_count: 0, cache_hits: 0 }
+    }
+
+    /// Number of paragraphs currently cached.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Hit rate over `paragraph()` lookups (`hits / (hits + shapes)`).
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.shape_count;
+        if total == 0 {
+            1.0
+        } else {
+            self.cache_hits as f64 / total as f64
+        }
     }
 
     /// Register an application font (TTF/OTF bytes).
@@ -215,7 +296,7 @@ impl TextSystem {
             }
         }
         // Empty content has no height; an explicit trailing newline still occupies a line.
-        Paragraph { width: max_w, height, glyphs, segments, text, buffer, line_starts }
+        Paragraph { width: max_w, height, glyphs, segments, text, buffer, line_starts, wrap: width }
     }
 
     pub fn paragraph(&mut self, content: &InlineContent, width: Option<f32>) -> Rc<Paragraph> {
@@ -229,25 +310,44 @@ impl TextSystem {
                 }
             }
         }
-        let key = ParaKey { content: content.key(), width_bits: width.map(|w| (w * 64.0).round() as u32 + 1).unwrap_or(0) };
-        if let Some(p) = self.cache.get(&key) {
-            return p.clone();
+        // Coarse width key: resize/scroll drags sweep many nearby widths, and shaping
+        // at the bucket floor keeps every width in the bucket sharing one paragraph
+        // that provably fits (constraint ≤ requested width).
+        let qw = width.map(quantize_width);
+        let key = ParaKey { content: content.key(), width_bits: qw.map(width_bits).unwrap_or(0) };
+        if let Some(e) = self.cache.get_mut(&key) {
+            self.clock = self.clock.wrapping_add(1);
+            e.last_used = self.clock;
+            self.cache_hits += 1;
+            return e.para.clone();
         }
-        if self.cache.len() > 2048 {
-            self.cache.clear();
+        if self.cache.len() >= PARA_CACHE_CAP {
+            // Least-recently-used eviction of a single entry: the hot set survives a
+            // shaping storm instead of being dropped by a full clear.
+            if let Some(victim) = self.cache.iter().min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k) {
+                self.cache.remove(&victim);
+            }
         }
-        let p = Rc::new(self.build(content, width));
-        self.cache.insert(key, p.clone());
+        let p = Rc::new(self.build(content, qw));
+        self.clock = self.clock.wrapping_add(1);
+        self.cache.insert(key, CacheEntry { para: p.clone(), last_used: self.clock });
         p
     }
 
     /// Caret position (x, top y, height) for a byte offset into the concatenated text.
     pub fn caret(&mut self, content: &InlineContent, width: Option<f32>, byte: usize) -> (f32, f32, f32) {
         let p = self.paragraph(content, width);
+        let fallback_h = content.container.line_height.resolve(content.container.font_size);
+        self.caret_in(&p, byte, fallback_h)
+    }
+
+    /// [`caret`](Self::caret) against an already-resolved paragraph, so paint can
+    /// reuse one `paragraph()` lookup for caret + selection + hit segments instead
+    /// of re-hashing the full text per query.
+    pub fn caret_in(&self, p: &Paragraph, byte: usize, fallback_h: f32) -> (f32, f32, f32) {
         let byte = byte.min(p.text.len());
         let line = p.line_starts.iter().rposition(|s| *s <= byte).unwrap_or(0);
         let idx = byte - p.line_starts[line];
-        let fallback_h = content.container.line_height.resolve(content.container.font_size);
         let mut best: Option<(f32, f32, f32)> = None;
         for run in p.buffer.layout_runs() {
             if run.line_i != line {
@@ -263,11 +363,8 @@ impl TextSystem {
             let x = x.unwrap_or_else(|| run.glyphs.last().map(|g| g.x + g.w).unwrap_or(0.0));
             let at_end = run.glyphs.last().is_none_or(|g| idx >= g.end);
             best = Some((x, run.line_top, run.line_height));
-            if !at_end || x > 0.0 || run.glyphs.is_empty() {
-                // Keep scanning only if the index may belong to a later wrapped run of the same line.
-                if !at_end {
-                    break;
-                }
+            if !at_end {
+                break;
             }
         }
         best.unwrap_or((0.0, 0.0, fallback_h))
@@ -276,6 +373,11 @@ impl TextSystem {
     /// Byte offset nearest to a point inside the paragraph.
     pub fn hit(&mut self, content: &InlineContent, width: Option<f32>, x: f32, y: f32) -> usize {
         let p = self.paragraph(content, width);
+        self.hit_in(&p, x, y)
+    }
+
+    /// [`hit`](Self::hit) against an already-resolved paragraph.
+    pub fn hit_in(&self, p: &Paragraph, x: f32, y: f32) -> usize {
         match p.buffer.hit(x, y) {
             Some(c) => p.line_starts.get(c.line).copied().unwrap_or(0) + c.index,
             None => p.text.len(),
@@ -285,6 +387,11 @@ impl TextSystem {
     /// Selection rectangles (x, y, w, h) for the byte range, in paragraph coordinates.
     pub fn selection_rects(&mut self, content: &InlineContent, width: Option<f32>, start: usize, end: usize) -> Vec<[f32; 4]> {
         let p = self.paragraph(content, width);
+        self.selection_rects_in(&p, start, end)
+    }
+
+    /// [`selection_rects`](Self::selection_rects) against an already-resolved paragraph.
+    pub fn selection_rects_in(&self, p: &Paragraph, start: usize, end: usize) -> Vec<[f32; 4]> {
         let (start, end) = (start.min(end), start.max(end));
         let mut out = Vec::new();
         for run in p.buffer.layout_runs() {
@@ -337,6 +444,294 @@ impl TextSystem {
     }
 }
 
+// ---- Font DB disk cache (R1.3 cold start) -----------------------------------------
+//
+// `FontSystem::new()` scans and fully parses every installed system font, which
+// dominates cold start (~0.75s). The parsed metadata is small and stable, so it is
+// cached on disk keyed by (OS, arch, font-backend versions, locale). A cache hit
+// rebuilds the `fontdb::Database` via `push_face_info` without reading any font
+// file's contents; each entry is validated against its file's size + mtime, and any
+// mismatch, corruption or I/O error falls back to a full scan (never a wrong DB).
+// Binary (app-loaded) fonts are not cached: they are re-registered through
+// `load_font`, which clears the paragraph cache as before.
+//
+// Shaping stays lazy: paragraphs are shaped on first use through the paragraph
+// cache below, so offscreen paragraphs cost nothing until they are measured or
+// painted (paint additionally skips fully-clipped text before shaping; see the
+// renderer), and the font DB itself is reused across runs via this cache.
+//
+// Env overrides (tests/debugging):
+// - `RENDRIX_CACHE_DIR`: directory holding `fontdb-v1.cache`.
+// - `RENDRIX_NO_FONT_CACHE`: skip both load and save.
+
+const FONT_CACHE_MAGIC: u32 = 0x52445846; // "RDXF"
+const FONT_CACHE_VERSION: u32 = 1;
+
+/// Cache key: OS + arch + the font-backend versions that fix the serialized schema.
+/// Bump `FONT_CACHE_VERSION` (or extend this) when upgrading cosmic-text/fontdb/ttf-parser.
+fn font_cache_key() -> String {
+    format!(
+        "rendrix-fontdb-v1|{}|{}|cosmic-0.14.2|fontdb-0.16.2|ttf-lang-0.20",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+fn font_cache_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(dir) = std::env::var_os("RENDRIX_CACHE_DIR") {
+        return PathBuf::from(dir).join("fontdb-v1.cache");
+    }
+    let base: Option<PathBuf> = {
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches"))
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        }
+    };
+    base.unwrap_or_else(std::env::temp_dir).join("rendrix").join("fontdb-v1.cache")
+}
+
+fn cache_write_u16(out: &mut Vec<u8>, x: u16) {
+    out.extend_from_slice(&x.to_le_bytes());
+}
+
+fn cache_write_u32(out: &mut Vec<u8>, x: u32) {
+    out.extend_from_slice(&x.to_le_bytes());
+}
+
+fn cache_write_u64(out: &mut Vec<u8>, x: u64) {
+    out.extend_from_slice(&x.to_le_bytes());
+}
+
+fn cache_write_str(out: &mut Vec<u8>, s: &str) {
+    cache_write_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+struct CacheReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CacheReader<'a> {
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.data.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(*self.bytes(1)?.first()?)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let b: [u8; 2] = self.bytes(2)?.try_into().ok()?;
+        Some(u16::from_le_bytes(b))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let b: [u8; 4] = self.bytes(4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(b))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let b: [u8; 8] = self.bytes(8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(b))
+    }
+
+    fn str(&mut self) -> Option<String> {
+        let n = self.u32()? as usize;
+        if n > 1 << 20 {
+            return None;
+        }
+        Some(std::str::from_utf8(self.bytes(n)?).ok()?.to_string())
+    }
+}
+
+/// Map a serialized `fontdb::Language` discriminant back to the enum.
+/// fontdb 0.16.2 (ttf-parser 0.20) has 205 variants with discriminants 0..=204;
+/// the cache key pins the backend versions, so any other value means corruption.
+/// NOTE: this is the *fontdb* `Language`, not `cosmic_text::ttf_parser::Language`
+/// (different ttf-parser versions in the tree): `FaceInfo.families` needs the former.
+fn language_from_disc(d: u32) -> Option<fontdb::Language> {
+    if d <= 204 {
+        // Sound: fieldless enum with 1-byte layout, `d` is a valid discriminant
+        // in this fontdb/ttf-parser (a wrong bound fails to compile via E0512).
+        Some(unsafe { std::mem::transmute::<u8, fontdb::Language>(d as u8) })
+    } else {
+        None
+    }
+}
+
+fn width_from_number(n: u16) -> Option<fontdb::Stretch> {
+    use fontdb::Stretch as W;
+    match n {
+        1 => Some(W::UltraCondensed),
+        2 => Some(W::ExtraCondensed),
+        3 => Some(W::Condensed),
+        4 => Some(W::SemiCondensed),
+        5 => Some(W::Normal),
+        6 => Some(W::SemiExpanded),
+        7 => Some(W::Expanded),
+        8 => Some(W::ExtraExpanded),
+        9 => Some(W::UltraExpanded),
+        _ => None,
+    }
+}
+
+/// Serialize the system-font metadata of `db` to the cache path (atomic write).
+/// File-backed faces only; in-memory faces are re-registered via `load_font`.
+fn save_font_db_cache(locale: &str, db: &fontdb::Database) {
+    if std::env::var_os("RENDRIX_NO_FONT_CACHE").is_some() {
+        return;
+    }
+    let mut out = Vec::with_capacity(64 * 1024);
+    cache_write_u32(&mut out, FONT_CACHE_MAGIC);
+    cache_write_u32(&mut out, FONT_CACHE_VERSION);
+    cache_write_str(&mut out, &font_cache_key());
+    cache_write_str(&mut out, locale);
+    // Collect first so an empty DB never clobbers a good cache.
+    let mut faces: Vec<(String, &fontdb::FaceInfo)> = Vec::new();
+    for face in db.faces() {
+        if let fontdb::Source::File(path) = &face.source {
+            if let Some(s) = path.to_str() {
+                faces.push((s.to_string(), face));
+            }
+        }
+    }
+    if faces.is_empty() {
+        return;
+    }
+    cache_write_u32(&mut out, faces.len() as u32);
+    for (path_str, face) in &faces {
+        let meta = match std::fs::metadata(path_str) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let mtime = match meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
+            Some(t) => t,
+            None => return,
+        };
+        cache_write_str(&mut out, path_str);
+        cache_write_u32(&mut out, face.index);
+        cache_write_u64(&mut out, meta.len());
+        cache_write_u64(&mut out, mtime.as_secs());
+        cache_write_u32(&mut out, mtime.subsec_nanos());
+        cache_write_u32(&mut out, face.families.len() as u32);
+        for (name, lang) in &face.families {
+            cache_write_str(&mut out, name);
+            cache_write_u32(&mut out, *lang as u32);
+        }
+        cache_write_str(&mut out, &face.post_script_name);
+        cache_write_u32(&mut out, face.style as u32);
+        cache_write_u32(&mut out, face.weight.0 as u32);
+        cache_write_u16(&mut out, face.stretch.to_number());
+        out.push(face.monospaced as u8);
+    }
+    let path = font_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Atomic publish: readers never see a half-written cache.
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &out).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Rebuild a `fontdb::Database` from the cache path. `None` on any miss,
+/// corruption, font change (size/mtime) or key mismatch: the caller falls back
+/// to a full system scan.
+fn load_font_db_cache(locale: &str) -> Option<fontdb::Database> {
+    if std::env::var_os("RENDRIX_NO_FONT_CACHE").is_some() {
+        return None;
+    }
+    let data = std::fs::read(font_cache_path()).ok()?;
+    let mut r = CacheReader { data: &data, pos: 0 };
+    if r.u32()? != FONT_CACHE_MAGIC || r.u32()? != FONT_CACHE_VERSION {
+        return None;
+    }
+    if r.str()? != font_cache_key() || r.str()? != locale {
+        return None;
+    }
+    let n = r.u32()?;
+    if n == 0 || n > 100_000 {
+        return None;
+    }
+    let mut db = fontdb::Database::new();
+    // Same generic-family defaults cosmic-text installs in `FontSystem::new_with_fonts`.
+    db.set_monospace_family("Noto Sans Mono");
+    db.set_sans_serif_family("Open Sans");
+    db.set_serif_family("DejaVu Serif");
+    for _ in 0..n {
+        let path_str = r.str()?;
+        let index = r.u32()?;
+        let size = r.u64()?;
+        let sec = r.u64()?;
+        let nanos = r.u32()?;
+        let meta = std::fs::metadata(&path_str).ok()?;
+        if meta.len() != size {
+            return None;
+        }
+        let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        if mtime.as_secs() != sec || mtime.subsec_nanos() != nanos {
+            return None;
+        }
+        let nfam = r.u32()?;
+        if nfam == 0 || nfam > 64 {
+            return None;
+        }
+        let mut families = Vec::with_capacity(nfam as usize);
+        for _ in 0..nfam {
+            let name = r.str()?;
+            let lang = language_from_disc(r.u32()?)?;
+            families.push((name, lang));
+        }
+        let post_script_name = r.str()?;
+        let style = match r.u32()? {
+            0 => fontdb::Style::Normal,
+            1 => fontdb::Style::Italic,
+            2 => fontdb::Style::Oblique,
+            _ => return None,
+        };
+        let weight = fontdb::Weight(r.u32()? as u16);
+        let stretch = width_from_number(r.u16()?)?;
+        let monospaced = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        // `push_face_info` stores the pre-parsed metadata without touching the
+        // font file: this is the whole cold-start saving.
+        db.push_face_info(fontdb::FaceInfo {
+            id: fontdb::ID::dummy(),
+            source: fontdb::Source::File(path_str.into()),
+            index,
+            families,
+            post_script_name,
+            style,
+            weight,
+            stretch,
+            monospaced,
+        });
+    }
+    if r.pos != data.len() {
+        return None;
+    }
+    Some(db)
+}
+
 impl TextMeasurer for TextSystem {
     fn measure(&mut self, content: &InlineContent, max_width: Option<f32>) -> (f32, f32) {
         if content.runs.iter().all(|r| r.text.is_empty() && !r.is_break) {
@@ -359,7 +754,7 @@ mod tests {
         let mut s = ComputedStyle::default();
         s.font_size = size;
         let s = Arc::new(s);
-        InlineContent { runs: vec![InlineRun { text: text.into(), style: s.clone(), node: 1, is_break: false }], container: s }
+        InlineContent::new(vec![InlineRun { text: text.into(), style: s.clone(), node: 1, is_break: false }], s)
     }
 
     #[test]
@@ -390,6 +785,52 @@ mod tests {
         assert_eq!(t.shape_count, n);
         t.measure(&c, Some(20.0));
         assert_eq!(t.shape_count, n + 1, "a width that forces wrapping needs its own layout");
+    }
+
+    #[test]
+    fn quantized_widths_share_shaping() {
+        let mut t = TextSystem::new();
+        let c = content("hello world this wraps over several lines when the width is narrow", 16.0);
+        let (nw, _) = t.measure(&c, None);
+        assert!(nw > 160.0, "test needs wrapping content, natural width {nw}");
+        let n0 = t.shape_count;
+        let (w1, h1) = t.measure(&c, Some(150.1));
+        assert_eq!(t.shape_count, n0 + 1, "the unconstrained shape is already cached; one bucket shape");
+        let (w2, h2) = t.measure(&c, Some(150.4));
+        assert_eq!(t.shape_count, n0 + 1, "same 0.5px bucket shares the shaping");
+        assert_eq!((w1, h1), (w2, h2));
+        assert!(t.cache_hits >= 2, "bucket lookups hit: {}", t.cache_hits);
+        // Wrap-correctness: the bucket paragraph was shaped at the bucket floor, so it fits.
+        for w in [150.1f32, 150.4] {
+            let p = t.paragraph(&c, Some(w));
+            assert_eq!(p.wrap, Some(150.0));
+            assert!(p.width <= w, "shaped width {} fits requested {w}", p.width);
+            assert!(p.height > h1 * 0.99, "still wrapped");
+        }
+        t.measure(&c, Some(160.1));
+        assert_eq!(t.shape_count, n0 + 2, "a new bucket shapes once more");
+        assert!(t.hit_rate() > 0.4, "hit rate {}", t.hit_rate());
+    }
+
+    #[test]
+    fn cache_evicts_lru_instead_of_clearing() {
+        let mut t = TextSystem::new();
+        let n = PARA_CACHE_CAP + 52;
+        let mut last = content("placeholder", 16.0);
+        for i in 0..n {
+            last = content(&format!("eviction probe paragraph number {i}"), 16.0);
+            t.measure(&last, Some(200.0));
+        }
+        assert_eq!(t.cache_len(), PARA_CACHE_CAP, "cache stays capped without a full clear");
+        let shapes = t.shape_count;
+        // The most recent content is still hot: no reshaping.
+        t.measure(&last, Some(200.0));
+        assert_eq!(t.shape_count, shapes, "recent entries survive; hits={}", t.cache_hits);
+        // The earliest content was evicted long ago: reshapes instead of hitting a cleared cache.
+        let first = content("eviction probe paragraph number 0", 16.0);
+        t.measure(&first, Some(200.0));
+        assert!(t.shape_count > shapes, "evicted entries reshape on demand");
+        assert_eq!(t.cache_len(), PARA_CACHE_CAP);
     }
 
     #[test]
@@ -428,15 +869,111 @@ mod tests {
     fn hard_breaks_make_lines() {
         let mut t = TextSystem::new();
         let s = Arc::new(ComputedStyle::default());
-        let c = InlineContent {
-            runs: vec![
+        let c = InlineContent::new(
+            vec![
                 InlineRun { text: "a".into(), style: s.clone(), node: 1, is_break: false },
                 InlineRun { text: String::new(), style: s.clone(), node: 1, is_break: true },
                 InlineRun { text: "b".into(), style: s.clone(), node: 1, is_break: false },
             ],
-            container: s,
-        };
+            s,
+        );
         let (_, h) = t.measure(&c, None);
         assert!(h >= 2.0 * 16.0 * 1.1, "two lines: {h}");
+    }
+
+    /// Isolate the font-DB cache in a fresh temp dir; restores the env after.
+    /// A process-wide lock serializes the cache tests against each other because
+    /// `RENDRIX_CACHE_DIR` is process-global (other tests using `TextSystem::new`
+    /// concurrently are unaffected: they just full-scan or hit a valid cache).
+    static FONT_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn with_font_cache_dir(f: impl FnOnce()) {
+        let _guard = FONT_CACHE_LOCK.lock().unwrap();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("rendrix-fontcache-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev_dir = std::env::var_os("RENDRIX_CACHE_DIR");
+        let prev_off = std::env::var_os("RENDRIX_NO_FONT_CACHE");
+        std::env::set_var("RENDRIX_CACHE_DIR", &dir);
+        std::env::remove_var("RENDRIX_NO_FONT_CACHE");
+        f();
+        if let Some(v) = prev_dir {
+            std::env::set_var("RENDRIX_CACHE_DIR", v);
+        } else {
+            std::env::remove_var("RENDRIX_CACHE_DIR");
+        }
+        if let Some(v) = prev_off {
+            std::env::set_var("RENDRIX_NO_FONT_CACHE", v);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn font_db_cache_roundtrip_preserves_faces() {
+        with_font_cache_dir(|| {
+            let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+            // Cold: no cache file yet.
+            assert!(load_font_db_cache(&locale).is_none(), "miss on empty dir");
+            // A full scan populates the cache as a side effect.
+            let sys = TextSystem::new();
+            assert!(font_cache_path().is_file(), "scan writes the cache");
+            let db = load_font_db_cache(&locale).expect("roundtrip hit");
+            let (mut a, mut b): (Vec<_>, Vec<_>) =
+                (sys.fonts.db().faces().collect(), db.faces().collect());
+            assert_eq!(a.len(), b.len(), "no faces lost");
+            assert!(!a.is_empty(), "system has fonts");
+            // Both iterate in insertion order; spot-check the first 32 faces field by field.
+            a.truncate(32);
+            b.truncate(32);
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x.index, y.index);
+                assert_eq!(x.families, y.families);
+                assert_eq!(x.post_script_name, y.post_script_name);
+                assert_eq!(x.style, y.style);
+                assert_eq!(x.weight, y.weight);
+                assert_eq!(x.stretch, y.stretch);
+                assert_eq!(x.monospaced, y.monospaced);
+                match (&x.source, &y.source) {
+                    (fontdb::Source::File(p), fontdb::Source::File(q)) => assert_eq!(p, q),
+                    other => panic!("system faces are file-backed: {other:?}"),
+                }
+            }
+            // A cache-built system resolves the same families as a scanned one.
+            let cached = TextSystem::new();
+            assert_eq!(cached.installed, sys.installed, "same installed-family set");
+        });
+    }
+
+    #[test]
+    fn font_db_cache_rejects_garbage_and_tampering() {
+        with_font_cache_dir(|| {
+            let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+            let path = font_cache_path();
+            // Garbage bytes.
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&path, b"definitely not a font cache").unwrap();
+            assert!(load_font_db_cache(&locale).is_none(), "garbage rejected");
+            // Truncated magic.
+            std::fs::write(&path, &FONT_CACHE_MAGIC.to_le_bytes()[..2]).unwrap();
+            assert!(load_font_db_cache(&locale).is_none(), "truncation rejected");
+            // Valid cache, then tampered: wrong locale, trailing bytes, truncation.
+            let _sys = TextSystem::new();
+            assert!(load_font_db_cache(&locale).is_some());
+            assert!(load_font_db_cache("xx-OTHER-LOCALE-xx").is_none(), "locale-keyed");
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.push(0xAA);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(load_font_db_cache(&locale).is_none(), "trailing bytes rejected");
+            bytes.pop();
+            bytes.pop();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(load_font_db_cache(&locale).is_none(), "truncation rejected");
+            // Oversized family count guard.
+            assert!(language_from_disc(205).is_none(), "out-of-range language rejected");
+            assert!(language_from_disc(u32::MAX).is_none());
+            assert!(width_from_number(0).is_none() && width_from_number(10).is_none());
+        });
     }
 }

@@ -570,11 +570,237 @@ function scheduleImageEvents(img) {
   }, 0);
 }
 
+class CanvasGradient {
+  constructor(kind, p) { this._kind = kind; Object.assign(this, p); this._stops = []; }
+  addColorStop(offset, color) {
+    offset = +offset;
+    if (!Number.isFinite(offset) || offset < 0 || offset > 1) throw new DOMException('The provided float value is non-finite', 'SyntaxError');
+    this._stops.push([offset, String(color)]);
+  }
+}
+const pathFinalizer = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(pid => { try { N('canvas_path_drop', pid); } catch (_) {} })
+  : { register() {} };
+class Path2D {
+  constructor(path) {
+    if (path === undefined) this._pid = N('canvas_path_create');
+    else if (path instanceof Path2D) this._pid = mut('canvas_path_clone', path._pid);
+    else throw new DOMException('Path2D string parsing is not supported', 'NotSupportedError');
+    pathFinalizer.register(this, this._pid);
+  }
+  moveTo(x, y) { N('canvas_path_move_to', this._pid, +x, +y); }
+  lineTo(x, y) { N('canvas_path_line_to', this._pid, +x, +y); }
+  rect(x, y, w, h) { N('canvas_path_rect', this._pid, +x, +y, +w, +h); }
+  arc(x, y, r, a0, a1, ccw) { mut('canvas_path_arc', this._pid, +x, +y, +r, +a0, +a1, !!ccw); }
+  ellipse(x, y, rx, ry, rot, a0, a1, ccw) { mut('canvas_path_ellipse', this._pid, +x, +y, +rx, +ry, +rot, +a0, +a1, !!ccw); }
+  closePath() { N('canvas_path_close', this._pid); }
+}
+class CanvasRenderingContext2D {
+  constructor(canvas) {
+    Object.defineProperty(this, '_id', { value: canvas[ID] });
+    this._resetCache();
+    N('canvas_ensure', this._id);
+  }
+  _resetCache() {
+    this._fill = '#000000'; this._stroke = '#000000';
+    this._font = '10px sans-serif'; this._align = 'start'; this._baseline = 'alphabetic';
+    this._shadowColor = 'rgba(0, 0, 0, 0)'; this._shadowBlur = 0; this._shadowX = 0; this._shadowY = 0;
+    this._stack = [];
+  }
+  get canvas() { return wrap(this._id); }
+  // ----- state -----
+  save() {
+    N('canvas_save', this._id);
+    this._stack.push([this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha,
+      this._font, this._align, this._baseline, this._shadowColor, this._shadowBlur, this._shadowX, this._shadowY]);
+  }
+  restore() {
+    N('canvas_restore', this._id);
+    const s = this._stack.pop();
+    if (s) [this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha,
+      this._font, this._align, this._baseline, this._shadowColor, this._shadowBlur, this._shadowX, this._shadowY] = s;
+  }
+  // ----- transform (canvas matrix convention: x' = a*x + c*y + e) -----
+  translate(x, y) { N('canvas_transform', this._id, 1, 0, 0, 1, +x, +y); }
+  scale(x, y) { N('canvas_transform', this._id, +x, 0, 0, +(y === undefined ? x : y), 0, 0); }
+  rotate(a) { const c = Math.cos(a), s = Math.sin(a); N('canvas_transform', this._id, c, s, -s, c, 0, 0); }
+  transform(a, b, c, d, e, f) { N('canvas_transform', this._id, +a, +b, +c, +d, +e, +f); }
+  setTransform(a, b, c, d, e, f) {
+    if (a === undefined) N('canvas_set_transform', this._id, 1, 0, 0, 1, 0, 0);
+    else N('canvas_set_transform', this._id, +a, +b, +c, +d, +e, +f);
+  }
+  resetTransform() { N('canvas_set_transform', this._id, 1, 0, 0, 1, 0, 0); }
+  // ----- styles (invalid values are ignored, per spec) -----
+  _paintJSON(v) {
+    if (v instanceof CanvasGradient) {
+      if (!v._stops.length) return JSON.stringify({ color: '#000000' });
+      if (v._kind === 'radial') return JSON.stringify({ grad: { type: 'radial', x0: v._x0, y0: v._y0, r0: v._r0, x1: v._x1, y1: v._y1, r1: v._r1, stops: v._stops } });
+      if (v._kind === 'conic') return JSON.stringify({ grad: { type: 'conic', x: v._x, y: v._y, start: v._start, stops: v._stops } });
+      return JSON.stringify({ grad: { type: 'linear', x0: v._x0, y0: v._y0, x1: v._x1, y1: v._y1, stops: v._stops } });
+    }
+    return JSON.stringify({ color: String(v) });
+  }
+  get fillStyle() { return this._fill; }
+  set fillStyle(v) { try { N('canvas_set_fill', this._id, this._paintJSON(v)); this._fill = v; } catch (_) {} }
+  get strokeStyle() { return this._stroke; }
+  set strokeStyle(v) { try { N('canvas_set_stroke', this._id, this._paintJSON(v)); this._stroke = v; } catch (_) {} }
+  get lineWidth() { return this._lineWidth === undefined ? 1 : this._lineWidth; }
+  set lineWidth(v) { v = +v; if (Number.isFinite(v) && v > 0) { N('canvas_set_line_width', this._id, v); this._lineWidth = v; } }
+  get lineCap() { return this._lineCap || 'butt'; }
+  set lineCap(v) { if (['butt', 'round', 'square'].includes(v)) { N('canvas_set_line_cap', this._id, v); this._lineCap = v; } }
+  get lineJoin() { return this._lineJoin || 'miter'; }
+  set lineJoin(v) { if (['miter', 'round', 'bevel'].includes(v)) { N('canvas_set_line_join', this._id, v); this._lineJoin = v; } }
+  get globalAlpha() { return this._alpha === undefined ? 1 : this._alpha; }
+  set globalAlpha(v) { v = +v; if (Number.isFinite(v) && v >= 0 && v <= 1) { N('canvas_set_alpha', this._id, v); this._alpha = v; } }
+  // Shadows: box-blur approximation; drawImage casts no shadow (documented). Invalid values ignored.
+  get shadowColor() { return this._shadowColor; }
+  set shadowColor(v) { try { N('canvas_set_shadow_color', this._id, String(v)); this._shadowColor = String(v); } catch (_) {} }
+  get shadowBlur() { return this._shadowBlur; }
+  set shadowBlur(v) { v = +v; if (Number.isFinite(v) && v >= 0) { N('canvas_set_shadow_blur', this._id, v); this._shadowBlur = v; } }
+  get shadowOffsetX() { return this._shadowX; }
+  set shadowOffsetX(v) { v = +v; if (Number.isFinite(v)) { N('canvas_set_shadow_offset', this._id, v, this._shadowY); this._shadowX = v; } }
+  get shadowOffsetY() { return this._shadowY; }
+  set shadowOffsetY(v) { v = +v; if (Number.isFinite(v)) { N('canvas_set_shadow_offset', this._id, this._shadowX, v); this._shadowY = v; } }
+  // Only source-over compositing is supported; other modes are ignored (documented).
+  get globalCompositeOperation() { return 'source-over'; }
+  set globalCompositeOperation(_) {}
+  // ----- text (shaped through the shared TextSystem; invalid values are ignored) -----
+  get font() { return this._font; }
+  set font(v) { v = String(v); try { mut('canvas_set_font', this._id, v); this._font = v; } catch (_) {} }
+  get textAlign() { return this._align; }
+  set textAlign(v) { if (['start', 'end', 'left', 'right', 'center'].includes(v)) { N('canvas_set_text_align', this._id, v); this._align = v; } }
+  get textBaseline() { return this._baseline; }
+  set textBaseline(v) { if (['alphabetic', 'top', 'hanging', 'middle', 'ideographic', 'bottom'].includes(v)) { N('canvas_set_text_baseline', this._id, v); this._baseline = v; } }
+  fillText(text, x, y, maxWidth) {
+    if (maxWidth === undefined) N('canvas_fill_text', this._id, String(text), +x, +y);
+    else N('canvas_fill_text', this._id, String(text), +x, +y, +maxWidth);
+  }
+  strokeText(text, x, y, maxWidth) {
+    if (maxWidth === undefined) N('canvas_stroke_text', this._id, String(text), +x, +y);
+    else N('canvas_stroke_text', this._id, String(text), +x, +y, +maxWidth);
+  }
+  measureText(text) {
+    const m = JSON.parse(N('canvas_measure_text', this._id, String(text)));
+    return {
+      width: m.w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: m.w,
+      actualBoundingBoxAscent: m.a, actualBoundingBoxDescent: m.d,
+      fontBoundingBoxAscent: m.a, fontBoundingBoxDescent: m.d,
+      emHeightAscent: m.a, emHeightDescent: m.d, alphabeticBaseline: m.a,
+    };
+  }
+  // ----- paths (each of fill/stroke/clip takes an optional Path2D + fillRule) -----
+  _pathArgs(path, rule) {
+    if (path instanceof Path2D) return [path._pid, typeof rule === 'string' ? rule : ''];
+    if (typeof path === 'string') return [0, path];
+    return [0, ''];
+  }
+  beginPath() { N('canvas_begin', this._id); }
+  moveTo(x, y) { N('canvas_move_to', this._id, +x, +y); }
+  lineTo(x, y) { N('canvas_line_to', this._id, +x, +y); }
+  rect(x, y, w, h) { N('canvas_rect', this._id, +x, +y, +w, +h); }
+  arc(x, y, r, a0, a1, ccw) { mut('canvas_arc', this._id, +x, +y, +r, +a0, +a1, !!ccw); }
+  ellipse(x, y, rx, ry, rot, a0, a1, ccw) { mut('canvas_ellipse', this._id, +x, +y, +rx, +ry, +rot, +a0, +a1, !!ccw); }
+  closePath() { N('canvas_close', this._id); }
+  fill(path, rule) { const [pid, r] = this._pathArgs(path, rule); mut('canvas_fill', this._id, pid, r); }
+  stroke(path) { mut('canvas_stroke', this._id, path instanceof Path2D ? path._pid : 0); }
+  clip(path, rule) { const [pid, r] = this._pathArgs(path, rule); mut('canvas_clip', this._id, pid, r); }
+  fillRect(x, y, w, h) { N('canvas_fill_rect', this._id, +x, +y, +w, +h); }
+  strokeRect(x, y, w, h) { N('canvas_stroke_rect', this._id, +x, +y, +w, +h); }
+  clearRect(x, y, w, h) { N('canvas_clear_rect', this._id, +x, +y, +w, +h); }
+  createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient('linear', { _x0: +x0, _y0: +y0, _x1: +x1, _y1: +y1 }); }
+  createRadialGradient(x0, y0, r0, x1, y1, r1) {
+    [x0, y0, r0, x1, y1, r1] = [+x0, +y0, +r0, +x1, +y1, +r1];
+    if (r0 < 0 || r1 < 0) throw new DOMException('The radius is negative', 'IndexSizeError');
+    if (![x0, y0, r0, x1, y1, r1].every(Number.isFinite)) throw new DOMException('The provided float value is non-finite', 'SyntaxError');
+    return new CanvasGradient('radial', { _x0: x0, _y0: y0, _r0: r0, _x1: x1, _y1: y1, _r1: r1 });
+  }
+  createConicGradient(startAngle, x, y) {
+    [startAngle, x, y] = [+startAngle, +x, +y];
+    if (![startAngle, x, y].every(Number.isFinite)) throw new DOMException('The provided float value is non-finite', 'SyntaxError');
+    return new CanvasGradient('conic', { _start: startAngle, _x: x, _y: y });
+  }
+  createPattern() { throw new DOMException('Patterns are not supported', 'NotSupportedError'); }
+  // ----- images -----
+  drawImage(src, ...a) {
+    let sj, sx, sy, sw, sh, dx, dy, dw, dh;
+    if (src instanceof HTMLCanvasElement) {
+      sj = JSON.stringify({ canvas: src[ID] }); sw = src.width; sh = src.height;
+    } else if (src instanceof HTMLImageElement) {
+      const info = N('image_info', src.getAttribute('src') || '');
+      if (!info) return; // not loaded yet: paints nothing
+      sj = JSON.stringify({ img: src.getAttribute('src') }); sw = info[0]; sh = info[1];
+    } else throw new TypeError("drawImage: argument is not an image or canvas");
+    if (a.length === 2) [dx, dy] = a, [dw, dh] = [sw, sh], [sx, sy] = [0, 0];
+    else if (a.length === 4) [dx, dy, dw, dh] = a, [sx, sy] = [0, 0];
+    else if (a.length === 8) [sx, sy, sw, sh, dx, dy, dw, dh] = a;
+    else throw new TypeError(`drawImage: ${a.length + 1} arguments`);
+    if (sw <= 0 || sh <= 0 || dw === 0 || dh === 0) return;
+    mut('canvas_draw_image', this._id, sj, +sx, +sy, +sw, +sh, +dx, +dy, +dw, +dh);
+  }
+  // ----- pixels (get/put round-trip raw bytes; large rects base64-encode the whole area —
+  // prefer small rects, see the perf caveat in the A3 report) -----
+  getImageData(sx, sy, sw, sh) {
+    sw = Math.floor(sw); sh = Math.floor(sh);
+    if (sw === 0 || sh === 0) throw new DOMException('getImageData dimensions must be non-zero', 'IndexSizeError');
+    const b64 = N('canvas_get_data', this._id, Math.floor(sx), Math.floor(sy), sw, sh);
+    return new ImageData(new Uint8ClampedArray(b64ToBytes(b64).buffer), sw, sh);
+  }
+  putImageData(data, dx, dy) {
+    if (!(data instanceof ImageData)) throw new TypeError('putImageData: argument is not ImageData');
+    N('canvas_put_data', this._id, bytesToB64(data.data), data.width, data.height, Math.floor(dx), Math.floor(dy));
+  }
+  createImageData(a, b) {
+    if (a instanceof ImageData) return new ImageData(new Uint8ClampedArray(a.data), a.width, a.height);
+    const w = Math.floor(a), h = Math.floor(b);
+    if (w === 0 || h === 0) throw new DOMException('createImageData dimensions must be non-zero', 'IndexSizeError');
+    return new ImageData(w, h);
+  }
+}
+class ImageData {
+  constructor(a, b, c) {
+    if (typeof a === 'number') {
+      this.width = a; this.height = b;
+      this.data = new Uint8ClampedArray(a * b * 4);
+    } else {
+      this.data = a instanceof Uint8ClampedArray ? a : new Uint8ClampedArray(a);
+      this.width = b; this.height = c === undefined ? this.data.length / 4 / b : c;
+    }
+  }
+}
+global.CanvasRenderingContext2D = CanvasRenderingContext2D;
+global.CanvasGradient = CanvasGradient;
+global.Path2D = Path2D;
+global.ImageData = ImageData;
+
 class HTMLCanvasElement extends HTMLElement {
-  getContext() { return null; }   // Canvas 2D / WebGL are not implemented; feature-detect on null.
-  toDataURL() { throw new DOMException('Canvas rendering is not supported', 'NotSupportedError'); }
-  get width() { return parseInt(this.getAttribute('width') || '300', 10); } set width(v) { this.setAttribute('width', String(v)); }
-  get height() { return parseInt(this.getAttribute('height') || '150', 10); } set height(v) { this.setAttribute('height', String(v)); }
+  getContext(kind) {
+    kind = String(kind === undefined ? '' : kind);
+    if (kind === '2d') {
+      if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this);
+      else N('canvas_ensure', this[ID]);
+      return this._ctx2d;
+    }
+    // Minimal WebGL subset over the shared scene store (see the 3D section above).
+    if (kind === 'webgl' || kind === 'experimental-webgl') {
+      if (!this._ctxGL) this._ctxGL = new WebGLRenderingContext(this);
+      else N('canvas_ensure', this[ID]);
+      return this._ctxGL;
+    }
+    if (kind === 'webgl2') {
+      if (!this._ctxGL2) this._ctxGL2 = new WebGL2RenderingContext(this);
+      else N('canvas_ensure', this[ID]);
+      return this._ctxGL2;
+    }
+    // 'webgpu'/'bitmaprenderer': not implemented — null for feature detection.
+    return null;
+  }
+  toDataURL(type) {
+    if (type !== undefined && String(type) !== 'image/png') { /* only image/png; still returns PNG */ }
+    if (this.width === 0 || this.height === 0) return 'data:,';
+    return N('canvas_data_url', this[ID]);
+  }
+  get width() { return parseInt(this.getAttribute('width') || '300', 10); } set width(v) { this.setAttribute('width', String(v)); N('canvas_resize', this[ID]); if (this._ctx2d) this._ctx2d._resetCache(); }
+  get height() { return parseInt(this.getAttribute('height') || '150', 10); } set height(v) { this.setAttribute('height', String(v)); N('canvas_resize', this[ID]); if (this._ctx2d) this._ctx2d._resetCache(); }
 }
 class HTMLStyleElement extends HTMLElement { get sheet() { return null; } }
 class HTMLLinkElement extends HTMLElement {}
@@ -582,8 +808,251 @@ reflectStr(HTMLLinkElement.prototype, 'href'); reflectStr(HTMLLinkElement.protot
 class HTMLScriptElement extends HTMLElement {}
 reflectStr(HTMLScriptElement.prototype, 'src'); reflectStr(HTMLScriptElement.prototype, 'type');
 
+// ----- 3D scenes (v1 subset) ------------------------------------------------------------------
+// Primary API: `RendrixScene` (desc-based handles on `<canvas>`; the desc schema is shared
+// with the future GPU scene backend, so scripts never change). Aliases over the same
+// native store (`scene3d_upsert`/`scene3d_remove`/`scene3d_get`):
+//   - `Rendrix3D.createBoxScene({...})` builds a one-box desc,
+//   - `canvas.getContext('webgl'|'webgl2')` returns a minimal WebGL-subset context
+//     (clearColor/clear/enable/viewport, buffer upload for triangle soup, drawArrays).
+// `<rendrix-scene>` is a declarative host: scenes attach, round-trip and remove exactly
+// like on canvas, but compositing requires `<canvas>` in v1 (paint.rs only composites
+// `canvas` tags), so `rendrix-scene` hosts are API-valid and forward-compatible, not
+// yet visible. Unsupported GL calls warn and no-op (or return null) — never crash.
+
+const SCENE_HOST_TAGS = ['canvas', 'rendrix-scene'];
+function resolveSceneHost(t) {
+  const el = typeof t === 'string' ? document.getElementById(t) : t;
+  if (!el || !(el instanceof Element)) throw new TypeError('RendrixScene: canvas or element id expected');
+  if (!SCENE_HOST_TAGS.includes(el.localName)) throw new TypeError('RendrixScene requires a <canvas> or <rendrix-scene> element');
+  return el;
+}
+function num3(v, d) {
+  return Array.isArray(v) && v.length >= 3 && v.slice(0, 3).every(x => Number.isFinite(+x))
+    ? [+v[0], +v[1], +v[2]] : d.slice();
+}
+function scale3(v) {
+  if (Number.isFinite(+v) && +v !== 0) return [+v, +v, +v];
+  if (Array.isArray(v) && v.length >= 3 && v.slice(0, 3).every(x => Number.isFinite(+x))) return [+v[0], +v[1], +v[2]];
+  return [1, 1, 1];
+}
+function normalizeMesh(m, i) {
+  if (!m || typeof m !== 'object') throw new TypeError(`RendrixScene: mesh ${i} must be an object`);
+  const geo = m.geo && typeof m.geo === 'object' ? { ...m.geo } : {};
+  if (typeof geo.kind !== 'string' || !geo.kind) throw new DOMException(`RendrixScene: mesh ${i} needs geo.kind`, 'NotSupportedError');
+  const mat = m.material && typeof m.material === 'object' ? m.material : {};
+  const xf = m.transform && typeof m.transform === 'object' ? m.transform : {};
+  return {
+    geo,
+    material: {
+      color: mat.color === undefined ? [1, 1, 1, 1] : mat.color,
+      metal: Number.isFinite(+mat.metal) ? +mat.metal : 0,
+      rough: Number.isFinite(+mat.rough) ? +mat.rough : 0.8,
+      emissive: Number.isFinite(+mat.emissive) ? Math.min(1, Math.max(0, +mat.emissive)) : 0,
+    },
+    transform: {
+      pos: num3(xf.pos, [0, 0, 0]),
+      rotEulerDeg: num3(xf.rotEulerDeg !== undefined ? xf.rotEulerDeg : xf.rot, [0, 0, 0]),
+      scale: scale3(xf.scale),
+    },
+  };
+}
+function defaultSceneCamera() { return { fovY: 45, near: 0.1, far: 100, position: [0, 0, 5], lookAt: [0, 0, 0] }; }
+function normalizeDesc(desc) {
+  if (!desc || typeof desc !== 'object') throw new TypeError('RendrixScene: scene description must be an object');
+  const cam = desc.camera && typeof desc.camera === 'object' ? desc.camera : {};
+  const d = defaultSceneCamera();
+  return {
+    camera: {
+      fovY: Number.isFinite(+cam.fovY) ? +cam.fovY : d.fovY,
+      near: Number.isFinite(+cam.near) && +cam.near > 0 ? +cam.near : d.near,
+      far: Number.isFinite(+cam.far) ? +cam.far : d.far,
+      position: num3(cam.position, d.position),
+      lookAt: num3(cam.lookAt, d.lookAt),
+    },
+    meshes: Array.isArray(desc.meshes) ? desc.meshes.map(normalizeMesh) : [],
+    lights: Array.isArray(desc.lights) && desc.lights.length ? desc.lights : [{ dir: [0.4, 0.8, 0.6] }],
+    background: desc.background !== undefined ? desc.background : (desc.clearColor !== undefined ? desc.clearColor : [0, 0, 0, 0]),
+  };
+}
+class RendrixSceneHandle {
+  constructor(el, desc) { Object.defineProperty(this, '_el', { value: el }); this._desc = desc; }
+  get canvas() { return this._el; }
+  get desc() { return JSON.parse(JSON.stringify(this._desc)); }
+  update(desc) { this._desc = normalizeDesc(desc); mut('scene3d_upsert', this._el[ID], JSON.stringify(this._desc)); return this; }
+  setCamera(cam) {
+    const full = normalizeDesc({ camera: { ...this._desc.camera, ...(cam || {}) }, meshes: [], lights: this._desc.lights });
+    this._desc.camera = full.camera;
+    mut('scene3d_upsert', this._el[ID], JSON.stringify(this._desc));
+    return this;
+  }
+  _add(geo, opts = {}) {
+    const mesh = normalizeMesh({
+      geo,
+      material: { color: opts.color !== undefined ? opts.color : [1, 1, 1, 1], emissive: opts.emissive || 0 },
+      transform: { pos: opts.pos || opts.position || [0, 0, 0], rotEulerDeg: opts.rot || opts.rotEulerDeg || [0, 0, 0], scale: opts.scale === undefined ? 1 : opts.scale },
+    }, this._desc.meshes.length);
+    this._desc.meshes.push(mesh);
+    mut('scene3d_upsert', this._el[ID], JSON.stringify(this._desc));
+    return this._desc.meshes.length - 1;
+  }
+  addBox(opts) { return this._add({ kind: 'box', size: (opts && opts.size !== undefined) ? opts.size : 1 }, opts); }
+  addPlane(opts) { return this._add({ kind: 'plane', size: (opts && opts.size !== undefined) ? opts.size : 1 }, opts); }
+  remove() { N('scene3d_remove', this._el[ID]); }
+}
+const RendrixScene = {
+  createScene(target, desc = {}) {
+    const el = resolveSceneHost(target);
+    const full = normalizeDesc(desc);
+    mut('scene3d_upsert', el[ID], JSON.stringify(full));
+    return new RendrixSceneHandle(el, full);
+  },
+  getScene(target) {
+    const el = typeof target === 'string' ? document.getElementById(target) : target;
+    if (!el || !(el instanceof Element) || !SCENE_HOST_TAGS.includes(el.localName)) return null;
+    const raw = N('scene3d_get', el[ID]);
+    return raw === null ? null : JSON.parse(raw);
+  },
+};
+const Rendrix3D = {
+  // Convenience desc builder over the primary RendrixScene API.
+  createBoxScene({ color = [0.3, 0.6, 1, 1], fovY = 40, camPos = [0, 0, 6], size = 2, angle = [25, 30, 0] } = {}) {
+    return {
+      camera: { fovY, near: 0.1, far: 100, position: camPos.slice(), lookAt: [0, 0, 0] },
+      meshes: [{ geo: { kind: 'box', size }, material: { color: color.slice ? color.slice() : color }, transform: { pos: [0, 0, 0], rotEulerDeg: angle.slice(), scale: 1 } }],
+      lights: [{ dir: [0.4, 0.8, 0.6] }],
+      background: [0, 0, 0, 0],
+    };
+  },
+};
+class WebGLLikeContext {
+  constructor(el) {
+    Object.defineProperty(this, '_cid', { value: el[ID] });
+    this._clear = [0, 0, 0, 0];
+    this._color = [1, 1, 1, 1];
+    this._frames = [];
+    this._camera = defaultSceneCamera();
+    this._buffer = null;
+    this._depthTest = false;
+    this._viewport = null;
+    N('canvas_ensure', this._cid);
+    // Empty + transparent: the flush skips rendering, so a bare getContext probe can
+    // never wipe 2D content — the scene entry only engages the lifecycle.
+    mut('scene3d_upsert', this._cid, JSON.stringify({ camera: this._camera, meshes: [], lights: [{ dir: [0.4, 0.8, 0.6] }], background: this._clear }));
+  }
+  get canvas() { return wrap(this._cid); }
+  get drawingBufferWidth() { const c = this.canvas; return c ? c.width : 0; }
+  get drawingBufferHeight() { const c = this.canvas; return c ? c.height : 0; }
+  _push() { mut('scene3d_upsert', this._cid, JSON.stringify({ camera: this._camera, meshes: this._frames, lights: [{ dir: [0.4, 0.8, 0.6] }], background: this._clear })); }
+  clearColor(r, g, b, a) { this._clear = [+r || 0, +g || 0, +b || 0, a === undefined ? 1 : +a]; }
+  clear(mask) {
+    mask = +mask || 0;
+    const known = WebGLLikeContext.COLOR_BUFFER_BIT | WebGLLikeContext.DEPTH_BUFFER_BIT;
+    if (mask & ~known) console.warn(`[webgl] clear: unsupported mask bits 0x${(mask & ~known).toString(16)} ignored`);
+    if (mask & WebGLLikeContext.COLOR_BUFFER_BIT) { this._frames = []; this._push(); }
+  }
+  enable(cap) {
+    if (cap === WebGLLikeContext.DEPTH_TEST) this._depthTest = true;
+    else console.warn(`[webgl] enable: capability ${cap} is not supported (ignored)`);
+  }
+  disable(cap) {
+    if (cap === WebGLLikeContext.DEPTH_TEST) this._depthTest = false;
+    else console.warn(`[webgl] disable: capability ${cap} is not supported (ignored)`);
+  }
+  viewport(x, y, w, h) { this._viewport = [+x || 0, +y || 0, +w || 0, +h || 0]; }
+  createBuffer() { return { _buf: null }; }
+  bindBuffer(target, buf) {
+    if (target !== WebGLLikeContext.ARRAY_BUFFER) { console.warn(`[webgl] bindBuffer: target ${target} is not supported (ignored)`); return; }
+    this._bound = buf || null;
+  }
+  bufferData(target, data, usage) {
+    if (target !== WebGLLikeContext.ARRAY_BUFFER) { console.warn(`[webgl] bufferData: target ${target} is not supported (ignored)`); return; }
+    let arr = null;
+    if (ArrayBuffer.isView(data)) arr = Float32Array.from(data, Number);
+    else if (data instanceof ArrayBuffer) arr = new Float32Array(data);
+    else if (Array.isArray(data)) arr = new Float32Array(data.map(Number));
+    else { console.warn('[webgl] bufferData: data must be an ArrayBufferView, ArrayBuffer or array (ignored)'); return; }
+    this._buffer = arr;
+  }
+  createShader() { return { _shader: true }; }
+  shaderSource() {} compileShader() {}
+  getShaderParameter() { return true; }
+  createProgram() { return { _prog: true }; }
+  attachShader() {} linkProgram() {} useProgram() {}
+  getProgramParameter() { return true; }
+  getAttribLocation() { return { _attrib: 0 }; }
+  getUniformLocation() { return { _uniform: 0 }; }
+  vertexAttribPointer() {} enableVertexAttribArray() {} disableVertexAttribArray() {}
+  vertexAttrib1f() {} vertexAttrib2f() {} vertexAttrib3f() {} vertexAttrib4f() {}
+  uniform1f() {} uniform1i() {} uniform2f() {} uniform3f() {}
+  uniform4f(loc, r, g, b, a) { this._color = [+r || 0, +g || 0, +b || 0, a === undefined ? 1 : +a]; }
+  uniform4fv(loc, v) { const a = Array.from(v || []); this.uniform4f(loc, a[0], a[1], a[2], a[3]); }
+  drawArrays(mode, first, count) {
+    if (mode !== WebGLLikeContext.TRIANGLES) { console.warn(`[webgl] drawArrays: mode ${mode} is not supported (only TRIANGLES)`); return; }
+    first = Math.max(0, Math.floor(+first) || 0); count = Math.max(0, Math.floor(+count) || 0);
+    const src = this._buffer;
+    if (!src || (first + count) * 3 > src.length || count % 3 !== 0) { console.warn('[webgl] drawArrays: no buffer data for the requested range (call bufferData first)'); return; }
+    this._frames.push({
+      geo: { kind: 'tris', verts: Array.from(src.slice(first * 3, (first + count) * 3)) },
+      material: { color: this._color.slice() },
+      transform: { pos: [0, 0, 0], rotEulerDeg: [0, 0, 0], scale: 1 },
+    });
+    this._push();
+  }
+  drawElements() { console.warn('[webgl] drawElements is not supported in Rendrix (use drawArrays)'); }
+  getParameter(p) {
+    const C = WebGLLikeContext;
+    if (p === C.VERSION) return 'WebGL 1.0 (Rendrix software rasterizer)';
+    if (p === C.RENDERER) return 'Rendrix';
+    if (p === C.VENDOR) return 'Rendrix';
+    if (p === C.COLOR_CLEAR_VALUE) return this._clear.slice();
+    if (p === C.VIEWPORT) return this._viewport || [0, 0, this.drawingBufferWidth, this.drawingBufferHeight];
+    if (p === C.DEPTH_TEST) return this._depthTest;
+    console.warn(`[webgl] getParameter: parameter ${p} is not supported (null)`);
+    return null;
+  }
+  getError() { return WebGLLikeContext.NO_ERROR; }
+  isContextLost() { return false; }
+  getContextAttributes() { return { alpha: true, depth: false, stencil: false, antialias: false, premultipliedAlpha: true, preserveDrawingBuffer: false }; }
+  getExtension() { return null; }
+  getSupportedExtensions() { return []; }
+  flush() {} finish() {}
+}
+WebGLLikeContext.DEPTH_TEST = 0x0B71; WebGLLikeContext.COLOR_BUFFER_BIT = 0x4000; WebGLLikeContext.DEPTH_BUFFER_BIT = 0x0100;
+WebGLLikeContext.TRIANGLES = 0x0004; WebGLLikeContext.ARRAY_BUFFER = 0x8892; WebGLLikeContext.ELEMENT_ARRAY_BUFFER = 0x8893;
+WebGLLikeContext.STATIC_DRAW = 0x88E4; WebGLLikeContext.DYNAMIC_DRAW = 0x88E8; WebGLLikeContext.STREAM_DRAW = 0x88E0;
+WebGLLikeContext.FLOAT = 0x1406; WebGLLikeContext.VERTEX_SHADER = 0x8B31; WebGLLikeContext.FRAGMENT_SHADER = 0x8B30;
+WebGLLikeContext.COMPILE_STATUS = 0x8B81; WebGLLikeContext.LINK_STATUS = 0x8B82;
+WebGLLikeContext.NO_ERROR = 0; WebGLLikeContext.VERSION = 0x1F02; WebGLLikeContext.VENDOR = 0x1F00; WebGLLikeContext.RENDERER = 0x1F01;
+WebGLLikeContext.VIEWPORT = 0x0BA2; WebGLLikeContext.COLOR_CLEAR_VALUE = 0x0C22;
+for (const name of ['createTexture', 'bindTexture', 'texImage2D', 'texSubImage2D', 'texParameteri', 'generateMipmap',
+    'createFramebuffer', 'bindFramebuffer', 'framebufferTexture2D', 'checkFramebufferStatus',
+    'createRenderbuffer', 'bindRenderbuffer', 'renderbufferStorage',
+    'blendFunc', 'depthFunc', 'depthMask', 'clearDepth', 'cullFace', 'frontFace', 'scissor', 'polygonOffset']) {
+  WebGLLikeContext.prototype[name] = function () { console.warn(`[webgl] ${name} is not supported in Rendrix (ignored)`); return null; };
+}
+// Browser-faithful access: constants work on the context object too (`gl.TRIANGLES`).
+for (const k of Object.getOwnPropertyNames(WebGLLikeContext)) {
+  if (typeof WebGLLikeContext[k] === 'number') WebGLLikeContext.prototype[k] = WebGLLikeContext[k];
+}
+class WebGL2RenderingContext extends WebGLLikeContext {}
+// Alias kept for feature-detection code that names the 1.0 type.
+class WebGLRenderingContext extends WebGLLikeContext {}
+class RendrixSceneElement extends HTMLElement {
+  getContext(kind) {
+    kind = String(kind === undefined ? '' : kind);
+    if (kind === 'webgl' || kind === 'experimental-webgl' || kind === 'webgl2') {
+      if (!this._ctx3d) this._ctx3d = new WebGLLikeContext(this);
+      return this._ctx3d;
+    }
+    return null;
+  }
+  get width() { return parseInt(this.getAttribute('width') || '300', 10); } set width(v) { this.setAttribute('width', String(v)); }
+  get height() { return parseInt(this.getAttribute('height') || '150', 10); } set height(v) { this.setAttribute('height', String(v)); }
+}
+
 const SPECIAL = { input: HTMLInputElement, textarea: HTMLTextAreaElement, select: HTMLSelectElement, option: HTMLOptionElement, button: HTMLButtonElement, form: HTMLFormElement,
-  a: HTMLAnchorElement, label: HTMLLabelElement, img: HTMLImageElement, canvas: HTMLCanvasElement, style: HTMLStyleElement, link: HTMLLinkElement, script: HTMLScriptElement };
+  a: HTMLAnchorElement, label: HTMLLabelElement, img: HTMLImageElement, canvas: HTMLCanvasElement, 'rendrix-scene': RendrixSceneElement, style: HTMLStyleElement, link: HTMLLinkElement, script: HTMLScriptElement };
 function elementClass(tag) { return SPECIAL[tag] || tagClasses.get(tag) || HTMLElement; }
 
 // ----- Document -------------------------------------------------------------------------------
