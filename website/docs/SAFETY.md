@@ -19,15 +19,18 @@ bundle trailer/format validation, and build-time rejection of Node built-ins and
 
 ## What is not enforced
 
-* No memory or CPU limit on script execution: an infinite loop freezes the window (QuickJS memory cap is
-  1 GiB, stack 2 MiB).
+* The execution budget is a liveness guard, not a sandbox: native QuickJS interrupts a task after 5 s and
+  reports it as an error, and memory is capped at 1 GiB with a 2 MiB stack. Workers are separate JS
+  contexts but run in the same process. On the experimental wasm target there is no execution-budget
+  interrupt, so a runaway script hangs the worker (the page stays alive).
 * QuickJS and native crates are not hardened against malicious inputs; treat untrusted images, fonts and
   HTML as a risk.
 * Scripts can read the whole bundle and their own `localStorage` (a plain JSON file in the user data
-  directory). Nothing is encrypted.
-* A bundle appended to an executable is not signed or integrity-checked by the runtime. Code signing is not
-  implemented.
-* `crypto.getRandomValues` uses the OS CSPRNG, but `crypto.subtle` does not exist.
+  directory, in-memory only on the web target). Nothing is encrypted.
+* A bundle appended to an executable is not integrity-checked by the runtime. Signing helpers are wired
+  (`rendrix package --sign`, `--manifest`, `--manifest-key`, `--publish-url`, `--installer nsis`), but
+  packages are unsigned by default and no signed macOS/Linux install has been run or recorded.
+* `crypto.getRandomValues` uses the OS CSPRNG. `crypto.subtle.digest` (SHA-1/256/384/512) is available; the rest of `SubtleCrypto` does not exist.
 
 ## Reporting
 

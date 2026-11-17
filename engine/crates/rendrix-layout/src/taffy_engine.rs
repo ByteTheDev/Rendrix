@@ -3,7 +3,7 @@
 use crate::{BoxLayout, InlineContent, LayoutEngine, LayoutKind, LayoutNode, LayoutResult, TextMeasurer};
 use rendrix_css as css;
 use rendrix_css::{Dim, TrackItem, TrackSize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use taffy::prelude::*;
 use taffy::geometry::Point;
@@ -18,6 +18,12 @@ enum Ctx {
 struct Cached {
     node: NodeId,
     style: Style,
+    /// The exact source `ComputedStyle` `Arc` that produced `style`. Kept alive so
+    /// `Arc::ptr_eq` is a stable, O(1) "this subtree's input is unchanged" test: the restyle
+    /// pass retains the old `Arc` whenever computed style is unchanged, and allocates a new
+    /// one on any change (see `style::restyle_subtree`). Clean subtree detection uses this
+    /// instead of re-converting every node with `to_taffy` each frame.
+    source_style: Arc<css::ComputedStyle>,
     kind_sig: u64,
     children: Vec<u64>,
     seen: bool,
@@ -29,6 +35,10 @@ pub struct TaffyEngine {
     /// Statistics from the last layout, for tests and profiling.
     pub last_new_nodes: usize,
     pub last_restyled_nodes: usize,
+    /// Number of nodes that actually went through `sync` (i.e. `to_taffy` was called) during
+    /// the last layout. With a dirty hint this is only the changed nodes plus their ancestors;
+    /// clean subtrees are skipped. Used by tests to prove sync is dirty-aware.
+    pub last_synced_nodes: usize,
 }
 
 impl Default for TaffyEngine {
@@ -39,16 +49,107 @@ impl Default for TaffyEngine {
 
 impl TaffyEngine {
     pub fn new() -> Self {
-        TaffyEngine { tree: TaffyTree::new(), nodes: HashMap::new(), last_new_nodes: 0, last_restyled_nodes: 0 }
+        TaffyEngine {
+            tree: TaffyTree::new(),
+            nodes: HashMap::new(),
+            last_new_nodes: 0,
+            last_restyled_nodes: 0,
+            last_synced_nodes: 0,
+        }
     }
 
-    fn sync(&mut self, n: &LayoutNode, parent_areas: Option<&Vec<Vec<String>>>, stats: &mut (usize, usize), tmp: &mut Vec<NodeId>) -> NodeId {
+    /// O(1) signature of a node's [`LayoutKind`]. Text nodes include the memoized
+    /// inline-content key, so a text edit always changes the signature and re-syncs that node.
+    fn kind_signature(kind: &LayoutKind) -> u64 {
+        match kind {
+            LayoutKind::Box => 0,
+            LayoutKind::Text(c) => c.key() | 1,
+            LayoutKind::Replaced { width, height } => (width.to_bits() as u64) << 32 | height.to_bits() as u64 | 2,
+        }
+    }
+
+    /// Expand a dirty set to include every ancestor up to the root. A top-down `sync` must not
+    /// skip a subtree that contains a dirty node, otherwise a deep mutation would never be
+    /// reached (its clean ancestors would short-circuit first). Uses the *box* tree — not the
+    /// DOM tree — so generated/anonymous boxes in between are covered too. `|=` is deliberate:
+    /// every child must be visited so all affected ancestors get inserted.
+    fn mark_affected(n: &LayoutNode, dirty: &HashSet<u64>, affected: &mut HashSet<u64>) -> bool {
+        let mut hit = dirty.contains(&n.id);
+        for c in &n.children {
+            hit |= Self::mark_affected(c, dirty, affected);
+        }
+        if hit {
+            affected.insert(n.id);
+        }
+        hit
+    }
+
+    /// Mark an entire cached subtree as seen without recursing into the live box tree. Used when
+    /// a clean subtree is skipped, so stale-node removal does not drop its still-valid Taffy nodes.
+    fn mark_seen_subtree(nodes: &mut HashMap<u64, Cached>, root: u64, stack: &mut Vec<u64>) {
+        stack.clear();
+        stack.push(root);
+        while let Some(id) = stack.pop() {
+            if let Some(c) = nodes.get_mut(&id) {
+                if c.seen {
+                    continue;
+                }
+                c.seen = true;
+                stack.extend(c.children.iter().copied());
+            }
+        }
+    }
+
+    fn sync(
+        &mut self,
+        n: &LayoutNode,
+        parent_areas: Option<&Vec<Vec<String>>>,
+        stats: &mut (usize, usize),
+        tmp: &mut Vec<NodeId>,
+        mark: &mut Vec<u64>,
+        dirty: Option<&HashSet<u64>>,
+        affected: &HashSet<u64>,
+        force: bool,
+    ) -> NodeId {
+        // Dirty-aware fast path. A whole subtree can reuse its cached Taffy node when
+        //   (a) sync-by-hint is enabled (`dirty` is Some) and no changed node lives in the
+        //       subtree (`!affected.contains`) — `affected` includes every ancestor of a dirty
+        //       node, so this is exact;
+        //   (b) the parent did not force a re-sync (e.g. its grid-template-areas changed);
+        //   (c) the child id list, the source style Arc and the kind signature all still match.
+        // The Arc check is the correctness backstop: restyle keeps the old Arc for unchanged
+        // computed styles and allocates a fresh one on any change, so a stale Arc can never hide
+        // a real change even if the dirty hint is incomplete (e.g. `:nth-child` sibling effects).
+        if !force && dirty.is_some() && !affected.contains(&n.id) {
+            if let Some(c) = self.nodes.get(&n.id) {
+                let same_children = c.children.len() == n.children.len()
+                    && c.children.iter().zip(n.children.iter()).all(|(a, b)| *a == b.id);
+                if same_children && Arc::ptr_eq(&c.source_style, &n.style) && c.kind_sig == Self::kind_signature(&n.kind) {
+                    let node = c.node;
+                    Self::mark_seen_subtree(&mut self.nodes, n.id, mark);
+                    return node;
+                }
+            }
+        }
+
+        self.last_synced_nodes += 1;
         let style = to_taffy(&n.style, &n.kind, parent_areas);
-        let (kind_sig, ctx) = match &n.kind {
-            LayoutKind::Box => (0, None),
-            LayoutKind::Text(c) => (c.key() | 1, Some(Ctx::Text(c.clone()))),
-            LayoutKind::Replaced { width, height } => ((width.to_bits() as u64) << 32 | height.to_bits() as u64 | 2, Some(Ctx::Replaced(*width, *height))),
+        let kind_sig = Self::kind_signature(&n.kind);
+        let ctx = match &n.kind {
+            LayoutKind::Box => None,
+            LayoutKind::Text(c) => Some(Ctx::Text(c.clone())),
+            LayoutKind::Replaced { width, height } => Some(Ctx::Replaced(*width, *height)),
         };
+        let (changed_style, changed_kind) = match self.nodes.get(&n.id) {
+            Some(c) => (c.style != style, c.kind_sig != kind_sig),
+            None => (true, true),
+        };
+        // A dirty node (or one whose own style/kind actually changed) must re-sync its whole
+        // subtree: the patch may have rebuilt descendants, and a child's resolved grid-area
+        // placement depends on its parent's template areas. Skipping here would be unsafe, so
+        // we fall back to the full path for the subtree instead of skipping clean descendants.
+        let force_children = force || dirty.is_some_and(|d| d.contains(&n.id)) || changed_style || changed_kind;
+
         // Children first (post-order) so ids exist. Child ids accumulate in the scratch
         // buffer (P5: one reused allocation per layout instead of two vecs per node);
         // `set_children`/`new_with_children` only borrow the slice during the call.
@@ -56,7 +157,7 @@ impl TaffyEngine {
         // This node's areas are the containing-block areas for its children.
         let my_areas = if n.style.grid_template_areas.is_empty() { None } else { Some(&n.style.grid_template_areas) };
         for c in &n.children {
-            let id = self.sync(c, my_areas, stats, tmp);
+            let id = self.sync(c, my_areas, stats, tmp, mark, dirty, affected, force_children);
             tmp.push(id);
         }
 
@@ -67,6 +168,7 @@ impl TaffyEngine {
                 c.style = style;
                 stats.1 += 1;
             }
+            c.source_style = n.style.clone();
             if c.kind_sig != kind_sig {
                 match ctx {
                     Some(ctx) => self.tree.set_node_context(c.node, Some(ctx)).unwrap(),
@@ -95,24 +197,56 @@ impl TaffyEngine {
             };
             self.nodes.insert(
                 n.id,
-                Cached { node, style, kind_sig, children: n.children.iter().map(|c| c.id).collect(), seen: true },
+                Cached {
+                    node,
+                    style,
+                    source_style: n.style.clone(),
+                    kind_sig,
+                    children: n.children.iter().map(|c| c.id).collect(),
+                    seen: true,
+                },
             );
             tmp.truncate(base);
             stats.0 += 1;
             node
         }
     }
-}
 
-impl LayoutEngine for TaffyEngine {
-    fn layout(&mut self, root: &LayoutNode, viewport: (f32, f32), measurer: &mut dyn TextMeasurer) -> LayoutResult {
+    /// Shared implementation for [`LayoutEngine::layout`] (no dirty hint → full sync) and
+    /// [`LayoutEngine::layout_with_dirty`] (skip clean subtrees).
+    fn layout_impl(
+        &mut self,
+        root: &LayoutNode,
+        viewport: (f32, f32),
+        measurer: &mut dyn TextMeasurer,
+        dirty: Option<&HashSet<u64>>,
+        out: &mut LayoutResult,
+    ) {
+        self.last_new_nodes = 0;
+        self.last_restyled_nodes = 0;
+        self.last_synced_nodes = 0;
+
+        // An empty hint means "no information" (e.g. a viewport-only resize where restyle was
+        // skipped). Treat it as no hint so the root is never skipped — skipping the root would
+        // prevent us from ever reaching a changed descendant via the Arc backstop below.
+        let dirty = dirty.filter(|d| !d.is_empty());
+        // Expand dirty box ids to every ancestor so `sync` can always reach a changed node.
+        let mut affected = HashSet::new();
+        if let Some(d) = dirty {
+            Self::mark_affected(root, d, &mut affected);
+        }
+        // If none of the hinted ids exist in this tree, the hint is unusable — never skip the
+        // root in that case, or a real change elsewhere could go unnoticed.
+        let dirty = if affected.is_empty() { None } else { dirty };
+
         for c in self.nodes.values_mut() {
             c.seen = false;
         }
         let mut stats = (0usize, 0usize);
         let mut tmp = Vec::new();
-        let root_node = self.sync(root, None, &mut stats, &mut tmp);
-        // Drop nodes that disappeared.
+        let mut mark = Vec::new();
+        let root_node = self.sync(root, None, &mut stats, &mut tmp, &mut mark, dirty, &affected, false);
+        // Drop nodes that disappeared. Skipped subtrees were marked seen above, so they survive.
         let stale: Vec<u64> = self.nodes.iter().filter(|(_, c)| !c.seen).map(|(k, _)| *k).collect();
         for k in stale {
             if let Some(c) = self.nodes.remove(&k) {
@@ -122,18 +256,32 @@ impl LayoutEngine for TaffyEngine {
 
         let avail = Size { width: AvailableSpace::Definite(viewport.0), height: AvailableSpace::Definite(viewport.1) };
         compute_with_measure(&mut self.tree, root_node, avail, measurer);
-        let mut out = LayoutResult::default();
-        collect(&self.tree, root, &self.nodes, &mut out);
+        if dirty.is_some() {
+            // Use the ancestor-expanded set: a changed box can move its siblings (flex/grid)
+            // and shift its ancestors, so every ancestor must re-collect its whole subtree.
+            // Still mutates the caller's map in place, so no fresh ~9000-entry map is allocated.
+            refresh_boxes_in_place(&self.tree, root, &self.nodes, Some(&affected), out);
+        } else {
+            // No hint (bench, calc fallback, viewport-only change): a full collect is the
+            // only provably correct answer. Reuse the caller's allocation.
+            out.boxes.clear();
+            collect(&self.tree, root, &self.nodes, out);
+        }
 
         // Mixed calc(): the first pass approximated Calc as its percent part to obtain
         // containing-block sizes; resolve to px and lay out again for exact geometry.
         if has_calc_in_tree(root) {
             let resolved = resolve_tree_calcs(root, viewport.0, viewport.1, &out.boxes);
+            // The resolved tree has fresh style Arcs, so the dirty hint no longer applies.
             for c in self.nodes.values_mut() {
                 c.seen = false;
             }
             let mut tmp2 = Vec::new();
-            let root_node2 = self.sync(&resolved, None, &mut stats, &mut tmp2);
+            let mut mark2 = Vec::new();
+            // The resolved tree has fresh style Arcs and grid contexts on every node, so the
+            // dirty hint is meaningless for it: fall back to a forced, full second sync pass.
+            let empty = HashSet::new();
+            let root_node2 = self.sync(&resolved, None, &mut stats, &mut tmp2, &mut mark2, None, &empty, true);
             let stale2: Vec<u64> = self.nodes.iter().filter(|(_, c)| !c.seen).map(|(k, _)| *k).collect();
             for k in stale2 {
                 if let Some(c) = self.nodes.remove(&k) {
@@ -141,35 +289,168 @@ impl LayoutEngine for TaffyEngine {
                 }
             }
             compute_with_measure(&mut self.tree, root_node2, avail, measurer);
-            let mut out2 = LayoutResult::default();
-            collect(&self.tree, &resolved, &self.nodes, &mut out2);
-            out = out2;
+            // Geometry changed tree-wide: always do a full collect for the second pass.
+            out.boxes.clear();
+            collect(&self.tree, &resolved, &self.nodes, out);
         }
 
         self.last_new_nodes = stats.0;
         self.last_restyled_nodes = stats.1;
+    }
+}
+
+impl TaffyEngine {
+    /// Like [`LayoutEngine::layout`], but carries forward the geometry of unchanged nodes
+    /// from `prev` instead of re-reading Taffy for every box.
+    ///
+    /// `dirty` names the ids whose geometry may have changed (a dirty node re-collects its
+    /// whole subtree). New ids and ids missing from `prev` are always re-collected; ids in
+    /// `prev` but absent from `root` drop out. `None` for either arg degrades to a full
+    /// collect. Dirty-aware sync still applies: clean subtrees are never re-converted.
+    pub fn layout_incremental(
+        &mut self,
+        root: &LayoutNode,
+        viewport: (f32, f32),
+        measurer: &mut dyn TextMeasurer,
+        prev: Option<&LayoutResult>,
+        dirty: Option<&HashSet<u64>>,
+    ) -> LayoutResult {
+        let mut out = match prev {
+            Some(p) => LayoutResult { boxes: p.boxes.clone() },
+            None => LayoutResult::default(),
+        };
+        self.layout_impl(root, viewport, measurer, dirty, &mut out);
+        out
+    }
+
+    /// Allocation-saving variant used by the engine: rebuilds `result.boxes` in place so a
+    /// clean frame does not allocate a fresh ~9000-entry `HashMap`.
+    pub fn layout_incremental_in_place(
+        &mut self,
+        root: &LayoutNode,
+        viewport: (f32, f32),
+        measurer: &mut dyn TextMeasurer,
+        result: &mut LayoutResult,
+        dirty: Option<&HashSet<u64>>,
+    ) {
+        self.layout_impl(root, viewport, measurer, dirty, result);
+    }
+}
+
+impl LayoutEngine for TaffyEngine {
+    fn layout(&mut self, root: &LayoutNode, viewport: (f32, f32), measurer: &mut dyn TextMeasurer) -> LayoutResult {
+        // No dirty hint (benches, direct callers, calc fallback): sync the full tree so behavior
+        // is byte-for-byte identical to the pre-dirty-aware implementation.
+        let mut out = LayoutResult::default();
+        self.layout_impl(root, viewport, measurer, None, &mut out);
+        out
+    }
+
+    fn layout_with_dirty(
+        &mut self,
+        root: &LayoutNode,
+        viewport: (f32, f32),
+        measurer: &mut dyn TextMeasurer,
+        dirty: &HashSet<u64>,
+    ) -> LayoutResult {
+        let mut out = LayoutResult::default();
+        self.layout_impl(root, viewport, measurer, Some(dirty), &mut out);
         out
     }
 }
 
+/// Full-collect wrapper retained for callers that have no previous result.
 fn collect(tree: &TaffyTree<Ctx>, n: &LayoutNode, nodes: &HashMap<u64, Cached>, out: &mut LayoutResult) {
-    let l = tree.layout(nodes[&n.id].node).unwrap();
-    out.boxes.insert(
-        n.id,
-        BoxLayout {
-            x: l.location.x,
-            y: l.location.y,
-            width: l.size.width,
-            height: l.size.height,
-            content_width: l.content_size.width.max(l.size.width - l.border.left - l.border.right),
-            content_height: l.content_size.height.max(l.size.height - l.border.top - l.border.bottom),
-            border: [l.border.top, l.border.right, l.border.bottom, l.border.left],
-            padding: [l.padding.top, l.padding.right, l.padding.bottom, l.padding.left],
-        },
-    );
-    for c in &n.children {
-        collect(tree, c, nodes, out);
+    collect_incremental(tree, n, nodes, None, None, out, false);
+}
+
+/// Incrementally collect geometry for the tree rooted at `n`.
+///
+/// `dirty` names ids whose Taffy layout may have changed: a dirty node and all its
+/// descendants are re-read from Taffy; every other node carries its `BoxLayout` forward
+/// from `prev` when available. New nodes (absent from `prev`) are always re-collected.
+/// `None` for `dirty` or `prev` degrades to a full collect.
+fn collect_incremental(
+    tree: &TaffyTree<Ctx>,
+    n: &LayoutNode,
+    nodes: &HashMap<u64, Cached>,
+    dirty: Option<&HashSet<u64>>,
+    prev: Option<&LayoutResult>,
+    out: &mut LayoutResult,
+    ancestor_dirty: bool,
+) {
+    let node_dirty = ancestor_dirty || dirty.map_or(true, |d| d.contains(&n.id));
+    match prev.filter(|_| !node_dirty).and_then(|p| p.boxes.get(&n.id)) {
+        Some(carried) => {
+            // Geometry provably unchanged: keep the exact previous BoxLayout.
+            out.boxes.insert(n.id, *carried);
+        }
+        None => {
+            let l = tree.layout(nodes[&n.id].node).unwrap();
+            out.boxes.insert(
+                n.id,
+                BoxLayout {
+                    x: l.location.x,
+                    y: l.location.y,
+                    width: l.size.width,
+                    height: l.size.height,
+                    content_width: l.content_size.width.max(l.size.width - l.border.left - l.border.right),
+                    content_height: l.content_size.height.max(l.size.height - l.border.top - l.border.bottom),
+                    border: [l.border.top, l.border.right, l.border.bottom, l.border.left],
+                    padding: [l.padding.top, l.padding.right, l.padding.bottom, l.padding.left],
+                },
+            );
+        }
     }
+    for c in &n.children {
+        collect_incremental(tree, c, nodes, dirty, prev, out, node_dirty);
+    }
+}
+
+/// In-place counterpart: updates `result.boxes` without allocating a new map. `live`
+/// accumulates ids present in the current tree so removed nodes can be dropped afterwards.
+fn collect_incremental_in_place(
+    tree: &TaffyTree<Ctx>,
+    n: &LayoutNode,
+    nodes: &HashMap<u64, Cached>,
+    dirty: Option<&HashSet<u64>>,
+    result: &mut LayoutResult,
+    live: &mut HashSet<u64>,
+    ancestor_dirty: bool,
+) {
+    let node_dirty = ancestor_dirty || dirty.map_or(true, |d| d.contains(&n.id));
+    live.insert(n.id);
+    if node_dirty || !result.boxes.contains_key(&n.id) {
+        let l = tree.layout(nodes[&n.id].node).unwrap();
+        result.boxes.insert(
+            n.id,
+            BoxLayout {
+                x: l.location.x,
+                y: l.location.y,
+                width: l.size.width,
+                height: l.size.height,
+                content_width: l.content_size.width.max(l.size.width - l.border.left - l.border.right),
+                content_height: l.content_size.height.max(l.size.height - l.border.top - l.border.bottom),
+                border: [l.border.top, l.border.right, l.border.bottom, l.border.left],
+                padding: [l.padding.top, l.padding.right, l.padding.bottom, l.padding.left],
+            },
+        );
+    }
+    for c in &n.children {
+        collect_incremental_in_place(tree, c, nodes, dirty, result, live, node_dirty);
+    }
+}
+
+fn refresh_boxes_in_place(
+    tree: &TaffyTree<Ctx>,
+    root: &LayoutNode,
+    nodes: &HashMap<u64, Cached>,
+    dirty: Option<&HashSet<u64>>,
+    result: &mut LayoutResult,
+) {
+    let mut live = HashSet::with_capacity(result.boxes.len());
+    collect_incremental_in_place(tree, root, nodes, dirty, result, &mut live, false);
+    result.boxes.retain(|id, _| live.contains(id));
 }
 
 fn compute_with_measure(tree: &mut TaffyTree<Ctx>, root_node: NodeId, avail: Size<AvailableSpace>, measurer: &mut dyn TextMeasurer) {
@@ -760,4 +1041,322 @@ mod tests {
         cell.display = css::Display::TableCell;
         assert_eq!(to_taffy(&cell, &LayoutKind::Box, None).display, Display::Block, "cells are grid items");
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Dirty-aware sync (the #1 residual cost called out in PERFORMANCE_AUDIT.md)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn dirty_aware_sync_skips_clean_subtrees() {
+        // Reuse the same Arc for every unchanged node, exactly as the real restyle pass does
+        // (`style.rs` keeps the old Arc when computed style is unchanged). Only node 3 gets a
+        // fresh Arc, so the cached-Arc check can tell it apart from the clean siblings.
+        let s1 = style(&[("display", "flex")]);
+        let s2 = style(&[("width", "10px")]);
+        let s4 = style(&[("width", "30px")]);
+        let build = |s3: Arc<ComputedStyle>| LayoutNode {
+            id: 1,
+            style: s1.clone(),
+            kind: LayoutKind::Box,
+            children: vec![
+                LayoutNode { id: 2, style: s2.clone(), kind: LayoutKind::Box, children: vec![] },
+                LayoutNode { id: 3, style: s3, kind: LayoutKind::Box, children: vec![] },
+                LayoutNode { id: 4, style: s4.clone(), kind: LayoutKind::Box, children: vec![] },
+            ],
+        };
+        let mut e = TaffyEngine::new();
+        e.layout(&build(style(&[("width", "10px")])), (800.0, 600.0), &mut FixedText);
+        assert_eq!(e.last_synced_nodes, 4, "first layout has no cache and syncs every node");
+
+        let mut dirty = HashSet::new();
+        dirty.insert(3u64);
+        let r = e.layout_with_dirty(&build(style(&[("width", "20px")])), (800.0, 600.0), &mut FixedText, &dirty);
+        // The changed node (3) and its ancestor (1, needed to reach it) are re-synced; clean
+        // siblings 2 and 4 (and their subtrees) are skipped without calling `to_taffy`.
+        assert_eq!(e.last_synced_nodes, 2, "clean siblings must not be re-synced");
+        assert_eq!((e.last_new_nodes, e.last_restyled_nodes), (0, 1));
+        assert_eq!(r.boxes[&3].width, 20.0);
+        assert_eq!(e.nodes.len(), 4, "skipped subtrees survive stale-node removal");
+    }
+
+    #[test]
+    fn dirty_aware_sync_recalcs_children_when_parent_grid_areas_change() {
+        // A child's resolved grid placement depends on its parent's grid-template-areas. Only
+        // the parent is dirty here, so the child must be force-re-synced even though its own
+        // style Arc is unchanged — otherwise its placement would be stale.
+        let child = LayoutNode {
+            id: 2,
+            style: style(&[("grid-area", "a"), ("height", "10px")]),
+            kind: LayoutKind::Box,
+            children: vec![],
+        };
+        let build = |areas: &str| LayoutNode {
+            id: 1,
+            style: style(&[
+                ("display", "grid"),
+                ("width", "300px"),
+                ("grid-template-columns", "100px 200px"),
+                ("grid-template-rows", "50px"),
+                ("grid-template-areas", areas),
+            ]),
+            kind: LayoutKind::Box,
+            children: vec![child.clone()],
+        };
+        let mut e = TaffyEngine::new();
+        let r = e.layout(&build("\"a b\""), (800.0, 600.0), &mut FixedText);
+        assert!((r.boxes[&2].x - 0.0).abs() < 0.6, "area 'a' starts in column 0: {:?}", r.boxes[&2]);
+
+        let mut dirty = HashSet::new();
+        dirty.insert(1u64); // only the grid container changed
+        let r = e.layout_with_dirty(&build("\"b a\""), (800.0, 600.0), &mut FixedText, &dirty);
+        assert!((r.boxes[&2].x - 100.0).abs() < 0.6, "area 'a' moved to column 1: {:?}", r.boxes[&2]);
+    }
+
+    #[test]
+    fn empty_dirty_hint_falls_back_to_full_sync() {
+        // An empty hint carries no information, so nothing may be skipped — the root included.
+        // Both the root and the child are reused Arcs; only the child's style changes, and we
+        // deliberately pass no dirty ids to prove the engine cannot skip the root and miss it.
+        let s1 = style(&[("width", "100px")]);
+        let build = |s2: Arc<ComputedStyle>| LayoutNode {
+            id: 1,
+            style: s1.clone(),
+            kind: LayoutKind::Box,
+            children: vec![LayoutNode { id: 2, style: s2, kind: LayoutKind::Box, children: vec![] }],
+        };
+        let mut e = TaffyEngine::new();
+        e.layout(&build(style(&[("width", "10px")])), (800.0, 600.0), &mut FixedText);
+        assert_eq!(e.last_synced_nodes, 2);
+        let dirty = HashSet::new();
+        let r = e.layout_with_dirty(&build(style(&[("width", "20px")])), (800.0, 600.0), &mut FixedText, &dirty);
+        assert_eq!(e.last_synced_nodes, 2, "empty hint must not skip the root");
+        assert_eq!(r.boxes[&2].width, 20.0);
+    }
+    // -----------------------------------------------------------------------------------------
+    // Incremental collection
+    // -----------------------------------------------------------------------------------------
+
+    fn result_of(r: &LayoutResult) -> LayoutResult {
+        LayoutResult { boxes: r.boxes.clone() }
+    }
+
+    #[test]
+    fn incremental_collect_matches_full_collect() {
+        let root = node(
+            1,
+            &[("width", "300px")],
+            vec![node(2, &[("height", "10px")], vec![]), node(3, &[("height", "10px")], vec![]), node(4, &[("height", "10px")], vec![])],
+        );
+        let mut e = TaffyEngine::new();
+        e.layout(&root, (800.0, 600.0), &mut FixedText);
+
+        let mut full = LayoutResult::default();
+        collect(&e.tree, &root, &e.nodes, &mut full);
+        let mut inc = LayoutResult::default();
+        collect_incremental(&e.tree, &root, &e.nodes, None, None, &mut inc, false);
+        assert_eq!(full.boxes, inc.boxes, "no prev / no dirty must degrade to a full collect");
+
+        let empty_dirty = HashSet::new();
+        let mut inc2 = LayoutResult::default();
+        collect_incremental(&e.tree, &root, &e.nodes, Some(&empty_dirty), Some(&result_of(&full)), &mut inc2, false);
+        assert_eq!(full.boxes, inc2.boxes, "empty dirty set carries forward every clean box");
+    }
+
+    #[test]
+    fn incremental_collect_reuses_clean_boxes() {
+        let root = node(
+            1,
+            &[("width", "100px")],
+            vec![node(2, &[("height", "10px")], vec![]), node(3, &[("height", "10px")], vec![])],
+        );
+        let mut e = TaffyEngine::new();
+        let full = e.layout(&root, (800.0, 600.0), &mut FixedText);
+
+        let mut prev = result_of(&full);
+        // A value no Taffy read could produce: if it survives, the BoxLayout was carried
+        // forward rather than re-collected (identity proof for Copy data).
+        let mut sentinel = prev.boxes[&2];
+        sentinel.x = 9876.5;
+        prev.boxes.insert(2, sentinel);
+
+        let mut dirty = HashSet::new();
+        dirty.insert(3u64);
+        let mut inc = LayoutResult::default();
+        collect_incremental(&e.tree, &root, &e.nodes, Some(&dirty), Some(&prev), &mut inc, false);
+
+        assert_eq!(inc.boxes[&2].x, 9876.5, "clean node must keep the exact previous BoxLayout");
+        assert_eq!(inc.boxes[&3], full.boxes[&3], "dirty node must be re-collected from Taffy");
+        assert_eq!(inc.boxes[&1], full.boxes[&1], "non-dirty ancestor is carried forward");
+    }
+
+    #[test]
+    fn incremental_collect_matches_full_after_style_change() {
+        let build = |w: &str| {
+            node(
+                1,
+                &[("width", "100px")],
+                vec![node(2, &[("height", "10px")], vec![]), node(3, &[("height", "10px"), ("width", w)], vec![])],
+            )
+        };
+        let initial = build("10px");
+        let final_tree = build("20px");
+        let mut e = TaffyEngine::new();
+        let first = e.layout(&initial, (800.0, 600.0), &mut FixedText);
+        let prev = result_of(&first);
+        let expected = e.layout(&final_tree, (800.0, 600.0), &mut FixedText);
+
+        let mut dirty = HashSet::new();
+        dirty.insert(3u64);
+        let mut inc = LayoutResult::default();
+        collect_incremental(&e.tree, &final_tree, &e.nodes, Some(&dirty), Some(&prev), &mut inc, false);
+        assert_eq!(inc.boxes, expected.boxes);
+    }
+
+    #[test]
+    fn incremental_collect_requires_conservative_dirty_set_for_siblings() {
+        // A width change on one flex item moves its siblings' x. The caller must include
+        // the flex container in `dirty` (a dirty re-collects its whole subtree), otherwise
+        // the carried-forward siblings would keep stale geometry.
+        let build = |w: &str| {
+            node(
+                1,
+                &[("display", "flex"), ("width", "300px"), ("height", "100px")],
+                vec![node(2, &[("width", w)], vec![]), node(3, &[("width", "50px")], vec![])],
+            )
+        };
+        let initial = build("50px");
+        let final_tree = build("100px");
+        let mut e = TaffyEngine::new();
+        let first = e.layout(&initial, (800.0, 600.0), &mut FixedText);
+        let prev = result_of(&first);
+        let expected = e.layout(&final_tree, (800.0, 600.0), &mut FixedText);
+        assert_ne!(expected.boxes[&3].x, first.boxes[&3].x, "clean sibling x really moves");
+
+        let mut dirty = HashSet::new();
+        dirty.insert(1u64); // flex container → whole subtree re-collected
+        dirty.insert(2u64);
+        let mut inc = LayoutResult::default();
+        collect_incremental(&e.tree, &final_tree, &e.nodes, Some(&dirty), Some(&prev), &mut inc, false);
+        assert_eq!(inc.boxes, expected.boxes);
+    }
+
+    #[test]
+    fn incremental_collect_matches_full_after_add_remove() {
+        let kid = |id, h| node(id, &[("height", h)], vec![]);
+        let build = |kids: Vec<LayoutNode>| node(1, &[("width", "100px")], kids);
+        let initial = build(vec![kid(2, "10px"), kid(3, "20px")]);
+        let final_tree = build(vec![kid(2, "10px"), kid(4, "30px")]); // remove 3, add 4
+        let mut e = TaffyEngine::new();
+        let first = e.layout(&initial, (800.0, 600.0), &mut FixedText);
+        let prev = result_of(&first);
+        let expected = e.layout(&final_tree, (800.0, 600.0), &mut FixedText);
+
+        let mut dirty = HashSet::new();
+        dirty.insert(1u64); // parent's children changed → parent + descendants re-collected
+        dirty.insert(4u64); // brand new node (also re-collected because it is absent from `prev`)
+        let mut inc = LayoutResult::default();
+        collect_incremental(&e.tree, &final_tree, &e.nodes, Some(&dirty), Some(&prev), &mut inc, false);
+        assert_eq!(inc.boxes, expected.boxes);
+        assert!(!inc.boxes.contains_key(&3), "removed node must not appear in the result");
+    }
+
+    #[test]
+    fn layout_incremental_matches_layout_with_and_without_prev() {
+        let root = node(
+            1,
+            &[("width", "300px"), ("height", "100px")],
+            vec![node(2, &[("height", "20px")], vec![]), node(3, &[("height", "20px")], vec![])],
+        );
+        let full = TaffyEngine::new().layout(&root, (800.0, 600.0), &mut FixedText);
+
+        let inc = TaffyEngine::new().layout_incremental(&root, (800.0, 600.0), &mut FixedText, None, None);
+        assert_eq!(inc.boxes, full.boxes, "no prev / no dirty must match the regular layout path");
+
+        let mut e = TaffyEngine::new();
+        let warm = e.layout(&root, (800.0, 600.0), &mut FixedText);
+        let prev = result_of(&warm);
+        let empty_dirty = HashSet::new();
+        let inc2 = e.layout_incremental(&root, (800.0, 600.0), &mut FixedText, Some(&prev), Some(&empty_dirty));
+        assert_eq!(inc2.boxes, full.boxes);
+    }
+
+    #[test]
+    fn layout_incremental_matches_layout_after_mutation() {
+        let build = |w| {
+            node(
+                1,
+                &[("width", "100px")],
+                vec![node(2, &[("height", "10px")], vec![]), node(3, &[("height", "10px"), ("width", w)], vec![])],
+            )
+        };
+        let initial = build("10px");
+        let final_tree = build("20px");
+
+        let mut reference = TaffyEngine::new();
+        reference.layout(&initial, (800.0, 600.0), &mut FixedText);
+        let expected = reference.layout(&final_tree, (800.0, 600.0), &mut FixedText);
+
+        let mut e = TaffyEngine::new();
+        let warm = e.layout(&initial, (800.0, 600.0), &mut FixedText);
+        let prev = result_of(&warm);
+        let mut dirty = HashSet::new();
+        dirty.insert(3u64);
+        let got = e.layout_incremental(&final_tree, (800.0, 600.0), &mut FixedText, Some(&prev), Some(&dirty));
+        assert_eq!(got.boxes, expected.boxes);
+    }
+
+    #[test]
+    fn layout_incremental_in_place_matches_layout() {
+        let build = |w| {
+            node(
+                1,
+                &[("width", "100px")],
+                vec![node(2, &[("height", "10px")], vec![]), node(3, &[("height", "10px"), ("width", w)], vec![])],
+            )
+        };
+        let initial = build("10px");
+        let final_tree = build("20px");
+
+        let mut reference = TaffyEngine::new();
+        reference.layout(&initial, (800.0, 600.0), &mut FixedText);
+        let expected = reference.layout(&final_tree, (800.0, 600.0), &mut FixedText);
+
+        let mut e = TaffyEngine::new();
+        let mut result = e.layout(&initial, (800.0, 600.0), &mut FixedText);
+        let mut dirty = HashSet::new();
+        dirty.insert(3u64);
+        e.layout_incremental_in_place(&final_tree, (800.0, 600.0), &mut FixedText, &mut result, Some(&dirty));
+        assert_eq!(result.boxes, expected.boxes);
+
+        // A clean second pass leaves the map untouched (and does not allocate a new one).
+        let snapshot = result.boxes.clone();
+        let empty = HashSet::new();
+        e.layout_incremental_in_place(&final_tree, (800.0, 600.0), &mut FixedText, &mut result, Some(&empty));
+        assert_eq!(result.boxes, snapshot);
+
+        // Nodes removed from the tree are dropped from the reused map.
+        let shorter = node(1, &[("width", "100px")], vec![node(2, &[("height", "10px")], vec![])]);
+        let mut dirty2 = HashSet::new();
+        dirty2.insert(1u64);
+        e.layout_incremental_in_place(&shorter, (800.0, 600.0), &mut FixedText, &mut result, Some(&dirty2));
+        assert!(!result.boxes.contains_key(&3));
+    }
+
+    #[test]
+    fn layout_incremental_matches_layout_with_calc() {
+        let root = node(
+            1,
+            &[("width", "400px")],
+            vec![node(2, &[("width", "calc(100% - 20px)"), ("height", "10px")], vec![])],
+        );
+        let full = TaffyEngine::new().layout(&root, (800.0, 600.0), &mut FixedText);
+
+        let mut e = TaffyEngine::new();
+        let warm = e.layout(&root, (800.0, 600.0), &mut FixedText);
+        let prev = result_of(&warm);
+        let empty_dirty = HashSet::new();
+        let inc = e.layout_incremental(&root, (800.0, 600.0), &mut FixedText, Some(&prev), Some(&empty_dirty));
+        assert_eq!(inc.boxes, full.boxes, "calc trees re-collect fully in the second pass");
+    }
 }
+

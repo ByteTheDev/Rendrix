@@ -1,10 +1,10 @@
 //! v1 forward 3D pass: Blinn-Phong with one directional + ambient light.
 //!
-//! One uniform buffer carries a per-scene frame block (view-projection, camera,
-//! lights) followed by a per-mesh block (model + normal matrix, material). The CPU
-//! rewrites the whole buffer per mesh — scenes are small in v1, so no dynamic
-//! offsets or descriptor churn. Deferred: shadow maps, PBR texture sampling,
-//! transparent sorting (output is opaque).
+//! Two uniform buffers carry per-scene frame blocks (view-projection, camera,
+//! lights) and per-mesh blocks (model + normal matrix, material). Each draw selects
+//! its own aligned slot through dynamic uniform offsets, so one bind group and one
+//! encoder serve every scene/mesh in the frame. Deferred: shadow maps, PBR texture
+//! sampling, transparent sorting (output is opaque).
 
 struct Frame {
     view_proj: mat4x4<f32>,

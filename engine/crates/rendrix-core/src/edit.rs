@@ -15,6 +15,8 @@ pub enum EditOp {
     Home { shift: bool },
     End { shift: bool },
     SelectAll,
+    Undo,
+    Redo,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -63,6 +65,22 @@ impl Engine {
     /// Apply an editing operation to a text control. The caller dispatches `input`/`change` events
     /// when `value_changed` is set.
     pub fn edit(&mut self, id: NodeId, op: EditOp) -> EditResult {
+        // Undo/redo restore a prior snapshot without pushing new history.
+        if matches!(op, EditOp::Undo | EditOp::Redo) {
+            let (from, to) = if matches!(op, EditOp::Undo) { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
+            let Some(stack) = from.get_mut(&id) else { return EditResult::default() };
+            let Some((v, a, b)) = stack.pop() else { return EditResult::default() };
+            let cur = self.doc.value(id);
+            let f = &self.doc.element(id).map(|e| (e.form.selection_start, e.form.selection_end)).unwrap_or((0, 0));
+            to.entry(id).or_default().push((cur, f.0, f.1));
+            if to.get(&id).map(|s| s.len()).unwrap_or(0) > 50 {
+                if let Some(s) = to.get_mut(&id) { s.remove(0); }
+            }
+            self.doc.set_form_value(id, &v);
+            self.doc.set_selection(id, a, b);
+            self.reset_caret();
+            return EditResult { value_changed: true, selection_changed: true };
+        }
         let Some(el) = self.doc.element(id) else { return EditResult::default() };
         let multiline = el.tag == "textarea";
         let readonly = self.doc.has_attr(id, "readonly") || self.doc.has_attr(id, "disabled");
@@ -161,6 +179,13 @@ impl Engine {
 
         let value_changed = new_value.is_some();
         if let Some(v) = new_value {
+            // Push pre-change snapshot for undo; any new edit clears the redo stack.
+            let stack = self.undo.entry(id).or_default();
+            if stack.last().map(|(pv, pa, pb)| pv != &value || pa != &a || pb != &b).unwrap_or(true) {
+                stack.push((value.clone(), a, b));
+                if stack.len() > 50 { stack.remove(0); }
+            }
+            self.redo.remove(&id);
             self.doc.set_form_value(id, &v);
         }
         let selection_changed = (na, nb) != (a, b);

@@ -5,7 +5,7 @@ use crate::color::Color;
 use crate::style::*;
 use crate::values::*;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StyleContext {
     pub viewport_w: f32,
     pub viewport_h: f32,
@@ -14,11 +14,21 @@ pub struct StyleContext {
     pub safe_area: [f32; 4],
     /// `env(keyboard-inset-height)` in CSS px: the on-screen keyboard overlapping the viewport.
     pub keyboard_h: f32,
+    /// Sizes of query containers from the last layout, keyed by element id. Populated by
+    /// `rendrix-core` before restyle; empty in isolated CSS tests.
+    pub container_sizes: std::sync::Arc<std::collections::HashMap<u64, (String, f32, f32)>>,
 }
 
 impl Default for StyleContext {
     fn default() -> Self {
-        StyleContext { viewport_w: 800.0, viewport_h: 600.0, root_font_size: 16.0, safe_area: [0.0; 4], keyboard_h: 0.0 }
+        StyleContext {
+            viewport_w: 800.0,
+            viewport_h: 600.0,
+            root_font_size: 16.0,
+            safe_area: [0.0; 4],
+            keyboard_h: 0.0,
+            container_sizes: std::sync::Arc::new(std::collections::HashMap::new()),
+        }
     }
 }
 
@@ -167,6 +177,11 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) -> bo
         "text-decoration" | "text-decoration-line" => cp!(text_decoration),
         "text-transform" => cp!(text_transform),
         "white-space" => cp!(white_space),
+        "word-break" => cp!(word_break),
+        "-webkit-line-clamp" | "line-clamp" => cp!(line_clamp),
+        "container-type" => cp!(container_type),
+        "container-name" => cp!(container_name),
+        "container" => cp!(container_name, container_type),
         "text-overflow" => cp!(text_overflow_ellipsis),
         "text-shadow" => cp!(text_shadow),
         "filter" => cp!(filter),
@@ -754,6 +769,31 @@ fn apply_inner(
         }
         "text-transform" => st.text_transform = TextTransform::parse(v)?,
         "white-space" => st.white_space = WhiteSpace::parse(v)?,
+        "word-break" => st.word_break = WordBreak::parse(v)?,
+        "container-type" => st.container_type = ContainerType::parse(v)?,
+        "container-name" => {
+            let n = v.trim().trim_matches(|c| c == '"' || c == '\'');
+            st.container_name = if n.eq_ignore_ascii_case("none") || n.is_empty() { None } else { Some(n.to_string()) };
+        }
+        "container" => {
+            // Split the shorthand on whitespace; first token may be the name, the rest the type.
+            let mut type_found = false;
+            for tok in v.split_whitespace() {
+                if let Some(t) = ContainerType::parse(tok) {
+                    st.container_type = t;
+                    type_found = true;
+                } else {
+                    let n = tok.trim_matches(|c| c == '"' || c == '\'');
+                    if !n.is_empty() && !n.eq_ignore_ascii_case("none") {
+                        st.container_name = Some(n.to_string());
+                    }
+                }
+            }
+            let _ = type_found;
+        }
+        "-webkit-line-clamp" | "line-clamp" => {
+            st.line_clamp = if v.trim().eq_ignore_ascii_case("none") { None } else { v.trim().parse::<u32>().ok() };
+        }
         "list-style" | "list-style-type" => st.list_style_none = v.split_whitespace().any(|t| t.eq_ignore_ascii_case("none")),
         "text-overflow" => st.text_overflow_ellipsis = matches!(v.to_ascii_lowercase().as_str(), "ellipsis"),
         "text-shadow" => st.text_shadow = parse_text_shadows(v, st.color, cx)?,
@@ -1527,6 +1567,20 @@ mod tests {
             apply_declaration(&mut st, &parent, n, v, &sc);
         }
         st
+    }
+
+    #[test]
+    fn word_break_and_line_clamp_parse() {
+        assert_eq!(apply(&[("word-break", "normal")]).word_break, WordBreak::Normal);
+        assert_eq!(apply(&[("word-break", "break-all")]).word_break, WordBreak::BreakAll);
+        assert_eq!(apply(&[("word-break", "keep-all")]).word_break, WordBreak::KeepAll);
+        // Inherited from parent.
+        let parent = ComputedStyle { word_break: WordBreak::BreakAll, ..ComputedStyle::default() };
+        let mut st = ComputedStyle::inherit_from(&parent);
+        apply_declaration(&mut st, &parent, "font-size", "20px", &StyleContext::default());
+        assert_eq!(st.word_break, WordBreak::BreakAll);
+        assert_eq!(apply(&[("-webkit-line-clamp", "3")]).line_clamp, Some(3));
+        assert_eq!(apply(&[("-webkit-line-clamp", "none")]).line_clamp, None);
     }
 
     #[test]

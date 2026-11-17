@@ -473,6 +473,22 @@ fn local_and_session_storage() {
 }
 
 #[test]
+fn document_cookie_syncs_with_the_session_jar_and_honours_expiry() {
+    let mut r = rt("");
+    run(&mut r, "globalThis.r1 = [navigator.cookieEnabled, document.cookie];
+      document.cookie = 'a=1'; document.cookie = 'b=two; Path=/';
+      globalThis.r2 = [document.cookie, document.cookie];
+      document.cookie = 'a=gone; Max-Age=0';
+      globalThis.r3 = document.cookie;
+      document.cookie = 'old=x; Expires=Wed, 21 Oct 2015 07:28:00 GMT';
+      globalThis.r4 = document.cookie;");
+    assert_eq!(s(&mut r, "r1"), r#"[true,""]"#);
+    assert_eq!(s(&mut r, "r2"), r#"["a=1; b=two","a=1; b=two"]"#);
+    assert_eq!(s(&mut r, "r3"), "b=two");
+    assert_eq!(s(&mut r, "r4"), "b=two");
+}
+
+#[test]
 fn mutation_observer_delivers_batched_records() {
     let mut r = rt("<div id=root><p id=p>x</p></div>");
     run(
@@ -690,8 +706,61 @@ fn unsupported_apis_are_honestly_absent_or_throw() {
         s(&mut r, "typeof document.getElementById('c').getContext('2d')"),
         "object"
     );
-    run(&mut r, "globalThis.e = (() => { try { document.body.attachShadow({}); } catch (e) { return e.name; } })();");
-    assert_eq!(s(&mut r, "e"), "NotSupportedError");
+    run(&mut r, "globalThis.e = (() => { try { const s = document.body.attachShadow({ mode: 'open' }); return s && s.host === document.body && document.body.shadowRoot === s ? 'attached' : 'bad-root'; } catch (e) { return e.name; } })();");
+    assert_eq!(s(&mut r, "e"), "attached");
+    run(&mut r, "globalThis.e2 = (() => { try { document.body.attachShadow({ mode: 'open' }); return 'second-ok'; } catch (e) { return e.name; } })();");
+    assert_eq!(s(&mut r, "e2"), "NotSupportedError");
+}
+
+#[test]
+fn form_validation_reflects_constraints_and_invalid_events() {
+    let mut r = rt(
+        "<form id=f><input id=req required value=''><input id=em type=email value='nope'><input id=num type=number min=5 value='3'></form>",
+    );
+    // Required empty fails with valueMissing; invalid event fires on checkValidity.
+    assert_eq!(s(&mut r, "document.getElementById('req').validity.valueMissing"), "true");
+    assert_eq!(s(&mut r, "document.getElementById('req').checkValidity()"), "false");
+    assert_eq!(s(&mut r, "document.getElementById('em').validity.typeMismatch"), "true");
+    assert_eq!(s(&mut r, "document.getElementById('num').validity.rangeUnderflow"), "true");
+    assert_eq!(s(&mut r, "document.getElementById('f').checkValidity()"), "false");
+    run(&mut r, "document.getElementById('req').value = 'x'; document.getElementById('em').value = 'a@b.co'; document.getElementById('num').value = '7';");
+    assert_eq!(s(&mut r, "document.getElementById('f').checkValidity()"), "true");
+    // Custom errors fail until cleared.
+    run(&mut r, "const i = document.getElementById('req'); i.setCustomValidity('nope');");
+    assert_eq!(s(&mut r, "document.getElementById('req').validity.customError"), "true");
+    assert_eq!(s(&mut r, "document.getElementById('req').checkValidity()"), "false");
+    run(&mut r, "document.getElementById('req').setCustomValidity('');");
+    assert_eq!(s(&mut r, "document.getElementById('req').checkValidity()"), "true");
+}
+
+#[test]
+fn range_selection_custom_elements_and_contenteditable_work() {
+    let mut r = rt("<div id=a>hello</div><div id=ed>edit me</div>");
+    // Range over a text node.
+    assert_eq!(
+        s(&mut r, "(() => { const t = document.getElementById('a').firstChild; const rg = document.createRange(); rg.setStart(t, 1); rg.setEnd(t, 4); return rg.toString(); })()"),
+        "ell"
+    );
+    // Selection singleton.
+    assert_eq!(
+        s(&mut r, "(() => { const sel = document.getSelection(); sel.removeAllRanges(); const rg = document.createRange(); rg.selectNodeContents(document.getElementById('a')); sel.addRange(rg); return [sel.rangeCount, sel.toString()].join('|'); })()"),
+        "1|hello"
+    );
+    // Custom elements registry + upgrade on createElement.
+    assert_eq!(
+        s(&mut r, "(() => { class X extends HTMLElement {} customElements.define('my-x', X); const el = document.createElement('my-x'); return [customElements.get('my-x') === X, el instanceof X].join('|'); })()"),
+        "true|true"
+    );
+    // Duplicate define throws; bad name throws SyntaxError.
+    assert_eq!(
+        s(&mut r, "(() => { const out = []; try { customElements.define('my-x', class extends HTMLElement {}); } catch (e) { out.push(e.name); } try { customElements.define('notacustomname', class extends HTMLElement {}); } catch (e) { out.push(e.name); } return out.join('|'); })()"),
+        "NotSupportedError|SyntaxError"
+    );
+    // contenteditable reflection + designMode fallback.
+    assert_eq!(s(&mut r, "document.getElementById('ed').isContentEditable"), "false");
+    run(&mut r, "document.getElementById('ed').setAttribute('contenteditable', 'true');");
+    assert_eq!(s(&mut r, "document.getElementById('ed').isContentEditable"), "true");
+    assert_eq!(s(&mut r, "(() => { document.designMode = 'on'; const d = document.createElement('div'); return d.isContentEditable; })()"), "true");
 }
 
 #[test]
@@ -725,6 +794,28 @@ fn crypto_random_values_come_from_the_os_and_look_random() {
     run(&mut r, "const a = crypto.randomUUID(), b = crypto.randomUUID(); const buf = crypto.getRandomValues(new Uint8Array(4096)); const distinct = new Set(buf).size;
                  globalThis.out = [/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(a), a !== b, distinct > 200];");
     assert_eq!(s(&mut r, "out"), "[true,true,true]");
+}
+
+#[test]
+fn crypto_subtle_digest_supports_the_sha_family() {
+    let mut r = rt("");
+    run(
+        &mut r,
+        "globalThis.digests = {};
+         const data = new TextEncoder().encode('abc');
+         for (const alg of ['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512']) {
+           crypto.subtle.digest(alg, data).then(buf => {
+             digests[alg] = [...new Uint8Array(buf)].map(x => x.toString(16).padStart(2, '0')).join('');
+           });
+         }
+         crypto.subtle.digest({name:'sha-256'}, data.buffer).then(buf => { digests.buffer = new Uint8Array(buf).length; });",
+    );
+    pump(&mut r, 30);
+    assert_eq!(s(&mut r, "digests['SHA-1']"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    assert_eq!(s(&mut r, "digests['SHA-256']"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(s(&mut r, "digests['SHA-384']"), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7");
+    assert_eq!(s(&mut r, "digests['SHA-512'].length"), "128");
+    assert_eq!(s(&mut r, "digests.buffer"), "32");
 }
 
 // ------------------------------------------------------------------------------------
@@ -1148,6 +1239,86 @@ fn canvas_2d_context_kinds_and_attributes() {
 }
 
 #[test]
+fn canvas_to_blob_and_composite_operations() {
+    let mut r = rt("<canvas id=c width=8 height=8></canvas>");
+    run(&mut r, "globalThis.c = document.getElementById('c'); globalThis.x = c.getContext('2d');
+      globalThis.blob = null; c.toBlob(b => { blob = b; });
+      globalThis.blobInfo = [blob !== null, blob.type, blob.size > 0];");
+    assert_eq!(s(&mut r, "blobInfo"), r#"[true,"image/png",true]"#);
+    // multiply: red then blue gives black, while source-over would give blue.
+    run(&mut r, "x.globalCompositeOperation = 'multiply'; x.fillStyle = 'red'; x.fillRect(0,0,8,8); x.fillStyle = 'blue'; x.fillRect(0,0,8,8);");
+    assert_eq!(s(&mut r, "x.globalCompositeOperation"), "multiply");
+    assert_eq!(s(&mut r, "[...x.getImageData(4,4,1,1).data].join()"), "0,0,0,255");
+    // copy replaces the destination including alpha.
+    run(&mut r, "x.globalCompositeOperation = 'copy'; x.fillStyle = 'rgba(0,255,0,0.5)'; x.fillRect(0,0,8,8);");
+    assert_eq!(s(&mut r, "[...x.getImageData(4,4,1,1).data].join()"), "0,255,0,128");
+    // Non-separable modes are accepted but fall back to source-over.
+    run(&mut r, "x.globalCompositeOperation = 'hue';");
+    assert_eq!(s(&mut r, "x.globalCompositeOperation"), "source-over");
+}
+
+#[test]
+fn select_show_picker_opens_a_popup_and_commits_a_choice() {
+    let mut r = rt("<select id=s><option>A</option><option>B</option><option>C</option></select>");
+    run(
+        &mut r,
+        "globalThis.changes = 0; const s = document.getElementById('s');
+         s.addEventListener('change', () => changes++); s.showPicker();
+         globalThis.popup = document.body.lastElementChild;
+         globalThis.items = Array.from(popup.children).map(c => c.textContent);",
+    );
+    assert_eq!(s(&mut r, "items"), r#"["A","B","C"]"#);
+    run(&mut r, "popup.children[2].onclick();");
+    assert_eq!(s(&mut r, "s.value"), "C");
+    assert_eq!(s(&mut r, "changes"), "1");
+}
+
+#[test]
+fn date_input_show_picker_opens_a_calendar() {
+    let mut r = rt("<input id=d type=date value=2024-05-10>");
+    run(
+        &mut r,
+        "const d = document.getElementById('d'); d.showPicker();
+         globalThis.popup = document.body.lastElementChild;
+         globalThis.title = popup.children[0].textContent;",
+    );
+    assert_eq!(s(&mut r, "title"), "2024-05");
+}
+
+#[test]
+fn file_input_show_picker_uses_the_os_dialog() {
+    let mut r = rt("<input id=f type=file accept=.png,.jpg multiple>");
+    r.host.borrow_mut().set_dialog_mock(Some(Some(vec!["/pics/a.png".into(), "/pics/b.png".into()])));
+    run(
+        &mut r,
+        "globalThis.changes = 0; const f = document.getElementById('f');
+         f.addEventListener('change', () => changes++); f.showPicker();",
+    );
+    pump(&mut r, 40);
+    assert_eq!(s(&mut r, "f.files.length"), "2");
+    assert_eq!(s(&mut r, "f.files[0].name"), "a.png");
+    assert_eq!(s(&mut r, "f.files[1].path"), "/pics/b.png");
+    assert_eq!(s(&mut r, "changes"), "1");
+}
+
+#[test]
+fn offscreen_canvas_draws_and_converts_to_blob() {
+    let mut r = rt("");
+    run(
+        &mut r,
+        "globalThis.off = new OffscreenCanvas(6, 6); globalThis.ox = off.getContext('2d');
+         ox.fillStyle = 'lime'; ox.fillRect(0, 0, 6, 6);
+         globalThis.px = [...ox.getImageData(2, 2, 1, 1).data].join();
+         off.convertToBlob().then(b => { globalThis.blob = [b.type, b.size > 0]; });",
+    );
+    assert_eq!(s(&mut r, "px"), "0,255,0,255");
+    assert_eq!(s(&mut r, "[off.width, off.height]"), "[6,6]");
+    // Let the blob promise resolve.
+    pump(&mut r, 30);
+    assert_eq!(s(&mut r, "blob"), r#"["image/png",true]"#);
+}
+
+#[test]
 fn canvas_2d_pixels_paths_gradients_and_images() {
     let mut r =
         rt("<canvas id=c width=24 height=24></canvas><canvas id=d width=8 height=8></canvas>");
@@ -1353,7 +1524,7 @@ fn canvas_2d_remainder_text_path2d_clip_gradients_shadows() {
         "restore drops shadow state"
     );
     assert_eq!(s(&mut r, "noShadow"), r#"["0,0,255,255","0,0,0,0"]"#);
-    // Still-source-over compositing and still-unsupported surface APIs.
+    // Composite ops now apply; filter is still unsupported.
     run(
         &mut r,
         "x.globalCompositeOperation = 'lighter'; globalThis.gco = x.globalCompositeOperation;
@@ -1361,7 +1532,7 @@ fn canvas_2d_remainder_text_path2d_clip_gradients_shadows() {
     );
     assert_eq!(
         s(&mut r, "[gco, unsupported]"),
-        r#"["source-over",["undefined","undefined","undefined"]]"#
+        r#"["lighter",["function","function","undefined"]]"#
     );
 }
 

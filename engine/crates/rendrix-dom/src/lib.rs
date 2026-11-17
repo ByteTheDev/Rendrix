@@ -61,6 +61,7 @@ pub struct ElementFlags {
     pub hover: bool,
     pub active: bool,
     pub focus: bool,
+    pub focus_visible: bool,
     pub focus_within: bool,
 }
 
@@ -134,6 +135,13 @@ pub struct Dirty {
     pub layout: bool,
     /// Repaint needed without relayout (state that only changes paint is still restyled; this flags raw redraws).
     pub paint: bool,
+    /// Child-list structure changed (append/remove/move). Always needs layout.
+    pub structure: bool,
+    /// Text or form-value content changed (character data, input value, option labels).
+    /// Needs layout even when computed styles are identical (inline measurement).
+    /// Also set for `width`/`height` content attributes on replaced elements, whose
+    /// intrinsic size lives outside `ComputedStyle`.
+    pub content: bool,
 }
 
 pub struct Document {
@@ -158,6 +166,9 @@ pub struct Document {
     pub inline_viewport_units: bool,
     /// Bumped whenever a node leaves its parent (lets wrapper caches know to re-check connectivity).
     pub detach_epoch: u64,
+    /// Last input modality: true for keyboard/a11y/programmatic focus (shows `:focus-visible`),
+    /// false for pointer focus. Set by the window driver before `set_focus`.
+    pub focus_modality_keyboard: bool,
 }
 
 impl Default for Document {
@@ -198,6 +209,7 @@ impl Document {
             sheets_dirty: true,
             inline_viewport_units: false,
             detach_epoch: 0,
+            focus_modality_keyboard: true,
         }
     }
 
@@ -566,6 +578,7 @@ impl Document {
         });
         self.mark_child_list_dirty(parent);
         self.dirty.layout = true;
+        self.dirty.structure = true;
         self.version += 1;
     }
 
@@ -590,6 +603,7 @@ impl Document {
         });
         self.mark_child_list_dirty(parent);
         self.dirty.layout = true;
+        self.dirty.structure = true;
         self.version += 1;
         self.gc_pending = true;
         Ok(child)
@@ -676,10 +690,20 @@ impl Document {
             removed: vec![],
             previous_sibling: None,
             next_sibling: None,
-            attribute_name: Some(name),
+            attribute_name: Some(name.clone()),
             old_value: old,
         });
         self.touch(id, false);
+        // Content attributes whose effect lives outside `ComputedStyle`
+        // (replaced intrinsic size, control text): force layout even when the
+        // computed style is paint-identical. `class`/`style` go through the
+        // style layout check instead so paint-only toggles skip layout.
+        if matches!(
+            name.as_str(),
+            "width" | "height" | "value" | "placeholder" | "src" | "srcset" | "type" | "selected" | "cols" | "rows" | "size"
+        ) {
+            self.dirty.content = true;
+        }
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
@@ -696,10 +720,16 @@ impl Document {
             removed: vec![],
             previous_sibling: None,
             next_sibling: None,
-            attribute_name: Some(name),
+            attribute_name: Some(name.clone()),
             old_value: Some(old),
         });
         self.touch(id, false);
+        if matches!(
+            name.as_str(),
+            "width" | "height" | "value" | "placeholder" | "src" | "srcset" | "type" | "selected" | "cols" | "rows" | "size"
+        ) {
+            self.dirty.content = true;
+        }
     }
 
     fn sync_cached_attr(e: &mut ElementData, name: &str, value: Option<&str>) {
@@ -828,12 +858,15 @@ impl Document {
 
     pub fn set_focus(&mut self, target: Option<NodeId>) {
         let want_within: HashSet<NodeId> = target.map(|t| self.event_path(t).into_iter().collect()).unwrap_or_default();
+        let visible = self.focus_modality_keyboard;
         for n in self.depth_first(self.root) {
             let (is_focus, is_within) = (Some(n) == target, want_within.contains(&n) && Some(n) != target);
+            let is_visible = is_focus && visible;
             let Some(e) = self.element(n) else { continue };
-            if e.flags.focus != is_focus || e.flags.focus_within != is_within {
+            if e.flags.focus != is_focus || e.flags.focus_within != is_within || e.flags.focus_visible != is_visible {
                 if let Some(e) = self.element_mut(n) {
                     e.flags.focus = is_focus;
+                    e.flags.focus_visible = is_visible;
                     e.flags.focus_within = is_within;
                 }
                 self.mark_state_dirty(n);
@@ -918,6 +951,7 @@ impl Document {
         if layout_only {
             self.dirty.layout = true;
             self.dirty.paint = true;
+            self.dirty.content = true;
             self.version += 1;
             // Text changes can alter inherited-style-independent layout only, but pseudo/`:empty` matters rarely.
             if let Some(p) = self.node(id).parent {

@@ -3,9 +3,9 @@
 use crate::boxtree::ANON;
 use crate::Engine;
 use rendrix_css::animation::{mat_apply, mat_invert, mat_mul, transform_matrix, Matrix, IDENTITY};
-use rendrix_css::{BackgroundImage, BackgroundRepeat, BackgroundSize, BorderStyle, Color, ComputedStyle, Dim, ObjectFit, Overflow, PointerEvents, Position, Visibility, WhiteSpace};
+use rendrix_css::{BackgroundImage, BackgroundRepeat, BackgroundSize, BorderStyle, ClipPath, Color, ComputedStyle, Dim, FilterOp, ObjectFit, Overflow, PointerEvents, Position, Visibility, WhiteSpace};
 use rendrix_dom::NodeId;
-use rendrix_gfx::{canvas_image_id, DisplayList, Fill, ImageItem, Item, RectItem, Scene3DItem, ShadowItem, TextItem};
+use rendrix_gfx::{canvas_image_id, Border, DisplayList, Fill, ImageItem, Item, LayerInfo, RectItem, Scene3DItem, ShadowItem, TextItem};
 use rendrix_layout::{BoxLayout, InlineContent, InlineRun, LayoutKind, LayoutNode, LayoutResult};
 use std::sync::Arc;
 
@@ -157,6 +157,53 @@ fn truncate_runs(content: &Arc<InlineContent>, first_line: &[&InlineRun], keep: 
     } else {
         InlineContent::new(out, content.container.clone())
     }
+}
+
+/// Apply `-webkit-line-clamp`: keep at most N shaped lines, appending `…` to the
+/// last visible line. Content is rewritten (not filtered at draw time) so hit
+/// regions and selection geometry stay consistent with what is painted.
+fn clamp_content(content: &Arc<InlineContent>, max_width: f32, engine: &Engine) -> Arc<InlineContent> {
+    let max_lines = match content.container.line_clamp {
+        Some(n) if n > 0 => n as usize,
+        _ => return content.clone(),
+    };
+    if !max_width.is_finite() || max_width <= 0.0 {
+        return content.clone();
+    }
+    let total_chars: usize = content.runs.iter().map(|r| r.text.chars().count()).sum();
+    if total_chars == 0 {
+        return content.clone();
+    }
+    // Shaping at `max_width` gives one baseline y per visual line; counting distinct
+    // baselines is a reliable proxy for the number of wrapped lines.
+    fn lines(p: &rendrix_gfx::text::Paragraph) -> usize {
+        p.glyphs.iter().map(|g| g.line_y.to_bits()).collect::<std::collections::HashSet<_>>().len()
+    }
+    let natural = engine.text_borrow().paragraph(content, Some(max_width));
+    if lines(&natural) <= max_lines {
+        return content.clone();
+    }
+    let all: Vec<&InlineRun> = content.runs.iter().collect();
+    let mut lo = 0usize;
+    let mut hi = total_chars;
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let cand = truncate_runs(content, &all, mid);
+        let n = lines(&engine.text_borrow().paragraph(&cand, Some(max_width)));
+        if n <= max_lines {
+            best = mid;
+            lo = mid + 1;
+            if mid == total_chars {
+                break;
+            }
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Arc::new(truncate_runs(content, &all, best))
 }
 
 impl<'a> Painter<'a> {
@@ -312,19 +359,40 @@ impl<'a> Painter<'a> {
             popped_xf = true;
             pops.push(Item::PopTransform);
         }
-        if style.opacity < 1.0 {
-            self.list.push(Item::PushOpacity(style.opacity));
-            pops.push(Item::PopOpacity);
-        }
-        // Filter and backdrop-filter markers (the renderer folds pointwise filter ops
-        // into each instance; backdrop ops only balance the stack — see display.rs).
-        if style.filter.iter().any(|o| !o.is_noop()) {
-            self.list.push(Item::PushFilter(style.filter.clone()));
-            pops.push(Item::PopFilter);
-        }
-        if !style.backdrop_filter.is_empty() {
-            self.list.push(Item::PushBackdrop(style.backdrop_filter.clone()));
-            pops.push(Item::PopBackdrop);
+        // Effects that read pixels — or isolate a group — need a real offscreen layer.
+        // Plain `opacity < 1` is one of them: children must blend with each other first,
+        // then the whole group composites once at that opacity. A per-item `PushOpacity`
+        // would instead blend every translucent sibling against the backdrop pairwise,
+        // which is visibly wrong for overlapping content (see `LayerInfo::needs_pass`).
+        let polygon: Option<Vec<[f32; 2]>> = match &style.clip_path {
+            ClipPath::Polygon(pts) if !pts.is_empty() => {
+                let res = |d: Dim, basis: f32| d.resolve(basis).unwrap_or(0.0);
+                Some(pts.iter().map(|(px, py)| [res(*px, b.width), res(*py, b.height)]).collect())
+            }
+            _ => None,
+        };
+        let needs_layer = style.opacity < 1.0
+            || !style.backdrop_filter.is_empty()
+            || style.filter.iter().any(|o| matches!(o, FilterOp::Blur(bl) if *bl > 0.0))
+            || polygon.is_some();
+        if needs_layer {
+            self.list.push(Item::PushLayer(LayerInfo {
+                rect,
+                radius: resolve_radii(&style, b.width, b.height)[0],
+                opacity: style.opacity,
+                filter: style.filter.clone(),
+                backdrop: style.backdrop_filter.clone(),
+                polygon: polygon.unwrap_or_default(),
+            }));
+            pops.push(Item::PopLayer);
+        } else {
+            // No group isolation needed: pointwise filter ops fold into each instance.
+            // `opacity` is 1.0 here (anything lower took the layer branch) and
+            // `backdrop-filter` is always handled by a layer, so neither needs a marker.
+            if style.filter.iter().any(|o| !o.is_noop()) {
+                self.list.push(Item::PushFilter(style.filter.clone()));
+                pops.push(Item::PopFilter);
+            }
         }
         // `mask-image`: average-alpha masking through the opacity stack (uniform masks
         // exact; spatially-varying masks approximated — see COMPATIBILITY.md).
@@ -358,7 +426,7 @@ impl<'a> Painter<'a> {
             let o = style.outline_offset + style.outline_width / 2.0;
             let r = [x - o - style.outline_width / 2.0, y - o - style.outline_width / 2.0, b.width + 2.0 * o + style.outline_width, b.height + 2.0 * o + style.outline_width];
             let radii = resolve_radii(&style, b.width, b.height).map(|v| v + o + style.outline_width / 2.0);
-            self.list.push(Item::Rect(RectItem { rect: r, radii, fill: Fill::None, border: Some(([style.outline_width; 4], style.outline_color)) }));
+            self.list.push(Item::Rect(RectItem { rect: r, radii, fill: Fill::None, border: Some(Border::solid([style.outline_width; 4], style.outline_color)) }));
         }
 
         for p in pops.into_iter().rev() {
@@ -393,9 +461,17 @@ impl<'a> Painter<'a> {
         let propagated = id == self.root as u64 || Some(id as NodeId) == self.skip_body_bg;
         let has_border = style.border_width.iter().any(|w| *w > 0.0) && style.border_style.iter().any(|s| !matches!(s, BorderStyle::None | BorderStyle::Hidden));
         let border = if has_border {
-            // Per-side colors are not modelled by the shader; use the first visible side's color.
-            let c = (0..4).find(|i| style.border_width[*i] > 0.0).map(|i| style.border_color[i]).unwrap_or(style.color);
-            Some((style.border_width, c))
+            let style_code = |s: BorderStyle| match s {
+                BorderStyle::Dashed => 1u8,
+                BorderStyle::Dotted => 2,
+                BorderStyle::Double => 3,
+                _ => 0,
+            };
+            Some(Border {
+                widths: style.border_width,
+                colors: style.border_color,
+                styles: style.border_style.map(style_code),
+            })
         } else {
             None
         };
@@ -506,7 +582,7 @@ impl<'a> Painter<'a> {
                 // `text-overflow: ellipsis` truncates single-line text with `…` when it
                 // would overflow the content box (controls keep their own scrolling).
                 let display_content: Arc<InlineContent> = if control.is_none() {
-                    ellipsize_content(content, content_w, engine)
+                    clamp_content(&ellipsize_content(content, content_w, engine), content_w, engine)
                 } else {
                     content.clone()
                 };
@@ -774,4 +850,51 @@ fn gradient_stops(stops: &[rendrix_css::GradientStop]) -> Vec<(Color, f32)> {
         .enumerate()
         .map(|(i, s)| (s.color, s.pos.unwrap_or(if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 })))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MapAssets;
+    use rendrix_dom::Document;
+
+    fn engine(html: &str, css: &str, w: f32, h: f32) -> Engine {
+        let src = format!("<html><head><style>{css}</style></head><body>{html}</body></html>");
+        let mut e = Engine::with_document(Document::parse(&src), Box::new(MapAssets::default()));
+        e.set_viewport(w, h, 1.0);
+        e.update(0.0);
+        e
+    }
+
+    /// CSS `opacity` isolates a group: the box plus its children render into one offscreen
+    /// layer carrying the group opacity, rather than a per-item alpha stack.
+    #[test]
+    fn opacity_uses_isolated_group_layer() {
+        let e = engine(r#"<div id="a" style="opacity:0.5"></div>"#, "body{margin:0}", 200.0, 200.0);
+        let layers: Vec<&LayerInfo> = e
+            .display_list()
+            .items
+            .iter()
+            .filter_map(|i| if let Item::PushLayer(info) = i { Some(info) } else { None })
+            .collect();
+        assert!(
+            layers.iter().any(|info| (info.opacity - 0.5).abs() < 1e-3),
+            "expected a PushLayer carrying group opacity 0.5, got {layers:?}"
+        );
+        // This document has no mask, so any PushOpacity would be the old opacity path.
+        assert!(
+            !e.display_list().items.iter().any(|i| matches!(i, Item::PushOpacity(_))),
+            "plain opacity must not emit a per-item PushOpacity"
+        );
+    }
+
+    #[test]
+    fn opaque_box_emits_no_layer() {
+        let e = engine(r#"<div id="a" style="opacity:1"></div>"#, "body{margin:0}", 200.0, 200.0);
+        assert!(!e.display_list().has_layers, "an opaque box must not create a layer");
+        assert!(
+            !e.display_list().items.iter().any(|i| matches!(i, Item::PushLayer(_) | Item::PushOpacity(_))),
+            "an opaque box must emit neither a layer nor a per-item opacity"
+        );
+    }
 }

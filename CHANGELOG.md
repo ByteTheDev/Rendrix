@@ -15,6 +15,28 @@ and runtime. See `docs/ENGINE_ASSESSMENT.md`.
 - New CLI: `rendrix init | dev | build | run | check | package | doctor` with TypeScript type-checking, TSX
   (`rendrix/jsx-runtime`), `node_modules` ESM resolution and `.rdxapp` / standalone executable output.
 - `examples/app-counter` and a scripted end-to-end test (`npm run e2e`); `npm run bench`.
+- Offscreen compositing layers: real `backdrop-filter`, true Gaussian `filter: blur()` and per-pixel
+  `clip-path: polygon()` (ordinary frames keep the single-draw-call path).
+- CSS text: `word-break` and `-webkit-line-clamp` (line-limited content with a trailing ellipsis).
+- CSS at-rules: real `@supports` condition evaluation, `@layer` ordering (reversed for `!important`),
+  and `@container` size queries against `container-type` ancestors.
+- `:focus-visible` follows input modality (keyboard/a11y vs pointer).
+- Borders: per-side colours and real dashed/dotted rendering in the shader.
+- Web APIs: `document.cookie` sync with the session jar plus `Max-Age`/`Expires` expiry;
+  `crypto.subtle.digest` (SHA-1/256/384/512); Canvas `toBlob`, `OffscreenCanvas` and
+  non-`source-over` `globalCompositeOperation`.
+- Form pickers: `input[type=file].showPicker()` uses the OS file dialog, with in-engine popups for
+  `<select>` and `input[type=date]`.
+
+### Renderer correctness and scale (2026-11-16)
+- Fixed multi-mesh and multi-scene 3D rendering: frame/mesh uniforms now use 256-byte dynamic offsets, so each draw keeps its own transform, material and camera. Covered by a two-mesh pixel test.
+- `opacity` on a subtree now creates an isolated offscreen group, so overlapping translucent children blend correctly instead of pairwise against the backdrop.
+- `backdrop-filter` no longer double-composites the backdrop when the page background is translucent.
+- Blur is a separable two-pass Gaussian (14 taps, ~±3.5σ) instead of a truncated 5×5 kernel. Layer frames share one GPU snapshot of the painted prefix, one encoder and one submit; the offscreen target pool is capped at 32 with LRU eviction.
+- 3D scene retrieval is a cheap `Arc` clone instead of deep-copying every mesh (up to ~1M vertices) twice per frame.
+- Small images (≤512 px per edge) pack into a shared atlas and merge into one draw batch; large images and dynamic canvases keep dedicated textures.
+- All passes in a layered frame (flat runs, backdrop snapshots, blur, composite, blit) are recorded in display-list order into one encoder and submitted once; flat content after a layer paints above it again, and a layer's backdrop excludes later content. Pooled layer targets are cleared to transparent each frame, and `backdrop-filter` grayscale/brightness now affect the backdrop.
+- Fixed zero-size `render_to_rgba`, frame-wide profiling counters for layered frames, and mid-frame glyph-atlas recycling inside nested layers.
 
 ### Removed
 - Electron compatibility layer, Electron project importer and their docs/examples.

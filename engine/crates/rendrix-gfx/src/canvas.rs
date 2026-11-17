@@ -144,6 +144,7 @@ struct Saved {
     cap: LineCap,
     join: LineJoin,
     alpha: f32,
+    composite: CompositeOp,
     clips: Vec<ClipEntry>,
     shadow_color: Color,
     shadow_blur: f32,
@@ -364,6 +365,7 @@ pub struct Canvas2D {
     cap: LineCap,
     join: LineJoin,
     alpha: f32,
+    composite: CompositeOp,
     path: Vec<PathCmd>,
     clips: Vec<ClipEntry>,
     shadow_color: Color,
@@ -391,6 +393,7 @@ impl Canvas2D {
             cap: LineCap::Butt,
             join: LineJoin::Miter,
             alpha: 1.0,
+            composite: CompositeOp::SourceOver,
             path: Vec::new(),
             clips: Vec::new(),
             shadow_color: Color::TRANSPARENT,
@@ -458,6 +461,7 @@ impl Canvas2D {
             cap: self.cap,
             join: self.join,
             alpha: self.alpha,
+            composite: self.composite,
             clips: self.clips.clone(),
             shadow_color: self.shadow_color,
             shadow_blur: self.shadow_blur,
@@ -478,6 +482,7 @@ impl Canvas2D {
             self.cap = s.cap;
             self.join = s.join;
             self.alpha = s.alpha;
+            self.composite = s.composite;
             self.clips = s.clips;
             self.shadow_color = s.shadow_color;
             self.shadow_blur = s.shadow_blur;
@@ -531,6 +536,14 @@ impl Canvas2D {
         if a.is_finite() && (0.0..=1.0).contains(&a) {
             self.alpha = a;
         }
+    }
+
+    pub fn set_composite(&mut self, op: CompositeOp) {
+        self.composite = op;
+    }
+
+    pub fn composite(&self) -> CompositeOp {
+        self.composite
     }
 
     pub fn set_shadow_color(&mut self, c: Color) {
@@ -914,7 +927,7 @@ impl Canvas2D {
                     continue;
                 }
                 let di = (y as u32 * self.width + x as u32) as usize * 4;
-                blend(&mut self.pixels[di..di + 4], sr, sg, sb, sa);
+                blend(&mut self.pixels[di..di + 4], self.composite, sr, sg, sb, sa);
             }
         }
         self.mark(
@@ -1003,10 +1016,10 @@ impl Canvas2D {
                         } else {
                             (0.0, 0.0, 0.0)
                         };
-                        blend(&mut self.pixels[di..di + 4], r, gg, b, ga);
+                        blend(&mut self.pixels[di..di + 4], self.composite, r, gg, b, ga);
                     } else {
                         let c = self.sample(paint, inv, sx as f32 + 0.5, sy as f32 + 0.5);
-                        blend(&mut self.pixels[di..di + 4], c[0], c[1], c[2], c[3] * ga);
+                        blend(&mut self.pixels[di..di + 4], self.composite, c[0], c[1], c[2], c[3] * ga);
                     }
                     mx0 = mx0.min(sx as u32);
                     my0 = my0.min(sy as u32);
@@ -1072,7 +1085,7 @@ impl Canvas2D {
                     continue;
                 }
                 let di = (sy as u32 * self.width + sx as u32) as usize * 4;
-                blend(&mut self.pixels[di..di + 4], sr, sg, sb, a);
+                blend(&mut self.pixels[di..di + 4], self.composite, sr, sg, sb, a);
                 x0 = x0.min(sx as u32);
                 y0 = y0.min(sy as u32);
                 x1 = x1.max(sx as u32 + 1);
@@ -1273,7 +1286,7 @@ impl Canvas2D {
                     self.pixels[di..di + 4].copy_from_slice(&[0, 0, 0, 0]);
                 } else {
                     let c = self.sample(paint, inv, x as f32 + 0.5, y as f32 + 0.5);
-                    blend(&mut self.pixels[di..di + 4], c[0], c[1], c[2], c[3] * alpha);
+                    blend(&mut self.pixels[di..di + 4], self.composite, c[0], c[1], c[2], c[3] * alpha);
                 }
             }
         }
@@ -1357,7 +1370,7 @@ impl Canvas2D {
                 }
                 let di = (y as u32 * self.width + x as u32) as usize * 4;
                 let c = self.sample(paint, inv, x as f32 + 0.5, y as f32 + 0.5);
-                blend(&mut self.pixels[di..di + 4], c[0], c[1], c[2], c[3] * alpha);
+                blend(&mut self.pixels[di..di + 4], self.composite, c[0], c[1], c[2], c[3] * alpha);
             }
         }
         self.mark(
@@ -1860,33 +1873,177 @@ fn box_blur(src: &[f32], w: u32, h: u32, r: u32) -> Vec<f32> {
     out
 }
 
-/// Source-over blend of straight-alpha `src` (alpha already includes `globalAlpha`).
-fn blend(dst: &mut [u8], r: f32, g: f32, b: f32, a: f32) {
-    let a = a.clamp(0.0, 1.0);
-    if a <= 0.0 {
-        return;
+/// `globalCompositeOperation` values the CPU rasterizer implements. The non-separable
+/// CSS/Canvas blend modes (hue, saturation, color, luminosity) are accepted by the
+/// setter but fall back to source-over — see COMPATIBILITY.md.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CompositeOp {
+    #[default]
+    SourceOver,
+    Copy,
+    SourceIn,
+    SourceOut,
+    SourceAtop,
+    DestinationIn,
+    DestinationOut,
+    DestinationAtop,
+    Xor,
+    Lighter,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+}
+
+impl CompositeOp {
+    pub fn parse(s: &str) -> CompositeOp {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "copy" => CompositeOp::Copy,
+            "source-in" => CompositeOp::SourceIn,
+            "source-out" => CompositeOp::SourceOut,
+            "source-atop" => CompositeOp::SourceAtop,
+            "destination-in" => CompositeOp::DestinationIn,
+            "destination-out" => CompositeOp::DestinationOut,
+            "destination-atop" => CompositeOp::DestinationAtop,
+            "xor" => CompositeOp::Xor,
+            "lighter" => CompositeOp::Lighter,
+            "multiply" => CompositeOp::Multiply,
+            "screen" => CompositeOp::Screen,
+            "overlay" => CompositeOp::Overlay,
+            "darken" => CompositeOp::Darken,
+            "lighten" => CompositeOp::Lighten,
+            "color-dodge" => CompositeOp::ColorDodge,
+            "color-burn" => CompositeOp::ColorBurn,
+            "hard-light" => CompositeOp::HardLight,
+            "soft-light" => CompositeOp::SoftLight,
+            "difference" => CompositeOp::Difference,
+            "exclusion" => CompositeOp::Exclusion,
+            // Non-separable modes and unknown values: feature-detectable fallback.
+            _ => CompositeOp::SourceOver,
+        }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompositeOp::SourceOver => "source-over",
+            CompositeOp::Copy => "copy",
+            CompositeOp::SourceIn => "source-in",
+            CompositeOp::SourceOut => "source-out",
+            CompositeOp::SourceAtop => "source-atop",
+            CompositeOp::DestinationIn => "destination-in",
+            CompositeOp::DestinationOut => "destination-out",
+            CompositeOp::DestinationAtop => "destination-atop",
+            CompositeOp::Xor => "xor",
+            CompositeOp::Lighter => "lighter",
+            CompositeOp::Multiply => "multiply",
+            CompositeOp::Screen => "screen",
+            CompositeOp::Overlay => "overlay",
+            CompositeOp::Darken => "darken",
+            CompositeOp::Lighten => "lighten",
+            CompositeOp::ColorDodge => "color-dodge",
+            CompositeOp::ColorBurn => "color-burn",
+            CompositeOp::HardLight => "hard-light",
+            CompositeOp::SoftLight => "soft-light",
+            CompositeOp::Difference => "difference",
+            CompositeOp::Exclusion => "exclusion",
+        }
+    }
+}
+
+fn blend_fn(cb: f32, cs: f32, op: CompositeOp) -> f32 {
+    match op {
+        CompositeOp::Multiply => cb * cs,
+        CompositeOp::Screen => cb + cs - cb * cs,
+        CompositeOp::Overlay | CompositeOp::HardLight => {
+            if cs <= 0.5 { 2.0 * cb * cs } else { 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs) }
+        }
+        CompositeOp::Darken => cb.min(cs),
+        CompositeOp::Lighten => cb.max(cs),
+        CompositeOp::ColorDodge => {
+            if cs >= 1.0 { 1.0 } else if cs <= 0.0 { 0.0 } else { (cb / (1.0 - cs)).min(1.0) }
+        }
+        CompositeOp::ColorBurn => {
+            if cs <= 0.0 { 0.0 } else if cs >= 1.0 { 1.0 } else { 1.0 - ((1.0 - cb) / cs).min(1.0) }
+        }
+        CompositeOp::SoftLight => {
+            let d = if cb <= 0.25 { ((16.0 * cb - 12.0) * cb + 4.0) * cb } else { cb.sqrt() };
+            if cs <= 0.5 { cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb) } else { cb + (2.0 * cs - 1.0) * (d - cb) }
+        }
+        CompositeOp::Difference => (cb - cs).abs(),
+        CompositeOp::Exclusion => cb + cs - 2.0 * cb * cs,
+        _ => cs,
+    }
+}
+
+/// Blend straight-alpha `src` (alpha already includes `globalAlpha`) into `dst`
+/// using the current `globalCompositeOperation`.
+fn blend(dst: &mut [u8], op: CompositeOp, r: f32, g: f32, b: f32, a: f32) {
+    let a = a.clamp(0.0, 1.0);
     let (dr, dg, db, da) = (
         dst[0] as f32 / 255.0,
         dst[1] as f32 / 255.0,
         dst[2] as f32 / 255.0,
         dst[3] as f32 / 255.0,
     );
-    let oa = a + da * (1.0 - a);
-    if oa <= 0.0 {
+    let m1 = 1.0 - a;
+    let mda = 1.0 - da;
+    // `co` is premultiplied output colour, `ao` output alpha.
+    let (co, ao) = match op {
+        CompositeOp::SourceOver => (
+            [r * a + dr * da * m1, g * a + dg * da * m1, b * a + db * da * m1],
+            a + da * m1,
+        ),
+        CompositeOp::Copy => ([r * a, g * a, b * a], a),
+        CompositeOp::SourceIn => ([r * da, g * da, b * da], a * da),
+        CompositeOp::SourceOut => ([r * mda, g * mda, b * mda], a * mda),
+        CompositeOp::SourceAtop => (
+            [r * da + dr * da * m1, g * da + dg * da * m1, b * da + db * da * m1],
+            da,
+        ),
+        CompositeOp::DestinationIn => ([dr * a, dg * a, db * a], da * a),
+        CompositeOp::DestinationOut => ([dr * m1, dg * m1, db * m1], da * m1),
+        CompositeOp::DestinationAtop => (
+            [dr * a + r * a * mda, dg * a + g * a * mda, db * a + b * a * mda],
+            a,
+        ),
+        CompositeOp::Xor => (
+            [r * a * mda + dr * da * m1, g * a * mda + dg * da * m1, b * a * mda + db * da * m1],
+            a + da - 2.0 * a * da,
+        ),
+        CompositeOp::Lighter => (
+            [(r * a + dr * da).min(1.0), (g * a + dg * da).min(1.0), (b * a + db * da).min(1.0)],
+            (a + da).min(1.0),
+        ),
+        op => {
+            let sr = blend_fn(dr, r, op);
+            let sg = blend_fn(dg, g, op);
+            let sb = blend_fn(db, b, op);
+            (
+                [
+                    r * a * mda + dr * da * m1 + sr * a * da,
+                    g * a * mda + dg * da * m1 + sg * a * da,
+                    b * a * mda + db * da * m1 + sb * a * da,
+                ],
+                a + da * m1,
+            )
+        }
+    };
+    if ao <= 0.0 {
         dst.copy_from_slice(&[0, 0, 0, 0]);
         return;
     }
-    dst[0] = ((r * a + dr * da * (1.0 - a)) / oa * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    dst[1] = ((g * a + dg * da * (1.0 - a)) / oa * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    dst[2] = ((b * a + db * da * (1.0 - a)) / oa * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    dst[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
+    let enc = |v: f32| (v / ao * 255.0).round().clamp(0.0, 255.0) as u8;
+    dst[0] = enc(co[0]);
+    dst[1] = enc(co[1]);
+    dst[2] = enc(co[2]);
+    dst[3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 // ---- CSS color parsing (subset) -----------------------------------------------------------------

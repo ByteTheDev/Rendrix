@@ -4,6 +4,16 @@ Date: 2026-11-14. Method: three parallel read-only subagent investigations (runt
 
 Constraints honored: no application code modified, no systems deleted or replaced, no unnecessary dependencies, all existing functionality preserved. All numbers below are quoted from `PERFORMANCE_AUDIT.md` / `ENGINE_ASSESSMENT.md` §6 (Windows 11, RTX 3060, Vulkan, 1000 items = 9,009 DOM nodes). No new benchmarks were invented.
 
+> **Superseded (2026-11-16).** This is a historical snapshot from 2026-11-14. Its "verified absent" list
+> (§2.3) and several partial rows in §2.2 are no longer accurate: Canvas 2D, WebSocket, Workers,
+> IntersectionObserver, Shadow DOM, custom elements, `:has()`, AccessKit, multi-window, native dialogs,
+> drag-and-drop, source maps, hot reload, `--inspect`, the Solid adapter and the wasm web target have all
+> landed since. The `getContext('2d') === null` / `WebSocket === undefined` spot-checks in §1 were true at
+> the time but are now stale. Use [ARCHITECTURE.md](ARCHITECTURE.md) for the current design,
+> [COMPATIBILITY.md](COMPATIBILITY.md) for the feature matrix, [ROADMAP.md](ROADMAP.md) for status and
+> [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) for measurements. This document is retained for the
+> decision history and the "build vs retain" rationale in §6, which still holds.
+
 ## 1. Current architecture (verified)
 
 ```

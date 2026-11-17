@@ -12,7 +12,7 @@ pub use taffy_engine::TaffyEngine;
 
 use rendrix_css::ComputedStyle;
 use rendrix_css::LineHeight;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -86,6 +86,8 @@ impl InlineContent {
         }
         let c = &self.container;
         (c.white_space as u8).hash(&mut h);
+        (c.word_break as u8).hash(&mut h);
+        c.line_clamp.hash(&mut h);
         (c.text_align as u8).hash(&mut h);
         c.text_overflow_ellipsis.hash(&mut h);
         hash_line_height(&c.line_height, &mut h);
@@ -140,6 +142,20 @@ pub struct LayoutResult {
 
 pub trait LayoutEngine {
     fn layout(&mut self, root: &LayoutNode, viewport: (f32, f32), measurer: &mut dyn TextMeasurer) -> LayoutResult;
+
+    /// Layout with an explicit hint about which *box ids* changed since the previous layout
+    /// (style / kind / children). Implementations may use this to skip re-converting and
+    /// re-syncing clean subtrees. The default ignores the hint and performs a normal layout,
+    /// so existing engines and callers (including the 9k-node bench) keep compiling unchanged.
+    fn layout_with_dirty(
+        &mut self,
+        root: &LayoutNode,
+        viewport: (f32, f32),
+        measurer: &mut dyn TextMeasurer,
+        _dirty: &HashSet<u64>,
+    ) -> LayoutResult {
+        self.layout(root, viewport, measurer)
+    }
 }
 
 #[cfg(test)]

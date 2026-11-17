@@ -15,6 +15,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use web_time::Instant;
 
+// Time the JS that builds the initial DOM (document scripts / entry module), separately from the
+// font-DB load and the first frame. Thread-local so parallel bench/test threads stay independent.
+thread_local! {
+    static SCRIPT_RUN_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Nanoseconds spent running document scripts (JS DOM construction) in the most recent
+/// `Session::new*` call on this thread.
+pub fn last_script_run_nanos() -> u64 {
+    SCRIPT_RUN_NANOS.with(|c| c.get())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Mods {
     pub ctrl: bool,
@@ -218,7 +230,9 @@ impl Session {
             js.add_source_map(path, &map.to_string());
         }
         let mut session = Session { engine, js, input: InputState { window_focused: true, ..Default::default() }, clipboard, last_cursor: None, title: bundle.window_title(), bundle_name: bundle.name.clone() };
+        let script_start = Instant::now();
         session.run_document_scripts(bundle)?;
+        SCRIPT_RUN_NANOS.with(|c| c.set(script_start.elapsed().as_nanos() as u64));
         // A4 workers: hand the bundle module map + network grant to the worker registry.
         session.js.set_worker_modules(bundle.modules.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
         session.js.set_worker_network(bundle.permissions.network);
@@ -423,6 +437,8 @@ impl Session {
             _ => 1,
         };
         self.input.last_click = Some(ClickState { time: now, pos: (x, y), count });
+        // Pointer focus suppresses :focus-visible (keyboard focus shows it).
+        self.engine.borrow_mut().doc.focus_modality_keyboard = false;
         let f = self.focus_target(t);
         self.move_focus(f);
         if let Some(f) = f {
@@ -874,6 +890,7 @@ impl Session {
     fn default_key_action(&mut self, k: &KeyInput, target: Option<NodeId>) {
         let m = k.mods;
         if k.key == "Tab" && !m.ctrl && !m.alt {
+            self.engine.borrow_mut().doc.focus_modality_keyboard = true;
             let list = self.focusables();
             if list.is_empty() {
                 return;
@@ -897,6 +914,69 @@ impl Session {
         if is_text {
             self.text_key(k, t, tag.as_deref() == Some("textarea"));
             return;
+        }
+        // Select popup keyboard support: arrows/Home/End move selection and fire
+        // input+change immediately (no native popup list in Rendrix).
+        if tag.as_deref() == Some("select") {
+            let step: Option<i32> = match k.key.as_str() {
+                "ArrowDown" => Some(1),
+                "ArrowUp" => Some(-1),
+                "Home" => Some(-1000000),
+                "End" => Some(1000000),
+                _ => None,
+            };
+            if let Some(d) = step {
+                let changed = {
+                    let mut e = self.engine.borrow_mut();
+                    // Descendant options in document order.
+                    let mut options: Vec<NodeId> = Vec::new();
+                    for n in e.doc.depth_first(t) {
+                        if e.doc.tag(n) == Some("option") {
+                            options.push(n);
+                        }
+                    }
+                    if options.is_empty() {
+                        false
+                    } else {
+                        let cur = options.iter().position(|n| e.doc.has_attr(*n, "selected")).unwrap_or(0);
+                        // Skip disabled options.
+                        let mut next = cur as i32;
+                        if d.abs() >= 1000000 {
+                            next = if d < 0 { 0 } else { options.len() as i32 - 1 };
+                        } else {
+                            for _ in 0..options.len() {
+                                next = (next + d).clamp(0, options.len() as i32 - 1);
+                                if !e.doc.has_attr(options[next as usize], "disabled") {
+                                    break;
+                                }
+                                if next == 0 || next as usize == options.len() - 1 {
+                                    break;
+                                }
+                            }
+                        }
+                        let ni = next.clamp(0, options.len() as i32 - 1) as usize;
+                        if ni == cur {
+                            false
+                        } else {
+                            for (i, n) in options.iter().enumerate() {
+                                if i == ni {
+                                    e.doc.set_attr(*n, "selected", "");
+                                } else {
+                                    e.doc.remove_attr(*n, "selected");
+                                }
+                            }
+                            true
+                        }
+                    }
+                };
+                if changed {
+                    self.js.fire_input(t, "", None);
+                    self.js.fire_change(t);
+                }
+                if k.key == "ArrowDown" || k.key == "ArrowUp" || k.key == "Home" || k.key == "End" {
+                    return;
+                }
+            }
         }
         // Activation keys on buttons, checkboxes, radios and links.
         match (k.key.as_str(), tag.as_deref()) {
@@ -944,6 +1024,9 @@ impl Session {
             "Home" => Some((EditOp::Home { shift: m.shift }, "")),
             "End" => Some((EditOp::End { shift: m.shift }, "")),
             "a" | "A" if cmd => Some((EditOp::SelectAll, "")),
+            "z" | "Z" if cmd && !m.shift => Some((EditOp::Undo, "historyUndo")),
+            "z" | "Z" if cmd && m.shift => Some((EditOp::Redo, "historyRedo")),
+            "y" | "Y" if cmd => Some((EditOp::Redo, "historyRedo")),
             "Enter" if multiline => Some((EditOp::Insert("\n".into()), "insertLineBreak")),
             _ => None,
         };

@@ -31,6 +31,9 @@ impl<'a> ElRef<'a> {
 }
 
 impl SelectorElement for ElRef<'_> {
+    fn node_id(&self) -> u64 {
+        self.id as u64
+    }
     fn tag(&self) -> &str {
         &self.data().tag
     }
@@ -71,6 +74,7 @@ impl SelectorElement for ElRef<'_> {
             ElementState::Hover => d.flags.hover,
             ElementState::Active => d.flags.active,
             ElementState::Focus => d.flags.focus,
+            ElementState::FocusVisible => d.flags.focus_visible,
             ElementState::FocusWithin => d.flags.focus_within,
             ElementState::Disabled => self.doc.has_attr(self.id, "disabled"),
             ElementState::Checked => {

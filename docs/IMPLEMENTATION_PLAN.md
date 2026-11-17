@@ -2,6 +2,13 @@
 
 Date: 2026-11-14. Source: `ARCHITECTURE_REVIEW.md` (three subagent investigations + four audits). Status labels: ✅ implemented (keep), 🟡 partially implemented (extend), ❌ missing (build). Every item lists justification, crates/files, build-vs-retain, perf implications, tests, and dependencies. No application code was modified to produce this plan. All perf targets are goals to be measured with the Phase-0 harness on the reference setup (Windows 11, RTX 3060, Vulkan) — not claimed results.
 
+> **Superseded (2026-11-16).** This is the original execution plan. All 24 of its tasks have since landed in
+> the working tree (including the A3/A4/D2–D4 follow-ups), along with later work it did not cover:
+> CSS at-rules, compositing, Shadow DOM, range/Selection/contenteditable, form validation and pickers,
+> touch/gamepad input, SVG, 3D scenes and the wasm web target. The ✅/🟡/❌ labels and the 156/234 test
+> counts below are historical. Current status is in [ROADMAP.md](ROADMAP.md), current features in
+> [COMPATIBILITY.md](COMPATIBILITY.md), and current measurements in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
+
 ## Ordering summary
 
 | Order | ID | Task | Depends on | Impact |

@@ -58,6 +58,7 @@ fn has_marker(list: &DisplayList, name: &str) -> bool {
         (Item::PopBackdrop, "backdrop") => true,
         (Item::PushEllipseClip { .. }, "ellipse") => true,
         (Item::PushOpacity(_), "opacity") => true,
+        (Item::PushLayer(_), "layer") | (Item::PopLayer, "layer") => true,
         _ => false,
     })
 }
@@ -126,7 +127,8 @@ fn filter_metadata_and_display_list_markers() {
     let e = engine(r#"<div id="a"></div>"#, "body{margin:0} #a{width:50px;height:50px;filter:blur(3px) brightness(0.5)}", 400.0, 300.0);
     let a = by_id(&e, "a");
     assert_eq!(e.computed_value(a, "filter"), "blur(3px) brightness(0.5)");
-    assert!(has_marker(e.display_list(), "filter"));
+    // Blur needs an offscreen pass, so paint emits a layer rather than per-instance markers.
+    assert!(has_marker(e.display_list(), "layer"));
     // Identity-only filters parse but emit no markers (fast path).
     let e2 = engine(r#"<div id="b"></div>"#, "body{margin:0} #b{width:50px;height:50px;filter:brightness(1)}", 400.0, 300.0);
     assert_eq!(e2.computed_value(by_id(&e2, "b"), "filter"), "brightness(1)");
@@ -157,15 +159,17 @@ fn filter_blur_softens_edges() {
         200.0,
         200.0,
     );
-    // Paint emits one rect; the renderer expands it into centre + 4 offset copies
-    // (batch-preserving box-blur approximation — instance counts covered in gfx tests).
+    // A blur filter isolates the subtree into an offscreen layer; one rect inside it.
+    assert!(has_marker(e.display_list(), "layer"));
     assert_eq!(e.display_list().items.iter().filter(|i| matches!(i, Item::Rect(_))).count(), 1);
     let Some(img) = render_frame(&e) else { eprintln!("no GPU adapter, skipping"); return };
     assert_eq!(px(&img, 200, 30, 30), [255, 0, 0, 255], "interior stays solid");
-    // blur(6px) → ±3px halo copies at 25%: 2px outside the box is pinkish, 6px out is white.
+    // True 5x5 Gaussian sampling: a soft halo bleeds several pixels past the box edge
+    // and fades gradually, instead of the old centre + 4 offset copies.
     let halo = px(&img, 200, 8, 30);
     assert!(halo[0] > 240 && halo[1] > 100 && halo[1] < 230 && halo[2] == halo[1], "halo bleeds onto white: {halo:?}");
-    assert_eq!(px(&img, 200, 4, 30), [255, 255, 255, 255], "past the halo stays background");
+    let far = px(&img, 200, 4, 30);
+    assert!(far[1] > 200 && far[1] < 255, "fades gradually past the box: {far:?}");
 }
 
 // ---- clip-path ----------------------------------------------------------------------
@@ -238,17 +242,21 @@ fn mask_average_alpha_modulates_group() {
 }
 
 #[test]
-fn backdrop_filter_is_stacking_marker_without_visual_change() {
-    let css = "body{margin:0} #bg{width:100px;height:100px;background:#ff0000} #fg{position:absolute;top:0;left:0;width:100px;height:100px;background:rgba(0,0,255,0.5);backdrop-filter:blur(8px)}";
-    let e = engine(r#"<div id="bg"></div><div id="fg"></div>"#, css, 200.0, 200.0);
-    assert!(has_marker(e.display_list(), "backdrop"));
+fn backdrop_filter_blurs_what_is_behind() {
+    let html = r#"<div id="l"></div><div id="r"></div><div id="fg"></div>"#;
+    let css = "body{margin:0} #l{position:absolute;left:0;top:0;width:50px;height:100px;background:#000} #r{position:absolute;left:50px;top:0;width:50px;height:100px;background:#fff} #fg{position:absolute;left:0;top:0;width:100px;height:100px;background:rgba(0,0,255,0.2);backdrop-filter:blur(8px)}";
+    let e = engine(html, css, 200.0, 200.0);
+    assert!(has_marker(e.display_list(), "layer"));
     let fg = by_id(&e, "fg");
     assert_eq!(e.computed_value(fg, "backdrop-filter"), "blur(8px)");
-    // Documented approximation: no visual change vs no backdrop-filter (needs offscreen pass).
+    // Without the offscreen backdrop pass the black/white edge under the overlay is razor sharp.
     let css2 = css.replace(";backdrop-filter:blur(8px)", "");
-    let plain = engine(r#"<div id="bg"></div><div id="fg"></div>"#, &css2, 200.0, 200.0);
+    let plain = engine(html, &css2, 200.0, 200.0);
     let (Some(a), Some(b)) = (render_frame(&e), render_frame(&plain)) else { eprintln!("no GPU adapter, skipping"); return };
-    assert_eq!(a, b, "backdrop-filter is currently a parsing + stacking marker only");
+    let blurred = px(&a, 200, 50, 50);
+    let sharp = px(&b, 200, 50, 50);
+    assert!(blurred != sharp, "backdrop edge was blurred: {blurred:?} vs {sharp:?}");
+    assert!(blurred[0] > 30 && blurred[0] < 220, "edge is grey after blur: {blurred:?}");
 }
 
 // ---- group opacity ------------------------------------------------------------------
@@ -261,7 +269,13 @@ fn nested_opacity_multiplies_as_group() {
         200.0,
         200.0,
     );
-    assert!(has_marker(e.display_list(), "opacity"));
+    let group_layers = e
+        .display_list()
+        .items
+        .iter()
+        .filter(|i| matches!(i, Item::PushLayer(info) if (info.opacity - 0.5).abs() < 0.01))
+        .count();
+    assert_eq!(group_layers, 2, "both translucent boxes must use isolated group layers");
     let Some(img) = render_frame(&e) else { eprintln!("no GPU adapter, skipping"); return };
     let c = px(&img, 200, 20, 20);
     // 0.5 * 0.5 = 0.25 red over white → (255, 191, 191).

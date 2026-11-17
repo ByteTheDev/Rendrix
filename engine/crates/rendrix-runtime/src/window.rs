@@ -624,7 +624,10 @@ impl App {
                     state.session.pointer_up(x, y, 0);
                 }
             }
-            Action::Focus => state.session.js.set_focus(Some(dom)),
+            Action::Focus => {
+                state.session.engine.borrow_mut().doc.focus_modality_keyboard = true;
+                state.session.js.set_focus(Some(dom));
+            }
             Action::Blur => state.session.js.set_focus(None),
             Action::SetValue => {
                 if let Some(ActionData::Value(v)) = req.data {

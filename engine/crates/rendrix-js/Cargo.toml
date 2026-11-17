@@ -18,6 +18,8 @@ serde_json.workspace = true
 accesskit = "0.25"
 # `std::time::Instant` panics on wasm32-unknown-unknown; this is std's Instant everywhere else.
 web-time = "1"
+sha1 = "0.11"
+sha2 = "0.11"
 
 # Native-only: the QuickJS engine, OS networking, file dialogs, and worker threads. On wasm32 the
 # browser provides the JavaScript engine (see `rendrix-web`) and network/dialog hooks.

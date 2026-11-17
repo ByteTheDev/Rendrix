@@ -17,6 +17,8 @@ struct Inst {
     radii: vec4<f32>,
     border: vec4<f32>,
     bcolor: vec4<f32>,
+    bcolors: array<vec4<f32>, 4>, // per-side border colours [T,R,B,L], premultiplied
+    bstyle: vec4<f32>,            // per-side style codes: 0 solid, 1 dashed, 2 dotted, 3 double
     clip: vec4<f32>,
     uv: vec4<f32>,
     extra: vec4<f32>,  // angle, nstops, clip_radius, pad
@@ -149,7 +151,46 @@ fn fs_main(v: VOut) -> @location(0) vec4<f32> {
                 (bw.x + bw.w) * 0.5, (bw.x + bw.y) * 0.5, (bw.z + bw.y) * 0.5, (bw.z + bw.w) * 0.5);
             let d_inner = sd_rrect(p - center - ioff, ihalf, max(inst.radii - shrink, vec4<f32>(0.0)));
             let cov_inner = coverage(d_inner, aa);
-            out = (fill * cov_inner + premul(inst.bcolor) * (1.0 - cov_inner)) * cov_outer;
+            let d = p - center;
+            // Distance past each side's inner edge. At a corner two weights are
+            // positive, so their ratio blends the two side colours smoothly.
+            let wgt = vec4<f32>(
+                max(0.0, -ihalf.y - ioff.y - d.y),
+                max(0.0, d.x - ioff.x - ihalf.x),
+                max(0.0, d.y - ioff.y - ihalf.y),
+                max(0.0, -ihalf.x - ioff.x - d.x)
+            );
+            let wsum = dot(wgt, vec4<f32>(1.0));
+            var bcol = inst.bcolor;
+            var bsty = inst.bstyle.x;
+            var bwid = bw.x;
+            var tang = p.x;
+            if (wsum > 0.0) {
+                bcol = (inst.bcolors[0] * wgt.x + inst.bcolors[1] * wgt.y + inst.bcolors[2] * wgt.z + inst.bcolors[3] * wgt.w) / wsum;
+            }
+            if (wgt.y > wgt.x && wgt.y > wgt.z && wgt.y > wgt.w) {
+                bsty = inst.bstyle.y; bwid = bw.y; tang = p.y;
+            } else if (wgt.z > wgt.x && wgt.z > wgt.y && wgt.z > wgt.w) {
+                bsty = inst.bstyle.z; bwid = bw.z;
+            } else if (wgt.w > wgt.x && wgt.w > wgt.y && wgt.w > wgt.z) {
+                bsty = inst.bstyle.w; bwid = bw.w; tang = p.y;
+            }
+            var dash = 1.0;
+            if (bsty > 0.5 && bsty < 1.5) {
+                // Dashed: three widths of colour, three widths of gap.
+                let period = max(bwid * 6.0, 1e-3);
+                let phase = fract(tang / period);
+                let e = clamp(aa / period, 0.0, 0.2);
+                dash = smoothstep(0.0, e, phase) * (1.0 - smoothstep(0.5 - e, 0.5, phase));
+            } else if (bsty > 1.5 && bsty < 2.5) {
+                // Dotted: roughly one-width round dots on a short period.
+                let period = max(bwid * 2.4, 1e-3);
+                let phase = fract(tang / period);
+                let e = clamp(aa / period, 0.0, 0.2);
+                dash = 1.0 - smoothstep(0.2 - e, 0.2 + e, abs(phase - 0.5));
+            }
+            let border_cov = (1.0 - cov_inner) * dash;
+            out = (fill * (1.0 - border_cov) + bcol * border_cov) * cov_outer;
         } else {
             out = fill * cov_outer;
         }

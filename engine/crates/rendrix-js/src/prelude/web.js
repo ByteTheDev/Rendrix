@@ -1093,13 +1093,24 @@ function updateLocation(url) {
 
 const navigatorObj = {
   userAgent: 'Mozilla/5.0 (Rendrix) Rendrix/0.5', appName: 'Rendrix', appVersion: '0.5', vendor: 'Rendrix', platform: 'Rendrix', product: 'Gecko',
-  language: 'en-US', languages: ['en-US', 'en'], onLine: true, cookieEnabled: false, hardwareConcurrency: 4, get maxTouchPoints() { return N('touch_points') | 0; }, webdriver: false, getGamepads() { return readGamepads(); },
+  language: 'en-US', languages: ['en-US', 'en'], onLine: true, get cookieEnabled() { return N('cookie_enabled'); }, hardwareConcurrency: 4, get maxTouchPoints() { return N('touch_points') | 0; }, webdriver: false, getGamepads() { return readGamepads(); },
   clipboard: { writeText: t => { N('clipboard_write', String(t)); return Promise.resolve(); }, readText: () => Promise.resolve(N('clipboard_read')) },
 };
 
 const cryptoObj = {
   getRandomValues(arr) { const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength); for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(N('random') * 256); return arr; },
   randomUUID() { const b = new Uint8Array(16); this.getRandomValues(b); b[6] = b[6] & 15 | 64; b[8] = b[8] & 63 | 128; const h = [...b].map(x => x.toString(16).padStart(2, '0')).join(''); return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`; },
+  subtle: {
+    digest(algorithm, data) {
+      const name = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name);
+      let bytes;
+      if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+      else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      else throw new TypeError('SubtleCrypto.digest: data must be a BufferSource');
+      const out = b64ToBytes(N('crypto_digest', String(name), bytesToB64(bytes)));
+      return Promise.resolve(out.buffer);
+    },
+  },
 };
 
 function structuredCloneImpl(v, seen = new Map()) {
@@ -1256,7 +1267,8 @@ const define = (name, value) => Object.defineProperty(global, name, { value, wri
 for (const [k, v] of Object.entries({
   EventTarget, Event, CustomEvent, UIEvent, FocusEvent, MouseEvent, PointerEvent, WheelEvent, KeyboardEvent, InputEvent, SubmitEvent, ErrorEvent, MessageEvent, PromiseRejectionEvent, ProgressEvent, DOMException,
   Node, CharacterData, Text, Comment, DocumentFragment, Element, HTMLElement, Document, NodeList, HTMLCollection, DOMRect, DOMTokenList, CSSStyleDeclaration,
-  HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement, HTMLFormElement, HTMLAnchorElement, HTMLLabelElement, HTMLImageElement, HTMLCanvasElement, HTMLStyleElement, HTMLLinkElement, HTMLScriptElement,
+  Range, Selection, ShadowRoot,
+  HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement, HTMLFormElement, HTMLAnchorElement, HTMLLabelElement, HTMLImageElement, HTMLCanvasElement, OffscreenCanvas, ImageBitmap, HTMLStyleElement, HTMLLinkElement, HTMLScriptElement,
   WebGLRenderingContext, WebGL2RenderingContext, RendrixScene, Rendrix3D, RendrixSceneElement, RendrixSceneHandle,
   MutationObserver, ResizeObserver, IntersectionObserver, MediaQueryList,
   URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, AbortSignal, Headers, Request, Response, Blob, File, FormData, Storage,
@@ -1267,7 +1279,7 @@ for (const [k, v] of Object.entries({
   document, console: consoleObj, performance: performanceObj, location: locationObj, history: historyObj, navigator: navigatorObj, crypto: cryptoObj,
   localStorage: makeStorage('local'), sessionStorage: makeStorage('session'),
   window: global, self: global, globalThis: global, top: global, parent: global, frames: global,
-  customElements: { define() { throw new DOMException('Custom elements are not supported', 'NotSupportedError'); }, get() { return undefined; }, whenDefined() { return new Promise(() => {}); } },
+  customElements: customElementsImpl,
   alert: m => N('console', 'warn', 'alert: ' + m), confirm: () => false, prompt: () => null,
   Image: class Image { constructor(w, h) { const i = document.createElement('img'); if (w !== undefined) i.width = w; if (h !== undefined) i.height = h; return i; } },
   Option: function Option(text = '', value, defaultSelected, selected) { const o = document.createElement('option'); o.textContent = text; if (value !== undefined) o.value = value; if (defaultSelected || selected) o.setAttribute('selected', ''); return o; },

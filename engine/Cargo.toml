@@ -39,9 +39,28 @@ rendrix-core = { path = "crates/rendrix-core" }
 rendrix-js = { path = "crates/rendrix-js" }
 
 [profile.release]
-lto = "thin"
-codegen-units = 4
+# Size-focused release profile. Rationale for each knob in docs/PERF_BINARY_SIZE.md.
+# Full (fat) LTO instead of thin: lets the linker inline and eliminate dead code across
+# *all* crates, which is the biggest safe size win. Cost: a much slower link step.
+lto = "fat"
+# One codegen unit per crate: gives LTO/the optimizer whole-crate visibility, improving
+# dead-code elimination and inlining. Cost: less build parallelism, longer compile.
+codegen-units = 1
+# Keep speed optimizations. Lowering to "s"/"z" would shrink further but slows the
+# renderer; size is being won via LTO + stripping instead. A separate size profile is
+# an option if measurements justify it.
 opt-level = 3
+# Strip the symbol table from the final executable (largest low-risk win on Windows,
+# where release builds normally carry no DWARF debug info for "debuginfo" to remove).
+# Trade-off: stripped release binaries give poorer stack traces and are harder to
+# profile; archive an unstripped build if you need to debug a shipped crash.
+strip = "symbols"
+# NOTE: panic = "abort" is deliberately NOT enabled. It would remove unwinding tables
+# for extra size, but it changes runtime semantics (destructors/catch_unwind are gone,
+# the rendrix-web panic hook can no longer be followed by recovery, and third-party
+# crates that unwind across FFI boundaries would abort). It also changes `--release`
+# benchmark behaviour. Tests are unaffected either way, but the size/behavior
+# trade-off needs a real measurement before enabling — see docs/PERF_BINARY_SIZE.md.
 
 [profile.dev]
 opt-level = 1

@@ -84,8 +84,10 @@ Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package
 
 ### CSS parsing (rendrix-css, internal)
 - **What it does:** Original CSS engine.
-- **Performance:** 22.7 ms full restyle on resize.
-- **Replace?** N/A (internal). Improve media-query invalidation.
+- **Performance:** 22.7 ms full restyle on resize at the time of the audit; stylesheet caching and
+  viewport-dependency pruning later reduced this to ~0.35 ms of CSS work in the last clean `bench 1000` run.
+- **Replace?** N/A (internal). Keep improving invalidation; the at-rule work (`@supports`, `@layer`,
+  `@container`) is implemented internally.
 
 ### DOM (rendrix-dom, internal)
 - **What it does:** Original arena DOM.
@@ -108,8 +110,13 @@ Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package
 | `accesskit_winit` | 0.34 | `rendrix-runtime` | OS-AT bridge (UIA/NSAccessibility/AT-SPI) (A7) | 1 Essential |
 | `criterion` | dev-only | all crates (`benches/`) | Micro-benchmarks (M0); never shipped | 1 Essential (dev) |
 | `solid-js` | 1.9.19 (exact, adapter-scoped) | `packages/solid-adapter` only | Real fine-grained reactivity for the D4 Solid adapter; no second renderer; never touches the engine | Approved, adapter-scoped |
+| `sha2` | 0.11 | `rendrix-js` | `crypto.subtle.digest` (SHA-1/256/384/512) | 1 Essential |
+| `gilrs` | 0.11 | `rendrix-runtime` (non-mobile) | Desktop gamepad input forwarded into `Session` | 1 Essential |
+| `web-time` | 1 | `rendrix-core`, `-js`, `-runtime` | A `Instant` that works on native and wasm32 (`std::time::Instant` panics on wasm) | 1 Essential |
+| `sys-locale`, `glam` | 0.3, 0.34 | workspace | OS locale detection and small vector/matrix math for 3D scene projection | 1 Essential |
+| `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `web-sys` | 0.2 / 0.4 / 0.3 / 0.3 | `rendrix-web` only (wasm32) | Bind the same engine to the browser Worker, `OffscreenCanvas` and browser APIs | 1 Essential (web target) |
 
-`packages/cli/src/installer/*` and `signing.mjs` are now wired into `rendrix package --sign --installer nsis --manifest/--manifest-key/--publish-url/--app-version` plus macOS `.app` layout (S1); the "unwired" note above is superseded.
+`packages/cli/src/installer/*` and `signing.mjs` are now wired into `rendrix package --sign --installer nsis --manifest/--manifest-key/--publish-url/--app-version` plus macOS `.app` layout (S1); the "unwired" note above is superseded. The renderer's offscreen compositing (real blur, backdrop-filter, per-pixel polygon clips), Canvas 2D, SVG painting and 3D scene rasterization are implemented internally in `rendrix-gfx` with no new rendering dependencies.
 
 ## Summary
 

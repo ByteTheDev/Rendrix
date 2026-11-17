@@ -72,21 +72,21 @@ Boundaries:
 |---|---|---|
 | 0 | Audit, target architecture, checkpoint | **Done** (this document; tag `checkpoint/pre-engine-transformation`) |
 | 1 | Core runtime: JS execution, ES modules, TS compile, event loop | **Done for the milestone**: QuickJS behind a `JsEngine` trait, module loader, top-level await, timers/rAF/microtasks, unhandled-rejection reporting, build-time TS compile + type-check. Not done: runaway-script limits, workers, WebAssembly |
-| 2 | Rendering foundation | **Done for the milestone**: wgpu SDF renderer (rounded rects, borders, gradients, shadows, clips, transforms, images, text), persistent glyph atlas, display list, culling, one-draw-call frames. Not done: dirty-rect presentation, offscreen compositing layers (group opacity), per-side border colours, `filter` |
-| 3 | Web platform | **Partly done**: real DOM, CSS cascade/animations, events, forms, fetch/URL/storage/observers. See [COMPATIBILITY.md](COMPATIBILITY.md) for gaps (Canvas 2D, WebSocket, IntersectionObserver, Shadow DOM, tables, floats …) |
-| 4 | Application platform | **Started**: winit window, DPI, input, IME commit, clipboard, standalone executables (Windows verified). Not done: file dialogs, multi-window, tray/shortcuts, touch, macOS/Linux validation |
-| 5 | Developer ecosystem | **Started**: `init/dev/build/run/check/package/doctor`, TSX with a direct-DOM JSX runtime, project template, headless scripted testing. Not done: state-preserving hot reload, devtools/inspector, framework adapters (React/Solid/Vue need a DOM-host adapter each plus a real `react-dom`-style integration test), source maps |
-| 6 | Production readiness | **Not started**: cross-platform CI results, memory soak tests, signed packaging, auto-update, accessibility |
+| 2 | Rendering foundation | **Done, with gaps**: wgpu SDF renderer (rounded rects, per-side/dashed borders, gradients, shadows, clips, transforms, images, text), persistent glyph atlas with LRU, display list, culling, one-draw-call frames, and offscreen compositing layers for true Gaussian `filter: blur()`, real `backdrop-filter` and per-pixel `clip-path: polygon()` (ordinary frames keep the one-draw-call path). Canvas 2D, SVG painting and an experimental 3D scene path reuse the same pipeline. Not done: dirty-rect presentation, full `filter` completeness, spatially-varying masks |
+| 3 | Web platform | **Broad, not complete**: real DOM, CSS cascade/animations/at-rules (`@supports`, `@layer`, `@container`, nesting, `@import`), events, forms with validation and pickers, observers (Mutation/Resize/Intersection), Shadow DOM, custom elements, `Range`/`Selection`, `contenteditable`, `fetch`/cookies, WebSocket, Workers, storage, Canvas 2D subset. See [COMPATIBILITY.md](COMPATIBILITY.md) for exact gaps (full table/float fidelity, `writing-mode`, WOFF2, Service Workers, XHR/IndexedDB, media, `cqw`/`cqh`, complex masks) |
+| 4 | Application platform | **Started, Windows-verified**: winit window, DPI, input, IME commit, clipboard, multi-window, OS file dialogs, native file drag-and-drop, touch and gamepad entry points, AccessKit bridge, update client, standalone executables. Not done: macOS/Linux validation, tray/global shortcuts, Android/iOS shells |
+| 5 | Developer ecosystem | **Started**: `init/dev/build/run/check/package/render/doctor`, TSX with a direct-DOM JSX runtime, source maps, state-preserving hot reload, `--inspect` snapshot, a Solid adapter, an experimental wasm web target and mobile-input scaffolding. Not done: React adapter, overlay inspector UI/devtools protocol |
+| 6 | Production readiness | **Not complete**: CI config builds/tests three OSes but no cross-platform results are recorded; no memory soak has been run; signing/installer/manifest helpers are wired but unsigned and unrun on macOS/Linux; the AccessKit bridge exists but no manual screen-reader pass is recorded |
 
-### Next priorities (in order)
+### Next priorities (in order — updated 2026-11-16)
 
-1. **Incremental box generation.** Style/structure changes rebuild the whole box tree (~5 ms / 9,000 nodes). Keep boxes per element and patch dirty subtrees.
-2. **Accessibility tree** (AccessKit) — blocks real-world use.
-3. **macOS and Linux validation** on real hardware; the CI workflow exists but has never run.
-4. **Canvas 2D** (a `<canvas>` backed by the same renderer) and **IntersectionObserver**.
-5. **Framework adapters**, starting with Solid (fine-grained DOM updates map directly onto this DOM) and a React reconciler.
-6. **Hot reload with state preservation**, source maps and an in-app inspector.
-7. Cold start: the first frame of the 1,000-item benchmark takes ~0.75 s (system font scan + shaping 3,000 paragraphs); cache the font database and shape lazily off-screen.
+1. **Re-measure cold start.** The font database is now cached to disk and the glyph atlas has LRU eviction; the old ~0.75 s first frame figure predates both. Target < 0.2 s, then publish fresh numbers in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
+2. **Mutation latency under 3 ms (120 FPS).** Incremental box generation, stylesheet caching and viewport-dependency pruning landed; the remaining ~6.5–7 ms is Taffy re-solve plus `InlineContent::key` rehashing.
+3. **macOS and Linux validation** on real hardware, plus the manual screen-reader pass in [A11Y_CHECKLIST.md](A11Y_CHECKLIST.md). The CI config exists but no cross-platform results are recorded.
+4. **Web-target gaps**: a WebGL2 renderer fallback (the current renderer panics where WebGPU is unavailable), browser-backed WebSocket/Workers/storage persistence, static import cycles and a runaway-script interrupt for the worker.
+5. **Scale measurement**: 50k+ node documents and a second machine/GPU, to find the real O(n) wall beyond the 9,009-node reference benchmark.
+6. **Compatibility gaps with high web value**: `cqw`/`cqh`, WOFF2, `writing-mode`, spatially-varying masks, table `colspan`/`rowspan`, float text wrap, the range input and a visual validation bubble.
+7. **Ecosystem**: a React reconciler (the Solid adapter and state-preserving hot reload have landed) and an overlay inspector UI on top of the existing `--inspect` JSON snapshot.
 
 ## 4. Migration: what was removed and where its job went
 

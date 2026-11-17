@@ -2,7 +2,8 @@
 
 use crate::Engine;
 use rendrix_css::animation::{interpolate_property, property_differs, sample_animation, ANIMATABLE};
-use rendrix_css::{compute_style, ComputedStyle, MediaContext, Origin, PseudoElement, RuleSet, StyleContext, TimingFunction};
+use rendrix_css::parser::{MediaQueryList, Rule};
+use rendrix_css::{compute_style, ComputedStyle, ContainerType, MediaContext, Origin, PseudoElement, RuleSet, StyleContext, TimingFunction};
 use rendrix_dom::{ElRef, NodeId, NodeKind};
 use std::sync::Arc;
 
@@ -33,8 +34,47 @@ impl Engine {
         MediaContext { width: self.viewport.0, height: self.viewport.1, dpr: self.scale, dark: self.dark, reduced_motion: false }
     }
 
+    /// Rebuild the map of container sizes from the most recent layout. Nested
+    /// containers overwrite their ancestors, so descendants see the nearest one.
+    pub fn refresh_container_sizes(&mut self) {
+        use rendrix_layout::{BoxLayout, LayoutNode};
+        let mut map = std::collections::HashMap::new();
+        fn fill(n: &LayoutNode, map: &mut std::collections::HashMap<u64, (String, f32, f32)>, name: &str, size: (f32, f32)) {
+            map.insert(n.id, (name.to_string(), size.0, size.1));
+            for c in &n.children {
+                fill(c, map, name, size);
+            }
+        }
+        fn walk(
+            n: &LayoutNode,
+            boxes: &std::collections::HashMap<u64, BoxLayout>,
+            map: &mut std::collections::HashMap<u64, (String, f32, f32)>,
+        ) {
+            if !matches!(n.style.container_type, ContainerType::Normal) {
+                if let Some(b) = boxes.get(&n.id) {
+                    let name = n.style.container_name.as_deref().unwrap_or("");
+                    fill(n, map, name, (b.width, b.height));
+                }
+            }
+            for c in &n.children {
+                walk(c, boxes, map);
+            }
+        }
+        if let Some(tree) = &self.layout_tree {
+            walk(tree, &self.layout_result.boxes, &mut map);
+        }
+        self.container_sizes = Arc::new(map);
+    }
+
     pub fn style_context(&self) -> StyleContext {
-        StyleContext { viewport_w: self.viewport.0, viewport_h: self.viewport.1, root_font_size: 16.0, safe_area: self.safe_area, keyboard_h: self.keyboard_h }
+        StyleContext {
+            viewport_w: self.viewport.0,
+            viewport_h: self.viewport.1,
+            root_font_size: 16.0,
+            safe_area: self.safe_area,
+            keyboard_h: self.keyboard_h,
+            container_sizes: self.container_sizes.clone(),
+        }
     }
 
     /// Re-collect `<style>` and `<link rel=stylesheet>` sheets when they or the media context changed.
@@ -55,19 +95,94 @@ impl Engine {
         let mut rules = RuleSet::new();
         rules.add_stylesheet(&rendrix_css::parser::ua_sheet(), Origin::UserAgent, &media);
         let root = self.doc.root();
+        // `@import` resolution against bundled assets (cycle-guarded, depth-capped).
+        // `base` scopes relative URLs (e.g. the `href` of a `<link>` sheet).
+        fn add_css(engine: &mut Engine, rules: &mut RuleSet, css: &str, media: &MediaContext, base: Option<&str>, depth: usize, visited: &mut std::collections::HashSet<String>) {
+            if depth > 8 {
+                return;
+            }
+            let sheet = rendrix_css::parser::parse_cached(css);
+            // Partition: imports splice in place (recursively), everything else indexes.
+            let mut rest = Vec::new();
+            for rule in &sheet.rules {
+                if let Rule::Import(url, mq) = rule {
+                    if !mq.trim().is_empty() && mq.to_ascii_lowercase() != "all" {
+                        // Gate on the import's media query (best-effort; unknown media = apply).
+                        let list = MediaQueryList::parse(mq);
+                        // `matches` needs a full context; reuse the current one.
+                        if !list.matches(media) {
+                            continue;
+                        }
+                    }
+                    let key = resolve_import_key(url, base);
+                    if !visited.insert(key.clone()) {
+                        continue;
+                    }
+                    if let Some(bytes) = engine.assets.read(&key) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let nested_base = base_dir(&key);
+                        add_css(engine, rules, &text, media, nested_base.as_deref(), depth + 1, visited);
+                    } else if let Some(bytes) = engine.assets.read(url) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        add_css(engine, rules, &text, media, base, depth + 1, visited);
+                    }
+                } else {
+                    rest.push(rule.clone());
+                }
+            }
+            if !rest.is_empty() {
+                let tmp = rendrix_css::parser::Stylesheet { rules: rest };
+                rules.add_stylesheet(&tmp, Origin::Author, media);
+            }
+        }
+        fn base_dir(path: &str) -> Option<String> {
+            match path.rfind('/') {
+                Some(i) => Some(path[..i].to_string()),
+                None => None,
+            }
+        }
+        fn resolve_import_key(url: &str, base: Option<&str>) -> String {
+            let mut u = url.trim().to_string();
+            // Strip query/fragment for bundled-asset lookup.
+            if let Some(i) = u.find(['?', '#']) {
+                u.truncate(i);
+            }
+            while u.starts_with("./") {
+                u = u[2..].to_string();
+            }
+            if u.starts_with('/') {
+                u = u[1..].to_string();
+            }
+            if u.contains("://") || u.starts_with("data:") {
+                return u;
+            }
+            if let Some(b) = base {
+                if !b.is_empty() {
+                    return format!("{}/{}", b.trim_end_matches('/'), u);
+                }
+            }
+            u
+        }
         for n in self.doc.depth_first(root) {
             match self.doc.tag(n) {
                 Some("style") => {
                     let css = self.doc.text_content(n);
-                    rules.add_stylesheet(&rendrix_css::parser::parse_cached(&css), Origin::Author, &media);
+                    let mut visited = std::collections::HashSet::new();
+                    // Borrow-split: `add_css` needs `&mut Engine` but we hold
+                    // `&mut self` already — call inline via a local reborrow.
+                    // (Nested function takes `&mut Engine`; `self` coerces.)
+                    add_css(&mut *self, &mut rules, &css, &media, None, 0, &mut visited);
                 }
                 Some("link") => {
                     let is_sheet = self.doc.get_attr(n, "rel").is_some_and(|r| r.eq_ignore_ascii_case("stylesheet"));
                     if is_sheet {
-                        if let Some(href) = self.doc.get_attr(n, "href") {
-                            if let Some(bytes) = self.assets.read(href) {
+                        if let Some(href) = self.doc.get_attr(n, "href").map(|h| h.to_string()) {
+                            if let Some(bytes) = self.assets.read(&href) {
                                 let css = String::from_utf8_lossy(&bytes).into_owned();
-                                rules.add_stylesheet(&rendrix_css::parser::parse_cached(&css), Origin::Author, &media);
+                                let mut visited = std::collections::HashSet::new();
+                                visited.insert(href.clone());
+                                let base = base_dir(&href);
+                                add_css(&mut *self, &mut rules, &css, &media, base.as_deref(), 0, &mut visited);
                             }
                         }
                     }
@@ -75,8 +190,9 @@ impl Engine {
                 _ => {}
             }
         }
-        for sheet in &self.adopted_sheets {
-            rules.add_stylesheet(&rendrix_css::parser::parse_cached(sheet), Origin::Author, &media);
+        for sheet in self.adopted_sheets.clone() {
+            let mut visited = std::collections::HashSet::new();
+            add_css(&mut *self, &mut rules, &sheet, &media, None, 0, &mut visited);
         }
         // Register @font-face fonts that point at bundled assets.
         let faces = rules.font_faces.clone();
@@ -98,6 +214,7 @@ impl Engine {
     /// Returns whether any computed style actually changed.
     pub(crate) fn restyle(&mut self, all: bool, roots: Vec<NodeId>, state_roots: Vec<NodeId>) -> bool {
         self.style_changed = all;
+        self.style_layout_changed = false;
         let sc = self.style_context();
         let cap = self.doc_capacity();
         if self.styles.len() < cap {
@@ -166,6 +283,8 @@ impl Engine {
                     let prev = self.pseudo.get(&(id, key)).cloned();
                     if fresh.as_deref() != prev.as_deref() {
                         self.style_changed = true;
+                        // Generated boxes affect layout; be conservative.
+                        self.style_layout_changed = true;
                     }
                     match fresh {
                         Some(s) => {
@@ -180,6 +299,15 @@ impl Engine {
                 let unchanged = old.as_ref().is_some_and(|o| **o == *new);
                 if !unchanged {
                     self.style_changed = true;
+                    // New boxes always need layout; otherwise only when a
+                    // layout-affecting property differs (paint-only changes skip Taffy).
+                    let layout_diff = match old.as_ref() {
+                        None => true,
+                        Some(o) => !o.layout_eq(&new),
+                    };
+                    if layout_diff {
+                        self.style_layout_changed = true;
+                    }
                 }
                 self.update_motion(id, old.as_ref(), &new);
                 // Keep the old Arc when nothing changed so cached comparisons stay cheap.
@@ -302,6 +430,115 @@ impl Engine {
             self.anim.remove(&id);
         }
         any
+    }
+
+    /// True when any currently-running transition or keyframe animation can
+    /// change box geometry. Paint-only motion (opacity, colours, transforms, …)
+    /// returns false so frames repaint without a Taffy re-solve.
+    pub(crate) fn anim_needs_layout(&self) -> bool {
+        for (id, st) in &self.anim {
+            for t in &st.transitions {
+                if ComputedStyle::is_layout_prop(t.prop) {
+                    // `all` is conservative: check whether the endpoints actually
+                    // differ in a layout-affecting property.
+                    if t.prop != "all" {
+                        return true;
+                    }
+                    if let Some(base) = self.styles.get(*id as usize).and_then(|s| s.as_ref()) {
+                        if !t.from.layout_eq(base) {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
+                }
+            }
+            for a in &st.animations {
+                // Only running animations force per-frame layout; retained
+                // fill-forwards finales are static (their geometry is already built).
+                let running = self
+                    .styles
+                    .get(*id as usize)
+                    .and_then(|s| s.as_ref())
+                    .and_then(|b| b.animations.get(a.spec_index))
+                    .is_some_and(|s| {
+                        s.iterations.is_infinite()
+                            || (self.now - a.start) as f32 - s.delay < s.duration * s.iterations
+                    });
+                if !running {
+                    continue;
+                }
+                let Some(kf) = self.rules.keyframes.get(&a.name) else { continue };
+                // Inspect the keyframe declarations: any layout-affecting name forces layout.
+                if kf
+                    .frames
+                    .iter()
+                    .flat_map(|(_, decls)| decls.iter())
+                    .any(|d| ComputedStyle::decl_affects_layout(&d.name))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Ids with running paint-only motion (transitions/animations that do not
+    /// affect layout). Their boxes must be rebuilt each frame for fresh
+    /// effective styles, but Taffy can be skipped.
+    pub(crate) fn anim_paint_ids(&self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        for (id, st) in &self.anim {
+            if st.transitions.is_empty() && st.animations.is_empty() {
+                continue;
+            }
+            // Skip layout-affecting motion here; the full layout path covers it.
+            // (Check per-node to avoid one width transition forcing all nodes paint-only.)
+            let mut needs_layout = false;
+            for t in &st.transitions {
+                if ComputedStyle::is_layout_prop(t.prop) {
+                    if t.prop != "all" {
+                        needs_layout = true;
+                        break;
+                    }
+                    if let Some(base) = self.styles.get(*id as usize).and_then(|s| s.as_ref()) {
+                        if !t.from.layout_eq(base) {
+                            needs_layout = true;
+                            break;
+                        }
+                    } else {
+                        needs_layout = true;
+                        break;
+                    }
+                }
+            }
+            if !needs_layout {
+                for a in &st.animations {
+                    let running = self
+                        .styles
+                        .get(*id as usize)
+                        .and_then(|s| s.as_ref())
+                        .and_then(|b| b.animations.get(a.spec_index))
+                        .is_some_and(|s| {
+                            s.iterations.is_infinite()
+                                || (self.now - a.start) as f32 - s.delay < s.duration * s.iterations
+                        });
+                    if !running {
+                        continue;
+                    }
+                    if let Some(kf) = self.rules.keyframes.get(&a.name) {
+                        if kf.frames.iter().flat_map(|(_, d)| d.iter()).any(|d| ComputedStyle::decl_affects_layout(&d.name)) {
+                            needs_layout = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !needs_layout {
+                out.push(*id);
+            }
+        }
+        out
     }
 
     /// Effective style of an element at the engine's current time.

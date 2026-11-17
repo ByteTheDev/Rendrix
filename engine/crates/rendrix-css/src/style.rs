@@ -49,6 +49,12 @@ keyword_enum!(TextAlign {
 keyword_enum!(WhiteSpace {
     Normal => "normal", NoWrap => "nowrap", Pre => "pre", PreWrap => "pre-wrap", PreLine => "pre-line",
 } default Normal);
+keyword_enum!(WordBreak {
+    Normal => "normal", BreakAll => "break-all", KeepAll => "keep-all",
+} default Normal);
+keyword_enum!(ContainerType {
+    Normal => "normal", InlineSize => "inline-size", Size => "size",
+} default Normal);
 keyword_enum!(FontStyle { Normal => "normal", Italic => "italic", Oblique => "oblique" } default Normal);
 keyword_enum!(BoxSizing { ContentBox => "content-box", BorderBox => "border-box" } default ContentBox);
 keyword_enum!(Visibility { Visible => "visible", Hidden => "hidden", Collapse => "collapse" } default Visible);
@@ -386,7 +392,16 @@ pub struct ComputedStyle {
     pub text_decoration: TextDecoration,
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
+    pub word_break: WordBreak,
     pub text_overflow_ellipsis: bool,
+    /// `-webkit-line-clamp`: maximum number of visible lines before an ellipsis.
+    /// Only effective with `display: -webkit-box` / `-webkit-box-orient: vertical`
+    /// semantics; we apply it whenever set and the content is clipped.
+    pub line_clamp: Option<u32>,
+    /// `container-type`: makes the box a query container for its descendants.
+    pub container_type: ContainerType,
+    /// `container-name`: name(s) matched by `@container <name>`.
+    pub container_name: Option<String>,
     pub caret_color: Option<Color>,
     pub list_style_none: bool,
 
@@ -484,7 +499,11 @@ impl Default for ComputedStyle {
             text_decoration: TextDecoration::default(),
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
+            word_break: WordBreak::Normal,
             text_overflow_ellipsis: false,
+            line_clamp: None,
+            container_type: ContainerType::Normal,
+            container_name: None,
             caret_color: None,
             list_style_none: false,
             transitions: Vec::new(),
@@ -510,6 +529,8 @@ impl ComputedStyle {
             text_transform: parent.text_transform,
             text_shadow: parent.text_shadow.clone(),
             white_space: parent.white_space,
+            word_break: parent.word_break,
+            line_clamp: parent.line_clamp,
             visibility: parent.visibility,
             cursor: parent.cursor,
             caret_color: parent.caret_color,
@@ -531,6 +552,139 @@ impl ComputedStyle {
 
     pub fn has_transform(&self) -> bool {
         !self.transform.is_empty()
+    }
+
+    /// True when `other` would lay out identically: every property that feeds
+    /// box generation, Taffy styles or text measurement is equal. Paint-only
+    /// properties (colours, shadows, transforms, opacity, filters, …) are ignored,
+    /// so a change confined to those can repaint without re-laying-out.
+    pub fn layout_eq(&self, other: &Self) -> bool {
+        self.display == other.display
+            && self.position == other.position
+            && self.inset == other.inset
+            && self.float == other.float
+            && self.clear == other.clear
+            && self.overflow_x == other.overflow_x
+            && self.overflow_y == other.overflow_y
+            && self.box_sizing == other.box_sizing
+            && self.width == other.width
+            && self.height == other.height
+            && self.min_width == other.min_width
+            && self.min_height == other.min_height
+            && self.max_width == other.max_width
+            && self.max_height == other.max_height
+            && self.aspect_ratio == other.aspect_ratio
+            && self.margin == other.margin
+            && self.padding == other.padding
+            && self.border_width == other.border_width
+            && self.flex_direction == other.flex_direction
+            && self.flex_wrap == other.flex_wrap
+            && self.flex_grow.to_bits() == other.flex_grow.to_bits()
+            && self.flex_shrink.to_bits() == other.flex_shrink.to_bits()
+            && self.flex_basis == other.flex_basis
+            && self.order == other.order
+            && self.align_items == other.align_items
+            && self.align_self == other.align_self
+            && self.align_content == other.align_content
+            && self.justify_content == other.justify_content
+            && self.justify_items == other.justify_items
+            && self.justify_self == other.justify_self
+            && self.row_gap == other.row_gap
+            && self.column_gap == other.column_gap
+            && self.column_count == other.column_count
+            && self.column_width == other.column_width
+            && self.column_span_all == other.column_span_all
+            && self.grid_template_columns == other.grid_template_columns
+            && self.grid_template_rows == other.grid_template_rows
+            && self.grid_template_areas == other.grid_template_areas
+            && self.grid_auto_columns == other.grid_auto_columns
+            && self.grid_auto_rows == other.grid_auto_rows
+            && self.grid_auto_flow == other.grid_auto_flow
+            && self.grid_column == other.grid_column
+            && self.grid_row == other.grid_row
+            && self.grid_area == other.grid_area
+            && self.content == other.content
+            && self.font_family == other.font_family
+            && self.font_size.to_bits() == other.font_size.to_bits()
+            && self.font_weight == other.font_weight
+            && self.font_style == other.font_style
+            && self.line_height == other.line_height
+            && self.letter_spacing.to_bits() == other.letter_spacing.to_bits()
+            && self.word_spacing.to_bits() == other.word_spacing.to_bits()
+            && self.text_align == other.text_align
+            && self.text_transform == other.text_transform
+            && self.white_space == other.white_space
+            && self.word_break == other.word_break
+            && self.line_clamp == other.line_clamp
+            && self.container_type == other.container_type
+            && self.text_overflow_ellipsis == other.text_overflow_ellipsis
+            && self.list_style_none == other.list_style_none
+            // `visibility` preserves space, so it never affects layout.
+            // Everything else (colours, backgrounds, shadows, transforms, opacity,
+            // filters, clip-path, outlines, cursors, …) is paint-only.
+    }
+
+    /// True when an animatable/transitionable property can change box geometry.
+    /// Paint-only props (opacity, colours, shadows, transforms, …) return false,
+    /// so their animations repaint without a Taffy re-solve.
+    pub fn is_layout_prop(prop: &str) -> bool {
+        matches!(
+            prop,
+            "width"
+                | "height"
+                | "min-width"
+                | "min-height"
+                | "max-width"
+                | "max-height"
+                | "margin"
+                | "margin-top"
+                | "margin-right"
+                | "margin-bottom"
+                | "margin-left"
+                | "padding"
+                | "padding-top"
+                | "padding-right"
+                | "padding-bottom"
+                | "padding-left"
+                | "top"
+                | "right"
+                | "bottom"
+                | "left"
+                | "font-size"
+                | "letter-spacing"
+                | "word-spacing"
+                | "flex-grow"
+                | "flex-shrink"
+                | "flex-basis"
+                | "flex"
+                | "gap"
+                | "row-gap"
+                | "column-gap"
+                | "border-width"
+                | "border-top-width"
+                | "border-right-width"
+                | "border-bottom-width"
+                | "border-left-width"
+                | "border"
+                | "all"
+        )
+    }
+
+    /// True when a keyframe/animation declaration name can affect layout.
+    /// Paint-only names (colours, opacity, shadows, transforms, …) return false;
+    /// unknown names return true (conservative: assume a re-layout is needed).
+    pub fn decl_affects_layout(name: &str) -> bool {
+        let n = name.trim().to_ascii_lowercase();
+        if n.starts_with("--") {
+            return true;
+        }
+        match n.as_str() {
+            "opacity" | "color" | "background-color" | "background" | "border-color" | "border-radius"
+            | "outline-color" | "transform" | "box-shadow" | "text-shadow" | "filter"
+            | "backdrop-filter" | "clip-path" | "mask-image" | "mask" | "visibility"
+            | "z-index" | "pointer-events" | "cursor" | "object-fit" => false,
+            _ => true,
+        }
     }
 
     /// Number of multi-column tracks, if this box establishes a column container.

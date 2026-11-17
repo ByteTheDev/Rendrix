@@ -8,9 +8,25 @@ use wgpu::util::DeviceExt;
 use rendrix_css::animation::{mat_apply, mat_mul, Matrix, IDENTITY};
 use rendrix_css::{Color, FilterOp};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
 const ATLAS_SIZE: u32 = 2048;
+/// Edge length of the shared image atlas. Small ordinary images are packed here so
+/// consecutive `<img>`/background images share one bind group (and therefore one batch).
+const IMAGE_ATLAS_SIZE: u32 = 2048;
+/// Images with either edge above this stay on the dedicated per-image texture path.
+const IMAGE_ATLAS_MAX: u32 = 512;
+/// Canvas ids are `0x8000_0000 | node`; they own a dynamic texture and must never be atlased.
+const CANVAS_ID_FLAG: ImageId = 0x8000_0000;
 const NO_CLIP: [f32; 4] = [-1.0e6, -1.0e6, 2.0e6, 2.0e6];
+/// Upper bound on idle offscreen targets retained between frames. Without a cap, a page
+/// cycling through many distinct layer sizes grows GPU memory without limit.
+const MAX_TARGETS: usize = 32;
+
+/// Round `n` up to the next multiple of `align` (`align` is a power of two).
+fn align_to(n: usize, align: usize) -> usize {
+    (n + align - 1) / align * align
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -23,6 +39,10 @@ struct Inst {
     radii: [f32; 4],
     border: [f32; 4],
     bcolor: [f32; 4],
+    /// Per-side border colours [top, right, bottom, left], premultiplied by alpha.
+    bcolors: [[f32; 4]; 4],
+    /// Per-side border style codes: 0 solid, 1 dashed, 2 dotted, 3 double.
+    bstyle: [f32; 4],
     clip: [f32; 4],
     uv: [f32; 4],
     extra: [f32; 4],
@@ -44,6 +64,8 @@ enum Tex {
     #[allow(dead_code)]
     White,
     Atlas,
+    /// The shared image atlas (many small images in one texture, one bind group).
+    ImageAtlas,
     Image(ImageId),
 }
 
@@ -59,6 +81,55 @@ struct ImageTex {
     texture: wgpu::Texture,
     pub width: u32,
     pub height: u32,
+}
+
+/// A shared RGBA8 texture packing many small images into one GPU texture. Consecutive
+/// image draws can then share a bind group and merge into a single batch, instead of
+/// paying one batch per visible image. Larger (or atlas-full) images keep the
+/// dedicated per-image texture path; canvases always do (they have a dynamic upload).
+struct ImageAtlas {
+    texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
+    size: u32,
+    /// Allocated slot `(x, y, w, h)` per image id, where `w`/`h` are the interior
+    /// image size in pixels. Each slot has a 1px gutter (see `alloc`) so LINEAR
+    /// sampling at an edge never bleeds into a neighbour.
+    slots: HashMap<ImageId, (u32, u32, u32, u32)>,
+    cursor_x: u32,
+    cursor_y: u32,
+    row_h: u32,
+}
+
+impl ImageAtlas {
+    /// Reserve a slot for `id`, reusing the existing slot when the size is unchanged
+    /// (so a re-upload overwrites in place). Returns the slot's top-left atlas pixel.
+    /// `None` means the image does not fit; the caller falls back to a dedicated
+    /// texture. A different-size re-upload migrates to a fresh slot; the old pixels
+    /// stay in the atlas but are no longer referenced by any instance.
+    fn alloc(&mut self, id: ImageId, w: u32, h: u32) -> Option<(u32, u32)> {
+        if let Some(&(x, y, sw, sh)) = self.slots.get(&id) {
+            if sw == w && sh == h {
+                return Some((x, y));
+            }
+        }
+        let (need_w, need_h) = (w + 2, h + 2); // 1px gutter on all four sides
+        if need_w > self.size || need_h > self.size {
+            return None;
+        }
+        if self.cursor_x + need_w > self.size {
+            self.cursor_x = 0;
+            self.cursor_y += self.row_h;
+            self.row_h = 0;
+        }
+        if self.cursor_y + need_h > self.size {
+            return None;
+        }
+        let (x, y) = (self.cursor_x, self.cursor_y);
+        self.cursor_x += need_w;
+        self.row_h = self.row_h.max(need_h);
+        self.slots.insert(id, (x, y, w, h));
+        Some((x, y))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +184,218 @@ struct ClipEntry {
     rect: [f32; 4],
     radius: f32,
     ellipse: bool,
+}
+
+// ---- Offscreen compositing layers -----------------------------------------------------
+//
+// A layer is rendered into its own RGBA8 target and composited as a single quad. This is the
+// only path that can read already-rasterised pixels, so `backdrop-filter`, true `filter:
+// blur()`, per-pixel `clip-path: polygon()` and isolated opacity use it. Frames without a
+// `PushLayer` never touch this machinery — the one-pipeline instanced path is unchanged.
+
+/// An offscreen render target, reusable across frames of the same size.
+struct TargetTex {
+    #[allow(dead_code)] // kept alive with the view/bind group for the pool's lifetime
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    #[allow(dead_code)] // bind group for the image path if a layer is reused as a texture
+    bind: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+    /// Stable identity, used to validate a cached composite bind group across frames.
+    uid: u64,
+    /// Last pool tick at which this target was acquired/returned (LRU eviction).
+    last_use: u64,
+    /// Cached composite texture bind group plus the uids of the three textures it binds.
+    /// Reused whenever a later layer binds the same trio (typically the same backdrop
+    /// accumulator across frames), avoiding a fresh descriptor allocation per layer.
+    comp_bind: Option<([u64; 3], wgpu::BindGroup)>,
+}
+
+/// Fixed-size uniform block for the composite shader (7 vec4s, 112 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LayerU {
+    viewport: [f32; 4],       // xy = target size in device px
+    layer_texel: [f32; 4],    // xy = 1 / layer texture size
+    backdrop_texel: [f32; 4], // xy = 1 / backdrop texture size
+    rect: [f32; 4],           // layer bounds in device px (x, y, w, h)
+    params: [f32; 4],         // opacity, content sigma, backdrop sigma, radius (device px)
+    filter: [f32; 4],         // grayscale, brightness, has-backdrop (0/1), polygon point count
+    fx2: [f32; 4],            // xy = backdrop grayscale / brightness (backdrop-filter ops)
+}
+
+/// Per-draw-chunk GPU state. Every pass of a top-level frame is recorded into a single
+/// command encoder and submitted once, so all `queue.write_buffer` calls land before that
+/// submit. Two flat runs sharing one instance buffer would therefore both draw the *last*
+/// chunk's instances; each chunk owns its instance/3D-uniform buffers to avoid that.
+struct DrawSlot {
+    inst_buf: wgpu::Buffer,
+    inst_cap: usize,
+    /// Per-chunk globals: a nested layer render has a different viewport, so sharing
+    /// this buffer would make the last chunk's viewport win for every pass.
+    globals_buf: wgpu::Buffer,
+    globals_bind: wgpu::BindGroup,
+    td_frame_buf: wgpu::Buffer,
+    td_mesh_buf: wgpu::Buffer,
+    td_bind: wgpu::BindGroup,
+}
+
+const MAX_POLY_POINTS: usize = 64;
+
+struct Composite {
+    pipeline: wgpu::RenderPipeline,
+    /// REPLACE-blend variant used for backdrop-filter layers: the shader resolves the
+    /// backdrop itself, so the old destination must not be blended in a second time.
+    replace_pipeline: wgpu::RenderPipeline,
+    /// Horizontal Gaussian pass into a layer-sized intermediate target.
+    blur_pipeline: wgpu::RenderPipeline,
+    /// Exact 1:1 copy of the finished offscreen frame into the caller's target view.
+    blit_pipeline: wgpu::RenderPipeline,
+    #[allow(dead_code)] // owned so the uniform bind group keeps a valid layout
+    u_layout: wgpu::BindGroupLayout,
+    t_layout: wgpu::BindGroupLayout,
+    u_buf: wgpu::Buffer,
+    u_bind: wgpu::BindGroup,
+    sampler: wgpu::Sampler,
+    /// One uniform/polygon buffer pair per GPU pass in the current frame. Distinct slots
+    /// let every layer's blur/composite passes share a single encoder and submit: all the
+    /// `write_buffer` calls land before the submit, so each pass must own its bytes.
+    slots: Vec<PassSlot>,
+    slot_used: usize,
+}
+
+struct PassSlot {
+    u_buf: wgpu::Buffer,
+    poly_buf: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+}
+
+/// A slice of the display list to draw into one target, with any ancestor transform/clip
+/// markers that were open at that point replayed around it so flatten state is preserved.
+struct FlatSegment {
+    items: Vec<Item>,
+}
+
+/// A planned offscreen layer: the layer's own subtree plus the ancestor markers that were
+/// open at its boundary. The painted prefix is captured by a single frame snapshot instead
+/// of being copied into each layer plan.
+enum Segment {
+    Flat(FlatSegment),
+    Layer {
+        info: LayerInfo,
+        open: Vec<Item>,
+        children: Vec<Item>,
+    },
+}
+
+fn make_composite(device: &wgpu::Device, format: wgpu::TextureFormat) -> Composite {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("rendrix composite shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
+    });
+    let u_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("rendrix composite uniforms"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+        ],
+    });
+    let t_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("rendrix composite textures"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("rendrix composite layout"),
+        bind_group_layouts: &[&u_layout, &t_layout],
+        push_constant_ranges: &[],
+    });
+    let make_pipeline = |label: &'static str, vs: &'static str, fs: &'static str, blend: Option<wgpu::BlendState>, topology: wgpu::PrimitiveTopology| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some(vs), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { topology, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        })
+    };
+    let strip = wgpu::PrimitiveTopology::TriangleStrip;
+    let pipeline = make_pipeline("rendrix composite pipeline", "vs_main", "fs_main", Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), strip);
+    let replace_pipeline = make_pipeline("rendrix composite replace", "vs_main", "fs_main", Some(wgpu::BlendState::REPLACE), strip);
+    let blur_pipeline = make_pipeline("rendrix composite blur-h", "vs_main", "fs_blur_h", Some(wgpu::BlendState::REPLACE), strip);
+    let blit_pipeline = make_pipeline("rendrix composite blit", "vs_blit", "fs_blit", Some(wgpu::BlendState::REPLACE), wgpu::PrimitiveTopology::TriangleList);
+    let u_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rendrix composite uniforms"),
+        size: std::mem::size_of::<LayerU>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let poly_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rendrix composite polygon"),
+        size: (MAX_POLY_POINTS * 8) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let u_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rendrix composite uniforms bind"),
+        layout: &u_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: u_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: poly_buf.as_entire_binding() },
+        ],
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        ..Default::default()
+    });
+    Composite { pipeline, replace_pipeline, blur_pipeline, blit_pipeline, u_layout, t_layout, u_buf, u_bind, sampler, slots: Vec::new(), slot_used: 0 }
 }
 
 /// Order resident glyphs newest-first for LRU repack (pure helper, unit-tested).
@@ -184,15 +467,22 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    #[allow(dead_code)] // template buffer retained for renderer compatibility
     globals_buf: wgpu::Buffer,
+    #[allow(dead_code)] // template bind group retained for renderer compatibility
     globals_bind: wgpu::BindGroup,
     g_layout: wgpu::BindGroupLayout,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     white_bind: wgpu::BindGroup,
+    /// View of the 1x1 white texture, used as a neutral backdrop/mask in layer compositing.
+    white_view: wgpu::TextureView,
     atlas: Atlas,
+    /// Shared texture for small decoded images (one bind group, batched draws).
+    image_atlas: ImageAtlas,
     images: HashMap<ImageId, ImageTex>,
     next_image: ImageId,
+    #[allow(dead_code)] // template buffer retained for renderer compatibility
     inst_buf: wgpu::Buffer,
     inst_cap: usize,
     /// Number of instances drawn in the last frame (profiling).
@@ -200,9 +490,13 @@ pub struct Renderer {
     pub last_batches: usize,
     // ---- 3D forward pass (R6.2 v1) -------------------------------------------------
     td_pipeline: wgpu::RenderPipeline,
+    /// Kept so the 3D bind group can be rebuilt when the uniform buffers grow.
+    td_layout: wgpu::BindGroupLayout,
     td_bind: wgpu::BindGroup,
     td_frame_buf: wgpu::Buffer,
     td_mesh_buf: wgpu::Buffer,
+    /// Dynamic uniform offset alignment for this device (at least 256 bytes).
+    td_align: usize,
     td_box: GpuMesh,
     td_plane: GpuMesh,
     td_sphere: GpuMesh,
@@ -213,6 +507,23 @@ pub struct Renderer {
     last_size: (u32, u32),
     /// 3D meshes drawn in the last frame (profiling).
     pub last_3d_meshes: usize,
+    // ---- Offscreen compositing layers -------------------------------------------------
+    comp: Composite,
+    /// Idle per-chunk draw state, reused across frames.
+    draw_slots: Vec<DrawSlot>,
+    /// Slots used by the frame currently being recorded. They must not return to the
+    /// idle pool until after the single submit, or a later chunk would overwrite the
+    /// instance/3D uniforms referenced by an earlier pass in the same encoder.
+    active_draw_slots: Vec<DrawSlot>,
+    targets: Vec<TargetTex>,
+    /// Monotonic tick for target-pool LRU bookkeeping.
+    target_clock: u64,
+    /// Monotonic id assigned to every offscreen target (bind-group cache signature).
+    next_target_uid: u64,
+    /// Number of offscreen layer passes in the last frame (profiling).
+    pub last_layers: usize,
+    /// True while rendering a layer's children/backdrop (nested renders must not reset counters).
+    rendering_layer: bool,
 }
 
 impl Renderer {
@@ -227,6 +538,7 @@ impl Renderer {
     /// Exists for overflow-recovery tests; production keeps the default.
     pub fn with_atlas_size(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, atlas_size: u32) -> Renderer {
         let atlas_size = atlas_size.max(16);
+        let comp = make_composite(&device, format);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rendrix shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -322,6 +634,7 @@ impl Renderer {
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         let white_bind = bind_for(&white);
+        let white_view = white.create_view(&Default::default());
         let atlas_tex = make_tex(atlas_size, atlas_size, "rendrix glyph atlas");
         // A 2x2 opaque white block at the atlas origin: shapes sample it, so rects, shadows and glyphs
         // share one texture and consecutive draws merge into a single batch.
@@ -332,6 +645,10 @@ impl Renderer {
             wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
         );
         let atlas_bind = bind_for(&atlas_tex);
+        // Separate from the glyph atlas: glyphs are LRU-recycled on overflow, while
+        // image slots stay put for the renderer's lifetime (re-uploads overwrite in place).
+        let image_atlas_tex = make_tex(IMAGE_ATLAS_SIZE, IMAGE_ATLAS_SIZE, "rendrix image atlas");
+        let image_atlas_bind = bind_for(&image_atlas_tex);
         let inst_cap = 1024;
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rendrix instances"),
@@ -345,46 +662,45 @@ impl Renderer {
             label: Some("rendrix 3d shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("scene3d.wgsl").into()),
         });
+        // One slot per scene and per mesh, addressed with dynamic offsets. All draws
+        // share a single encoder/submit, so rewriting a single buffer slot per draw
+        // would make the last scene/mesh win for *every* draw. Uniform offsets must
+        // be aligned to the device limit (>= 256 bytes).
+        let td_align = (device.limits().min_uniform_buffer_offset_alignment as usize).max(256);
+        let td_frame_slot = align_to(std::mem::size_of::<FrameU>(), td_align) as u64;
+        let td_mesh_slot = align_to(std::mem::size_of::<MeshU>(), td_align) as u64;
+        let td_frame_slot_nz = NonZeroU64::new(td_frame_slot).unwrap();
+        let td_mesh_slot_nz = NonZeroU64::new(td_mesh_slot).unwrap();
         let td_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rendrix 3d uniforms"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: Some(td_frame_slot_nz) },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: Some(td_mesh_slot_nz) },
                     count: None,
                 },
             ],
         });
-        // Two buffers (frame: viewProj/camera/lights, rewritten per scene; mesh:
-        // model/material, rewritten per mesh) so every binding sits at offset 0 —
-        // uniform binding offsets must respect the 256-byte alignment limit.
         let td_frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rendrix 3d frame"),
-            size: std::mem::size_of::<FrameU>() as u64,
+            size: td_frame_slot,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let td_mesh_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rendrix 3d mesh"),
-            size: std::mem::size_of::<MeshU>() as u64,
+            size: td_mesh_slot,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let td_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rendrix 3d bind"),
-            layout: &td_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: td_frame_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: td_mesh_buf.as_entire_binding() },
-            ],
-        });
+        let td_bind = Renderer::make_td_bind(&device, &td_layout, &td_frame_buf, &td_mesh_buf, td_frame_slot_nz, td_mesh_slot_nz);
         let td_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("rendrix 3d layout"), bind_group_layouts: &[&td_layout], push_constant_ranges: &[] });
         let td_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("rendrix 3d pipeline"),
@@ -442,7 +758,9 @@ impl Renderer {
             tex_layout,
             sampler,
             white_bind,
+            white_view,
             atlas: Atlas { texture: atlas_tex, bind: atlas_bind, size: atlas_size, map: HashMap::new(), recency: HashMap::new(), clock: 0, cursor_x: 3, cursor_y: 0, row_h: 3, evictions: 0, generation: 0, overflowed: false },
+            image_atlas: ImageAtlas { texture: image_atlas_tex, bind: image_atlas_bind, size: IMAGE_ATLAS_SIZE, slots: HashMap::new(), cursor_x: 0, cursor_y: 0, row_h: 0 },
             images: HashMap::new(),
             next_image: 1,
             inst_buf,
@@ -450,9 +768,11 @@ impl Renderer {
             last_instances: 0,
             last_batches: 0,
             td_pipeline,
+            td_layout,
             td_bind,
             td_frame_buf,
             td_mesh_buf,
+            td_align,
             td_box,
             td_plane,
             td_sphere,
@@ -460,6 +780,14 @@ impl Renderer {
             depth: None,
             last_size: (1, 1),
             last_3d_meshes: 0,
+            comp,
+            draw_slots: Vec::new(),
+            active_draw_slots: Vec::new(),
+            targets: Vec::new(),
+            target_clock: 0,
+            next_target_uid: 1,
+            last_layers: 0,
+            rendering_layer: false,
         }
     }
 
@@ -472,6 +800,85 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: inst_buf.as_entire_binding() },
             ],
         })
+    }
+
+    #[inline]
+    fn td_frame_slot(&self) -> u64 {
+        align_to(std::mem::size_of::<FrameU>(), self.td_align) as u64
+    }
+
+    #[inline]
+    fn td_mesh_slot(&self) -> u64 {
+        align_to(std::mem::size_of::<MeshU>(), self.td_align) as u64
+    }
+
+    fn make_td_bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        frame_buf: &wgpu::Buffer,
+        mesh_buf: &wgpu::Buffer,
+        frame_slot: NonZeroU64,
+        mesh_slot: NonZeroU64,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rendrix 3d bind"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: frame_buf, offset: 0, size: Some(frame_slot) }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: mesh_buf, offset: 0, size: Some(mesh_slot) }),
+                },
+            ],
+        })
+    }
+
+    /// Grow the 3D uniform buffers to hold `frames` frame slots and `meshes` mesh
+    /// slots. Buffers (and the bind group referencing them) are only recreated when
+    /// capacity is actually exceeded, so steady frames reuse the same GPU memory.
+    fn ensure_td_capacity(&mut self, frames: usize, meshes: usize) {
+        let (fs, ms) = (self.td_frame_slot(), self.td_mesh_slot());
+        let need_f = (frames.max(1) as u64) * fs;
+        let need_m = (meshes.max(1) as u64) * ms;
+        if self.td_frame_buf.size() >= need_f && self.td_mesh_buf.size() >= need_m {
+            return;
+        }
+        if self.td_frame_buf.size() < need_f {
+            let mut cap = self.td_frame_buf.size().max(fs);
+            while cap < need_f {
+                cap *= 2;
+            }
+            self.td_frame_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rendrix 3d frame"),
+                size: cap,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if self.td_mesh_buf.size() < need_m {
+            let mut cap = self.td_mesh_buf.size().max(ms);
+            while cap < need_m {
+                cap *= 2;
+            }
+            self.td_mesh_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rendrix 3d mesh"),
+                size: cap,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        // The bind group pins the old buffer(s); rebuild it after any regrow.
+        self.td_bind = Self::make_td_bind(
+            &self.device,
+            &self.td_layout,
+            &self.td_frame_buf,
+            &self.td_mesh_buf,
+            NonZeroU64::new(fs).unwrap(),
+            NonZeroU64::new(ms).unwrap(),
+        );
     }
 
     /// Glyph-atlas recycles so far (each one LRU-repacked the atlas and re-uploaded).
@@ -511,10 +918,52 @@ impl Renderer {
         }
     }
 
+    /// Build a `(w+2)x(h+2)` premultiplied buffer with the edge pixels replicated
+    /// into a 1px gutter. LINEAR sampling at an image's border then never mixes in
+    /// transparent black or a neighbouring image's pixels.
+    fn pad_edges(pm: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let (w, h) = (w as usize, h as usize);
+        let mut out = vec![0u8; (w + 2) * (h + 2) * 4];
+        for j in 0..h + 2 {
+            let sj = j.saturating_sub(1).min(h - 1);
+            for i in 0..w + 2 {
+                let si = i.saturating_sub(1).min(w - 1);
+                let src = (sj * w + si) * 4;
+                let dst = (j * (w + 2) + i) * 4;
+                out[dst..dst + 4].copy_from_slice(&pm[src..src + 4]);
+            }
+        }
+        out
+    }
+
     /// Upload under a caller-chosen id (the engine owns id allocation).
     pub fn upload_image_as(&mut self, id: ImageId, rgba: &[u8], width: u32, height: u32) {
         let mut pm = rgba.to_vec();
         Self::premultiply(&mut pm);
+        // Canvas ids (high bit set) own a dynamic texture that `upload_canvas` /
+        // `update_canvas_region` write into directly, so they must keep the dedicated
+        // texture path. Small ordinary images share the image atlas; oversized images
+        // and images that no longer fit use the one-texture-per-image fallback.
+        if id & CANVAS_ID_FLAG == 0 && width > 0 && height > 0
+            && width <= IMAGE_ATLAS_MAX && height <= IMAGE_ATLAS_MAX
+        {
+            if let Some((x, y)) = self.image_atlas.alloc(id, width, height) {
+                let padded = Self::pad_edges(&pm, width, height);
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &self.image_atlas.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                    &padded,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some((width + 2) * 4), rows_per_image: Some(height + 2) },
+                    wgpu::Extent3d { width: width + 2, height: height + 2, depth_or_array_layers: 1 },
+                );
+                // Drop a stale dedicated texture from an earlier (e.g. larger) upload.
+                self.images.remove(&id);
+                return;
+            }
+        }
+        // Fallback: canvases, images over IMAGE_ATLAS_MAX, or an atlas with no room
+        // left. If this id previously lived in the atlas, invalidate that slot so
+        // flattening cannot reference stale pixels.
+        self.image_atlas.slots.remove(&id);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rendrix image"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -542,10 +991,12 @@ impl Renderer {
 
     pub fn image_size(&self, id: ImageId) -> Option<(u32, u32)> {
         self.images.get(&id).map(|i| (i.width, i.height))
+            .or_else(|| self.image_atlas.slots.get(&id).map(|&(_, _, w, h)| (w, h)))
     }
 
     pub fn free_image(&mut self, id: ImageId) {
         self.images.remove(&id);
+        self.image_atlas.slots.remove(&id);
     }
 
     // ---- Canvas 2D targets (A3) ------------------------------------------------------------
@@ -680,7 +1131,7 @@ impl Renderer {
             self.atlas.map.iter().filter_map(|(k, v)| v.is_none().then_some(*k)).collect();
         self.atlas.map.clear();
         self.atlas.recency.clear();
-        let (nlive, nblanks) = (live.len(), blanks.len());
+        let (_nlive, _nblanks) = (live.len(), blanks.len());
         for k in blanks {
             self.atlas.map.insert(k, None);
         }
@@ -722,64 +1173,164 @@ impl Renderer {
     }
 
     /// Draw a display list into `target` (`size_px` physical pixels, `scale` device px per logical px).
+    /// Every GPU pass of the frame is recorded into one encoder and submitted exactly once,
+    /// in display-list order. Nested layer renders share this encoder via [`Self::render_inner`].
     pub fn render(&mut self, list: &DisplayList, text: &mut TextSystem, target: &wgpu::TextureView, size_px: (u32, u32), scale: f32) {
-        self.begin_frame(text);
+        // Atlas recycling is only safe at the start of a TOP-LEVEL frame: nested
+        // render() calls from render_layer share the outer frame's already-emitted
+        // instances, and clearing/repacking the atlas mid-frame would leave those
+        // instances pointing at stale glyph slots. Everything else (layer, instance
+        // and batch counters) is per-frame bookkeeping that the top level owns too.
+        if !self.rendering_layer {
+            self.begin_frame(text);
+            self.last_layers = 0;
+            self.last_instances = 0;
+            self.last_batches = 0;
+            self.last_3d_meshes = 0;
+            self.comp.slot_used = 0;
+        }
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rendrix frame") });
+        self.render_inner(list, text, target, size_px, scale, &mut enc);
+        self.queue.submit(Some(enc.finish()));
+        self.draw_slots.append(&mut self.active_draw_slots);
+        self.last_size = size_px;
+    }
+
+    /// Record a display list into `enc` without submitting. The ordinary no-layer path
+    /// remains a single flat pass; layered frames interleave flat runs, snapshots, blurs
+    /// and composites in the original paint order.
+    fn render_inner(&mut self, list: &DisplayList, text: &mut TextSystem, target: &wgpu::TextureView, size_px: (u32, u32), scale: f32, enc: &mut wgpu::CommandEncoder) {
+        if !list.has_layers {
+            let mut slot = self.take_draw_slot();
+            self.render_chunk(list, text, enc, target, size_px, scale, !self.rendering_layer, &mut slot);
+            self.active_draw_slots.push(slot);
+            return;
+        }
+        // Layer frames paint into an offscreen target we own. That lets a backdrop-filter
+        // layer sample the already-painted prefix with a single GPU memcpy instead of
+        // re-rasterising the whole prefix, so N backdrop layers cost O(N) work, not O(N^2).
+        // The finished frame is published to the caller's view once, with a 1:1 blit.
+        let segments = plan_segments(&list.items);
+        let need_acc = segments.iter().any(|s| matches!(s, Segment::Layer { info, .. } if !info.backdrop.is_empty()));
+        let frame = self.target(size_px.0, size_px.1);
+        let acc = if need_acc { Some(self.target(size_px.0, size_px.1)) } else { None };
+        // Fold the clear into the first flat pass when one exists; only a layers-only
+        // frame (or a frame starting with a layer) needs a standalone clear pass.
+        let first_is_flat = matches!(segments.first(), Some(Segment::Flat(_)));
+        if !first_is_flat {
+            self.clear_target(enc, &frame.view, list.background);
+        }
+        for (i, seg) in segments.into_iter().enumerate() {
+            match seg {
+                Segment::Flat(s) => {
+                    let sub = DisplayList {
+                        has_3d: s.items.iter().any(|i| matches!(i, Item::Scene3D(_))),
+                        has_layers: false,
+                        width: list.width,
+                        height: list.height,
+                        background: list.background,
+                        items: s.items,
+                    };
+                    let mut slot = self.take_draw_slot();
+                    self.render_chunk(&sub, text, enc, &frame.view, size_px, scale, i == 0 && first_is_flat, &mut slot);
+                    self.active_draw_slots.push(slot);
+                }
+                Segment::Layer { info, open, children } => {
+                    let backdrop = if !info.backdrop.is_empty() {
+                        if let Some(a) = acc.as_ref() {
+                            self.snapshot_frame(enc, &frame, a);
+                            acc.as_ref()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    self.render_layer(&info, &open, &children, list, text, &frame.view, backdrop, enc, size_px, scale);
+                }
+            }
+        }
+        self.blit_frame(enc, &frame, target, size_px);
+        if let Some(a) = acc {
+            self.release_target(a);
+        }
+        self.release_target(frame);
+    }
+
+    /// Draw one flat slice of a display list into the frame's shared encoder. The
+    /// per-chunk `slot` owns the instance and 3D uniform buffers so later chunks cannot
+    /// overwrite data still referenced by earlier passes in the same encoder.
+    fn render_chunk(
+        &mut self,
+        list: &DisplayList,
+        text: &mut TextSystem,
+        enc: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        size_px: (u32, u32),
+        scale: f32,
+        clear: bool,
+        slot: &mut DrawSlot,
+    ) {
         let mut insts: Vec<Inst> = Vec::with_capacity(512);
         let mut batches: Vec<Batch> = Vec::new();
         let mut scenes: Vec<SceneDraw> = Vec::new();
         self.flatten(list, text, scale, &mut insts, &mut batches, &mut scenes);
-        self.last_instances = insts.len();
-        self.last_batches = batches.len();
+        // Accumulate across every chunk of the frame (flat runs, layer children and
+        // backdrop re-renders). The top-level `render` resets these to zero.
+        self.last_instances += insts.len();
+        self.last_batches += batches.len();
         self.last_size = size_px;
 
-        if insts.len() > self.inst_cap {
+        if insts.len() > slot.inst_cap {
             // Headroom growth: 25% + 256 instances of slack, rounded up, so a
             // frame that jitters around a power of two does not reallocate
             // every time it crosses the boundary.
             let want = insts.len() + insts.len() / 4 + 256;
-            let mut cap = self.inst_cap.max(1024);
+            let mut cap = slot.inst_cap.max(1024);
             while cap < want {
                 cap *= 2;
             }
-            self.inst_cap = cap;
-            self.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            slot.inst_cap = cap;
+            slot.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rendrix instances"),
-                size: (self.inst_cap * std::mem::size_of::<Inst>()) as u64,
+                size: (slot.inst_cap * std::mem::size_of::<Inst>()) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             // The globals bind group references the instance buffer, so it must
             // be recreated — once per regrow, not once per frame.
-            self.globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &self.globals_buf, &self.inst_buf);
+            slot.globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &self.globals_buf, &slot.inst_buf);
         }
         if !insts.is_empty() {
-            self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&insts));
+            self.queue.write_buffer(&slot.inst_buf, 0, bytemuck::cast_slice(&insts));
         }
-        self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&Globals { viewport: [size_px.0 as f32, size_px.1 as f32], pad: [0.0; 2] }));
+        self.queue.write_buffer(&slot.globals_buf, 0, bytemuck::bytes_of(&Globals { viewport: [size_px.0 as f32, size_px.1 as f32], pad: [0.0; 2] }));
 
         let bg = list.background;
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rendrix frame") });
+        let load = if clear {
+            wgpu::LoadOp::Clear(wgpu::Color { r: bg.r as f64, g: bg.g as f64, b: bg.b as f64, a: bg.a as f64 })
+        } else {
+            wgpu::LoadOp::Load
+        };
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("rendrix pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: bg.r as f64, g: bg.g as f64, b: bg.b as f64, a: bg.a as f64 }),
-                        store: wgpu::StoreOp::Store,
-                    },
+                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.globals_bind, &[]);
+            pass.set_bind_group(0, &slot.globals_bind, &[]);
             for b in &batches {
                 let bind = match b.tex {
                     Tex::White => &self.white_bind,
                     Tex::Atlas => &self.atlas.bind,
+                    Tex::ImageAtlas => &self.image_atlas.bind,
                     Tex::Image(id) => match self.images.get(&id) {
                         Some(i) => &i.bind,
                         None => continue,
@@ -794,19 +1345,464 @@ impl Renderer {
         // store lock (flag check), no depth texture, no extra submit.
         if list.has_3d && !scenes.is_empty() {
             let dv = self.depth_view(size_px.0.max(1), size_px.1.max(1));
-            self.last_3d_meshes = self.composite_3d(&mut encoder, target, &dv, &scenes, size_px);
+            // `composite_3d` writes into `self.td_*` and may grow them. Swap in this
+            // chunk's own buffers so a later chunk in the same frame cannot overwrite
+            // uniforms referenced by this one's already-recorded passes.
+            std::mem::swap(&mut self.td_frame_buf, &mut slot.td_frame_buf);
+            std::mem::swap(&mut self.td_mesh_buf, &mut slot.td_mesh_buf);
+            std::mem::swap(&mut self.td_bind, &mut slot.td_bind);
+            self.last_3d_meshes += self.composite_3d(enc, target, &dv, &scenes, size_px);
+            std::mem::swap(&mut self.td_frame_buf, &mut slot.td_frame_buf);
+            std::mem::swap(&mut self.td_mesh_buf, &mut slot.td_mesh_buf);
+            std::mem::swap(&mut self.td_bind, &mut slot.td_bind);
         } else {
-            self.last_3d_meshes = 0;
             if !list.has_3d && !self.td_tris.is_empty() {
                 self.td_tris.clear();
             }
         }
-        self.queue.submit(Some(encoder.finish()));
+    }
+
+    // ---- Offscreen layer implementation ---------------------------------------------
+
+    /// Reuse an offscreen target of the requested size, creating one on demand.
+    /// The idle pool is capped and evicts the least recently used target, so cycling
+    /// through many distinct layer sizes cannot grow GPU memory without limit.
+    fn target(&mut self, w: u32, h: u32) -> TargetTex {
+        let (w, h) = (w.max(1), h.max(1));
+        self.target_clock = self.target_clock.wrapping_add(1);
+        let now = self.target_clock;
+        if let Some(pos) = self.targets.iter().position(|t| t.width == w && t.height == h) {
+            let mut t = self.targets.remove(pos);
+            t.last_use = now;
+            return t;
+        }
+        if self.targets.len() >= MAX_TARGETS {
+            let lru = self.targets.iter().enumerate().min_by_key(|(_, t)| t.last_use).map(|(i, _)| i);
+            if let Some(i) = lru {
+                self.targets.remove(i);
+            }
+        }
+        let uid = self.next_target_uid;
+        self.next_target_uid = self.next_target_uid.wrapping_add(1);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rendrix layer target"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rendrix layer target bind"),
+            layout: &self.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        TargetTex { texture, view, bind, width: w, height: h, uid, last_use: now, comp_bind: None }
+    }
+
+    /// Return a target to the bounded LRU pool.
+    fn release_target(&mut self, mut t: TargetTex) {
+        t.last_use = self.target_clock;
+        self.targets.push(t);
+    }
+
+    /// Number of idle offscreen targets currently retained (test-only accessor).
+    #[cfg(test)]
+    pub(crate) fn target_pool_len(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Reserve a distinct uniform slot for one layer GPU pass. Slots are reused across
+    /// frames; the cursor is reset only at the top-level frame so nested renders cannot
+    /// overwrite a slot still referenced by the parent's unsubmitted encoder.
+    fn take_comp_slot(&mut self) -> usize {
+        let i = self.comp.slot_used;
+        self.comp.slot_used += 1;
+        if i == self.comp.slots.len() {
+            let u_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rendrix composite slot uniforms"),
+                size: std::mem::size_of::<LayerU>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let poly_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rendrix composite slot polygon"),
+                size: (MAX_POLY_POINTS * 8) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rendrix composite slot bind"),
+                layout: &self.comp.u_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: u_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: poly_buf.as_entire_binding() },
+                ],
+            });
+            self.comp.slots.push(PassSlot { u_buf, poly_buf, bind });
+        }
+        i
+    }
+
+    /// Take an idle per-chunk draw slot (creating one on demand). Slots stay out of the
+    /// pool for the whole frame so nested renders cannot reuse a buffer referenced by an
+    /// unsubmitted pass.
+    fn take_draw_slot(&mut self) -> DrawSlot {
+        if let Some(slot) = self.draw_slots.pop() {
+            return slot;
+        }
+        // Every slot needs its own allocation: `wgpu::Buffer::clone` shares the same GPU
+        // memory, and two chunks writing into one buffer before the single submit would
+        // make the last chunk's instances win for both passes.
+        let inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rendrix draw slot instances"),
+            size: (self.inst_cap * std::mem::size_of::<Inst>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let globals_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rendrix draw slot globals"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &globals_buf, &inst_buf);
+        let fs = self.td_frame_slot();
+        let ms = self.td_mesh_slot();
+        let td_frame_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rendrix draw slot 3d frame"),
+            size: fs,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let td_mesh_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rendrix draw slot 3d mesh"),
+            size: ms,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let td_bind = Self::make_td_bind(
+            &self.device,
+            &self.td_layout,
+            &td_frame_buf,
+            &td_mesh_buf,
+            NonZeroU64::new(fs).unwrap(),
+            NonZeroU64::new(ms).unwrap(),
+        );
+        DrawSlot { inst_buf, inst_cap: self.inst_cap, globals_buf, globals_bind, td_frame_buf, td_mesh_buf, td_bind }
+    }
+
+    /// Copy the finished offscreen frame into the sampleable backdrop accumulator.
+    /// This replaces the old "re-render the entire prefix per backdrop layer" path:
+    /// one GPU memcpy per backdrop layer instead of a full viewport rasterisation.
+    fn snapshot_frame(&mut self, enc: &mut wgpu::CommandEncoder, frame: &TargetTex, acc: &TargetTex) {
+        enc.copy_texture_to_texture(
+            frame.texture.as_image_copy(),
+            acc.texture.as_image_copy(),
+            wgpu::Extent3d { width: frame.width.min(acc.width), height: frame.height.min(acc.height), depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Exact 1:1 blit of the finished offscreen frame into the caller's target view.
+    /// The caller's view is write-only from this renderer's perspective, so a REPLACE
+    /// textured triangle is the only safe way to publish the frame without needing the
+    /// underlying `wgpu::Texture` handle for a texture-to-texture copy.
+    fn blit_frame(&mut self, enc: &mut wgpu::CommandEncoder, frame: &TargetTex, target: &wgpu::TextureView, size_px: (u32, u32)) {
+        let u = LayerU {
+            viewport: [size_px.0 as f32, size_px.1 as f32, 0.0, 2.0], // mode = plain REPLACE
+            layer_texel: [1.0 / frame.width as f32, 1.0 / frame.height as f32, 0.0, 0.0],
+            backdrop_texel: [0.0; 4],
+            rect: [0.0, 0.0, size_px.0 as f32, size_px.1 as f32],
+            params: [1.0, 0.0, 0.0, 0.0],
+            filter: [0.0, 1.0, 0.0, 0.0],
+            fx2: [0.0; 4],
+        };
+        self.queue.write_buffer(&self.comp.u_buf, 0, bytemuck::bytes_of(&u));
+        let tb = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rendrix blit bind"),
+            layout: &self.comp.t_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.white_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.white_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.comp.sampler) },
+            ],
+        });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rendrix blit pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.comp.blit_pipeline);
+            pass.set_bind_group(0, &self.comp.u_bind, &[]);
+            pass.set_bind_group(1, &tb, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Clear one offscreen target to `bg`, recorded into the shared frame encoder.
+    fn clear_target(&mut self, enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, bg: Color) {
+        {
+            let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rendrix layer clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: bg.r as f64, g: bg.g as f64, b: bg.b as f64, a: bg.a as f64 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+    }
+
+    /// Horizontal Gaussian pass into `dst` from one of the source textures, recorded into
+    /// the frame's shared encoder under its own uniform slot.
+    fn blur_horizontal(&mut self, enc: &mut wgpu::CommandEncoder, dst: &TargetTex, sigma: f32, source_is_backdrop: bool, layer_tex: &wgpu::TextureView, backdrop_tex: &wgpu::TextureView) {
+        let u = LayerU {
+            viewport: [dst.width as f32, dst.height as f32, sigma, if source_is_backdrop { 1.0 } else { 0.0 }],
+            layer_texel: [1.0 / dst.width as f32, 1.0 / dst.height as f32, 0.0, 0.0],
+            backdrop_texel: [0.0; 4],
+            rect: [0.0, 0.0, dst.width as f32, dst.height as f32],
+            params: [0.0; 4],
+            filter: [0.0; 4],
+            fx2: [0.0; 4],
+        };
+        let slot = self.take_comp_slot();
+        self.queue.write_buffer(&self.comp.slots[slot].u_buf, 0, bytemuck::bytes_of(&u));
+        let ub = self.comp.slots[slot].bind.clone();
+        let tb = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rendrix blur-h bind"),
+            layout: &self.comp.t_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(layer_tex) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(backdrop_tex) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(backdrop_tex) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.comp.sampler) },
+            ],
+        });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rendrix blur-h pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.comp.blur_pipeline);
+            pass.set_bind_group(0, &ub, &[]);
+            pass.set_bind_group(1, &tb, &[]);
+            pass.draw(0..4, 0..1);
+        }
+    }
+
+    /// Render one isolated layer: children into a transparent target, then composite it
+    /// (optionally over the already-captured `backdrop`) into the offscreen frame.
+    fn render_layer(
+        &mut self,
+        info: &LayerInfo,
+        open: &[Item],
+        children: &[Item],
+        list: &DisplayList,
+        text: &mut TextSystem,
+        target: &wgpu::TextureView,
+        backdrop: Option<&TargetTex>,
+        enc: &mut wgpu::CommandEncoder,
+        size_px: (u32, u32),
+        scale: f32,
+    ) {
+        // Ancestor transforms replayed around the layer give its device-space rect.
+        let mut xf = [scale, 0.0, 0.0, scale, 0.0, 0.0];
+        for item in open {
+            if let Item::PushTransform(m) = item {
+                xf = mat_mul(xf, *m);
+            }
+        }
+        let r = info.rect;
+        let corners = [
+            mat_apply(xf, r[0], r[1]),
+            mat_apply(xf, r[0] + r[2], r[1]),
+            mat_apply(xf, r[0], r[1] + r[3]),
+            mat_apply(xf, r[0] + r[2], r[1] + r[3]),
+        ];
+        let (x0f, x1f) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.0), a.1.max(c.0)));
+        let (y0f, y1f) = corners.iter().fold((f32::MAX, f32::MIN), |a, c| (a.0.min(c.1), a.1.max(c.1)));
+        let blur = |ops: &[FilterOp]| ops.iter().find_map(|op| if let FilterOp::Blur(r) = op { Some(*r) } else { None }).unwrap_or(0.0);
+        let (cb, bb) = (blur(&info.filter), blur(&info.backdrop));
+        // The separable kernel reaches +/-3.5 sigma in each direction; pad enough that
+        // the blurred halo is not clipped by the offscreen target bounds.
+        let reach = (cb + bb) * 3.5 * scale + 2.0;
+        let x0 = (x0f - reach).floor().max(0.0);
+        let y0 = (y0f - reach).floor().max(0.0);
+        let x1 = (x1f + reach).ceil().min(size_px.0 as f32);
+        let y1 = (y1f + reach).ceil().min(size_px.1 as f32);
+        let (lw, lh) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        if lw == 0 || lh == 0 {
+            return;
+        }
+        self.last_layers += 1;
+
+        // Children, shifted so the layer's device-space origin lands at the target origin.
+        let mut child_items = vec![Item::PushTransform([1.0, 0.0, 0.0, 1.0, -x0, -y0])];
+        child_items.extend_from_slice(open);
+        child_items.extend_from_slice(children);
+        for item in open.iter().rev() {
+            if let Some(c) = closing(item) {
+                child_items.push(c);
+            }
+        }
+        child_items.push(Item::PopTransform);
+        let child_list = DisplayList {
+            width: list.width,
+            height: list.height,
+            background: Color::from_u8(0, 0, 0, 0.0),
+            items: child_items,
+            has_3d: children.iter().any(|i| matches!(i, Item::Scene3D(_))),
+            has_layers: children.iter().any(|i| matches!(i, Item::PushLayer(_))),
+        };
+        let mut layer_tex = self.target(lw, lh);
+        // Pooled targets keep their previous contents. The layer quad covers the padded
+        // rect (reach + 2px), which `coverage()` treats as fully inside, so any stale
+        // pixel in that ring would be composited. Always start transparent.
+        self.clear_target(enc, &layer_tex.view, Color::from_u8(0, 0, 0, 0.0));
+        let prev_rendering_layer = self.rendering_layer;
+        self.rendering_layer = true;
+        self.render_inner(&child_list, text, &layer_tex.view, (lw, lh), scale, enc);
+        self.rendering_layer = prev_rendering_layer;
+
+        // The raw backdrop is the accumulated prefix snapshot (never the texture being
+        // written to), so the REPLACE composite can cross-fade antialiased edges with it.
+        let raw_view = backdrop.map(|b| b.view.clone()).unwrap_or_else(|| self.white_view.clone());
+        let backdrop_needed = !info.backdrop.is_empty() && backdrop.is_some();
+        let (csig, bsig) = (cb * scale, bb * scale);
+        // Separable blur: horizontal half into a layer-sized / full-viewport intermediate,
+        // vertical half in the composite fragment shader. No-blur layers skip both passes.
+        let content_h = if csig > 0.05 {
+            Some(self.target(lw, lh))
+        } else {
+            None
+        };
+        if let Some(h) = content_h.as_ref() {
+            self.blur_horizontal(enc, h, csig, false, &layer_tex.view, &raw_view);
+        }
+        let backdrop_h = if backdrop_needed && bsig > 0.05 {
+            Some(self.target(size_px.0, size_px.1))
+        } else {
+            None
+        };
+        if let Some(h) = backdrop_h.as_ref() {
+            self.blur_horizontal(enc, h, bsig, true, &layer_tex.view, &raw_view);
+        }
+        let layer_view = content_h.as_ref().map(|t| t.view.clone()).unwrap_or_else(|| layer_tex.view.clone());
+        let filtered_view = backdrop_h.as_ref().map(|t| t.view.clone()).unwrap_or_else(|| raw_view.clone());
+        let sig = [
+            content_h.as_ref().map(|t| t.uid).unwrap_or(layer_tex.uid),
+            backdrop_h.as_ref().map(|t| t.uid).unwrap_or_else(|| backdrop.map(|b| b.uid).unwrap_or(0)),
+            backdrop.map(|b| b.uid).unwrap_or(0),
+        ];
+
+        // Filter factors fold exactly for grayscale/brightness; blur is split between
+        // the horizontal pass above and the vertical taps in the composite shader.
+        let (gray, bright, _) = filter_fold(std::slice::from_ref(&info.filter));
+        // `backdrop-filter` grayscale/brightness are separate from the layer's own filter.
+        let (bg_gray, bg_bright, _) = filter_fold(std::slice::from_ref(&info.backdrop));
+        let mut poly_px = Vec::with_capacity(info.polygon.len());
+        for p in &info.polygon {
+            let (px, py) = mat_apply(xf, r[0] + p[0], r[1] + p[1]);
+            poly_px.push([px - x0, py - y0]);
+        }
+        let u = LayerU {
+            // viewport.w = 1 selects REPLACE blending with the backdrop already resolved.
+            viewport: [size_px.0 as f32, size_px.1 as f32, 0.0, if backdrop_needed { 1.0 } else { 0.0 }],
+            layer_texel: [1.0 / lw as f32, 1.0 / lh as f32, 0.0, 0.0],
+            backdrop_texel: [1.0 / size_px.0 as f32, 1.0 / size_px.1 as f32, 0.0, 0.0],
+            rect: [x0, y0, lw as f32, lh as f32],
+            params: [info.opacity, csig, bsig, info.radius * scale],
+            filter: [gray, bright, if backdrop_needed { 1.0 } else { 0.0 }, poly_px.len().min(MAX_POLY_POINTS) as f32],
+            fx2: [bg_gray, bg_bright, 0.0, 0.0],
+        };
+        let slot = self.take_comp_slot();
+        self.queue.write_buffer(&self.comp.slots[slot].u_buf, 0, bytemuck::bytes_of(&u));
+        if !poly_px.is_empty() {
+            let mut data = vec![[0.0f32, 0.0f32]; MAX_POLY_POINTS];
+            for (d, p) in data.iter_mut().zip(poly_px.iter().take(MAX_POLY_POINTS)) {
+                *d = *p;
+            }
+            self.queue.write_buffer(&self.comp.slots[slot].poly_buf, 0, bytemuck::cast_slice(&data));
+        }
+        let ub = self.comp.slots[slot].bind.clone();
+        if layer_tex.comp_bind.as_ref().is_none_or(|(s, _)| *s != sig) {
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rendrix composite textures bind"),
+                layout: &self.comp.t_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&layer_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&filtered_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&raw_view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.comp.sampler) },
+                ],
+            });
+            layer_tex.comp_bind = Some((sig, bind));
+        }
+        let tbind = layer_tex.comp_bind.as_ref().unwrap().1.clone();
+        let pipeline = if backdrop_needed { &self.comp.replace_pipeline } else { &self.comp.pipeline };
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rendrix composite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &ub, &[]);
+            pass.set_bind_group(1, &tbind, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        if let Some(h) = content_h {
+            self.release_target(h);
+        }
+        if let Some(h) = backdrop_h {
+            self.release_target(h);
+        }
+        self.release_target(layer_tex);
     }
 
     /// Render to an offscreen RGBA8 image and read it back (used for screenshots and tests).
     pub fn render_to_rgba(&mut self, list: &DisplayList, text: &mut TextSystem, size_px: (u32, u32), scale: f32) -> Vec<u8> {
         let (w, h) = size_px;
+        // A zero extent is not a valid texture, and the shader divides by the
+        // viewport width/height — short-circuit before any GPU work.
+        if w == 0 || h == 0 {
+            return Vec::new();
+        }
+        // Defensive clamp (also keeps every row-pitch calculation valid).
+        let (w, h) = (w.max(1), h.max(1));
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rendrix capture"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -885,6 +1881,9 @@ impl Renderer {
                 ..Default::default()
             };
             match item {
+                // Layers are split out before flattening; if one slips through (e.g. from a
+                // caller-built list) treat the markers as transparent to draw state.
+                Item::PushLayer(_) | Item::PopLayer => {}
                 Item::Rect(r) => {
                     let mut i = base(r.rect, 0.0);
                     i.radii = clamp_radii(r.radii, r.rect[2], r.rect[3]);
@@ -894,9 +1893,15 @@ impl Renderer {
                         Fill::Linear { angle, stops } => set_gradient(&mut i, 1.0, *angle, stops, op),
                         Fill::Radial { stops } => set_gradient(&mut i, 2.0, 0.0, stops, op),
                     }
-                    if let Some((w, c)) = &r.border {
-                        i.border = *w;
-                        i.bcolor = mul_alpha(*c, op);
+                    if let Some(b) = &r.border {
+                        i.border = b.widths;
+                        // Keep the legacy single-colour field in sync for inset-shadow reuse
+                        // and for the unlayered fallback path.
+                        i.bcolor = mul_alpha(b.colors[0], op);
+                        for k in 0..4 {
+                            i.bcolors[k] = mul_alpha(b.colors[k], op);
+                            i.bstyle[k] = b.styles[k] as f32;
+                        }
                     }
                     if matches!(r.fill, Fill::None) && r.border.is_none() {
                         continue;
@@ -919,8 +1924,24 @@ impl Renderer {
                     let mut i = base(im.rect, 4.0);
                     i.radii = clamp_radii(im.radii, im.rect[2], im.rect[3]);
                     i.c[0] = [1.0, 1.0, 1.0, op];
-                    i.uv = im.uv;
-                    push_inst(insts, batches, Tex::Image(im.image), i, blur_local);
+                    // Small images live in the shared atlas: remap their normalised
+                    // sub-rect into the slot's patch of that texture so consecutive
+                    // images share one bind group and merge into one batch. Canvas
+                    // ids and large/atlas-full images keep the dedicated texture and
+                    // the original UVs — shapes, text and canvases are untouched.
+                    if let Some(&(sx, sy, sw, sh)) = self.image_atlas.slots.get(&im.image) {
+                        let a = self.image_atlas.size as f32;
+                        i.uv = [
+                            (sx as f32 + 1.0 + im.uv[0] * sw as f32) / a,
+                            (sy as f32 + 1.0 + im.uv[1] * sh as f32) / a,
+                            im.uv[2] * sw as f32 / a,
+                            im.uv[3] * sh as f32 / a,
+                        ];
+                        push_inst(insts, batches, Tex::ImageAtlas, i, blur_local);
+                    } else {
+                        i.uv = im.uv;
+                        push_inst(insts, batches, Tex::Image(im.image), i, blur_local);
+                    }
                 }
                 Item::Text(t) => {
                     let simple = xf[1].abs() < 1e-6 && xf[2].abs() < 1e-6;
@@ -1093,14 +2114,39 @@ impl Renderer {
                 self.td_tris.insert(key, GpuMesh { vbuf, ibuf, count: indices.len() as u32 });
             }
         }
-        // Phase 2 (read-only GPU state): one render pass per visible scene.
-        let mut drawn = 0usize;
+        // Phase 2a (read-only scene state): prepare every FrameU and MeshU into its
+        // own slot. All passes share one encoder and one submit, so queue writes
+        // from inside a draw loop would all land before the submit and the last
+        // scene/mesh would win for every draw. Writing distinct slots up front
+        // avoids that entirely.
+        #[derive(Clone, Copy)]
+        enum TdGeom {
+            Box,
+            Plane,
+            Sphere,
+            Tris((u64, usize, u64)),
+        }
+        struct TdMeshSlot {
+            slot: usize,
+            geom: TdGeom,
+        }
+        struct TdPreparedDraw {
+            frame_slot: usize,
+            vp: [f32; 4],
+            scissor: [u32; 4],
+            meshes: Vec<TdMeshSlot>,
+        }
+
+        let mut frames: Vec<FrameU> = Vec::new();
+        let mut meshes: Vec<MeshU> = Vec::new();
+        let mut prepared: Vec<TdPreparedDraw> = Vec::new();
         let mut used: Vec<(u64, usize, u64)> = Vec::new();
         for d in draws {
             let (rx, ry, rw, rh) = (d.rect_px[0], d.rect_px[1], d.rect_px[2], d.rect_px[3]);
             if rw < 1.0 || rh < 1.0 {
                 continue;
             }
+            // `cloned_scene` is a cheap Arc clone; deref it, never deep-copy the Scene.
             let Some(scene) = cloned_scene(d.scene_id) else { continue };
             if scene.meshes.is_empty() {
                 continue;
@@ -1126,7 +2172,71 @@ impl Renderer {
                 light_color: [lcol[0], lcol[1], lcol[2], 1.0],
                 ambient: [amb[0], amb[1], amb[2], 1.0],
             };
-            self.queue.write_buffer(&self.td_frame_buf, 0, bytemuck::bytes_of(&frame));
+            let mut mesh_slots = Vec::with_capacity(visible.len());
+            for mi in visible {
+                let mesh = &scene.meshes[mi];
+                if mesh.world_sphere().1 < 1e-9 {
+                    continue;
+                }
+                let nmat = mesh.transform.inverse().transpose();
+                let uni = MeshU {
+                    model: mesh.transform.to_cols_array_2d(),
+                    normal_mat: nmat.to_cols_array_2d(),
+                    base: mesh.material.base_color,
+                    emissive: [mesh.material.emissive[0], mesh.material.emissive[1], mesh.material.emissive[2], 1.0],
+                    params: [mesh.material.metallic, mesh.material.roughness, 128.0 + (8.0 - 128.0) * mesh.material.roughness, 0.0],
+                };
+                let slot = meshes.len();
+                meshes.push(uni);
+                let geom = match &mesh.geometry {
+                    Geometry::Box => TdGeom::Box,
+                    Geometry::Plane => TdGeom::Plane,
+                    Geometry::Sphere => TdGeom::Sphere,
+                    Geometry::Tris { .. } => {
+                        let key = (d.scene_id, mi, scene.revision);
+                        used.push(key);
+                        TdGeom::Tris(key)
+                    }
+                };
+                mesh_slots.push(TdMeshSlot { slot, geom });
+            }
+            if mesh_slots.is_empty() {
+                continue;
+            }
+            let frame_slot = frames.len();
+            frames.push(frame);
+            prepared.push(TdPreparedDraw {
+                frame_slot,
+                vp: [cx0, cy0, cx1 - cx0, cy1 - cy0],
+                scissor: [cx0 as u32, cy0 as u32, (cx1 - cx0) as u32, (cy1 - cy0) as u32],
+                meshes: mesh_slots,
+            });
+        }
+
+        // Drop GPU buffers for scenes/meshes that no longer exist (bounded cache).
+        if used.len() != self.td_tris.len() {
+            self.td_tris.retain(|k, _| used.contains(k));
+        }
+        // Zero draws / empty scenes: no buffer writes, no passes, no GPU work.
+        if prepared.is_empty() {
+            return 0;
+        }
+
+        // Phase 2b: grow once if needed, then write each uniform into its own slot
+        // before recording any pass. Offsets are slot_index * aligned_slot_size.
+        self.ensure_td_capacity(frames.len(), meshes.len());
+        let (fs, ms) = (self.td_frame_slot(), self.td_mesh_slot());
+        for (i, f) in frames.iter().enumerate() {
+            self.queue.write_buffer(&self.td_frame_buf, i as u64 * fs, bytemuck::bytes_of(f));
+        }
+        for (i, m) in meshes.iter().enumerate() {
+            self.queue.write_buffer(&self.td_mesh_buf, i as u64 * ms, bytemuck::bytes_of(m));
+        }
+
+        // Phase 2c: one render pass per visible scene (viewport/scissor/depth logic
+        // unchanged), selecting the per-scene and per-mesh slot for every draw.
+        let mut drawn = 0usize;
+        for p in prepared {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("rendrix 3d pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1143,45 +2253,26 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.td_pipeline);
-            pass.set_viewport(cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0, 1.0);
-            pass.set_scissor_rect(cx0 as u32, cy0 as u32, (cx1 - cx0) as u32, (cy1 - cy0) as u32);
-            pass.set_bind_group(0, &self.td_bind, &[]);
-            for mi in visible {
-                let mesh = &scene.meshes[mi];
-                if mesh.world_sphere().1 < 1e-9 {
-                    continue;
-                }
-                let nmat = mesh.transform.inverse().transpose();
-                let uni = MeshU {
-                    model: mesh.transform.to_cols_array_2d(),
-                    normal_mat: nmat.to_cols_array_2d(),
-                    base: mesh.material.base_color,
-                    emissive: [mesh.material.emissive[0], mesh.material.emissive[1], mesh.material.emissive[2], 1.0],
-                    params: [mesh.material.metallic, mesh.material.roughness, 128.0 + (8.0 - 128.0) * mesh.material.roughness, 0.0],
+            pass.set_viewport(p.vp[0], p.vp[1], p.vp[2], p.vp[3], 0.0, 1.0);
+            pass.set_scissor_rect(p.scissor[0], p.scissor[1], p.scissor[2], p.scissor[3]);
+            let frame_off = (p.frame_slot as u64) * fs;
+            for pm in p.meshes {
+                let gpu: &GpuMesh = match pm.geom {
+                    TdGeom::Box => &self.td_box,
+                    TdGeom::Plane => &self.td_plane,
+                    TdGeom::Sphere => &self.td_sphere,
+                    TdGeom::Tris(key) => match self.td_tris.get(&key) {
+                        Some(g) => g,
+                        None => continue,
+                    },
                 };
-                self.queue.write_buffer(&self.td_mesh_buf, 0, bytemuck::bytes_of(&uni));
-                let gpu: &GpuMesh = match &mesh.geometry {
-                    Geometry::Box => &self.td_box,
-                    Geometry::Plane => &self.td_plane,
-                    Geometry::Sphere => &self.td_sphere,
-                    Geometry::Tris { .. } => {
-                        let key = (d.scene_id, mi, scene.revision);
-                        used.push(key);
-                        match self.td_tris.get(&key) {
-                            Some(g) => g,
-                            None => continue,
-                        }
-                    }
-                };
+                let mesh_off = (pm.slot as u64) * ms;
+                pass.set_bind_group(0, &self.td_bind, &[frame_off as u32, mesh_off as u32]);
                 pass.set_vertex_buffer(0, gpu.vbuf.slice(..));
                 pass.set_index_buffer(gpu.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..gpu.count, 0, 0..1);
                 drawn += 1;
             }
-        }
-        // Drop GPU buffers for scenes/meshes that no longer exist (bounded cache).
-        if used.len() != self.td_tris.len() {
-            self.td_tris.retain(|k, _| used.contains(k));
         }
         drawn
     }
@@ -1221,6 +2312,111 @@ impl Renderer {
         self.last_3d_meshes = n;
         n
     }
+}
+
+fn is_open(item: &Item) -> bool {
+    matches!(item, Item::PushTransform(_) | Item::PushClip { .. } | Item::PushEllipseClip { .. } | Item::PushOpacity(_) | Item::PushFilter(_) | Item::PushBackdrop(_))
+}
+
+fn is_close(item: &Item) -> bool {
+    matches!(item, Item::PopTransform | Item::PopClip | Item::PopOpacity | Item::PopFilter | Item::PopBackdrop)
+}
+
+fn closing(item: &Item) -> Option<Item> {
+    match item {
+        Item::PushTransform(_) => Some(Item::PopTransform),
+        Item::PushClip { .. } | Item::PushEllipseClip { .. } => Some(Item::PopClip),
+        Item::PushOpacity(_) => Some(Item::PopOpacity),
+        Item::PushFilter(_) => Some(Item::PopFilter),
+        Item::PushBackdrop(_) => Some(Item::PopBackdrop),
+        _ => None,
+    }
+}
+
+/// Index of the `PopLayer` matching the `PushLayer` at `start`.
+fn matching_pop(items: &[Item], start: usize) -> usize {
+    let mut depth = 1usize;
+    for (i, item) in items.iter().enumerate().skip(start) {
+        match item {
+            Item::PushLayer(_) => depth += 1,
+            Item::PopLayer => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    items.len().saturating_sub(1)
+}
+
+/// Split a display list into flat runs and isolated layers. Ancestor transform/clip
+/// markers open at a boundary are replayed around each run and each layer's children so
+/// flatten state (and hit-test geometry) stays identical to the un-split frame.
+fn plan_segments(items: &[Item]) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut open: Vec<Item> = Vec::new();
+    let mut chunk: Vec<Item> = Vec::new();
+    let mut chunk_base = 0usize;
+    let mut i = 0usize;
+    while i < items.len() {
+        match &items[i] {
+            Item::PushLayer(info) => {
+                if !chunk.is_empty() {
+                    let mut flat = open[..chunk_base].to_vec();
+                    flat.append(&mut chunk);
+                    for item in open[..chunk_base].iter().rev() {
+                        if let Some(c) = closing(item) {
+                            flat.push(c);
+                        }
+                    }
+                    out.push(Segment::Flat(FlatSegment { items: flat }));
+                }
+                let end = matching_pop(items, i + 1);
+                out.push(Segment::Layer {
+                    info: info.clone(),
+                    open: open.clone(),
+                    children: if end > i + 1 { items[i + 1..end].to_vec() } else { Vec::new() },
+                });
+                i = (end + 1).min(items.len());
+                chunk_base = open.len();
+            }
+            Item::PopLayer => {
+                i += 1;
+            }
+            item if is_open(item) => {
+                open.push(item.clone());
+                chunk.push(item.clone());
+                i += 1;
+            }
+            item if is_close(item) => {
+                open.pop();
+                // If this closed an ancestor that was open when the chunk started, the
+                // replay prefix shrinks with it.
+                if chunk_base > open.len() {
+                    chunk_base = open.len();
+                }
+                chunk.push(item.clone());
+                i += 1;
+            }
+            item => {
+                chunk.push(item.clone());
+                i += 1;
+            }
+        }
+    }
+    if !chunk.is_empty() {
+        let mut flat = open[..chunk_base].to_vec();
+        flat.append(&mut chunk);
+        for item in open[..chunk_base].iter().rev() {
+            if let Some(c) = closing(item) {
+                flat.push(c);
+            }
+        }
+        out.push(Segment::Flat(FlatSegment { items: flat }));
+    }
+    out
 }
 
 fn mul_alpha(c: Color, k: f32) -> [f32; 4] {
@@ -1317,7 +2513,12 @@ fn push_inst(insts: &mut Vec<Inst>, batches: &mut Vec<Batch>, tex: Tex, inst: In
 mod tests {
     use super::*;
     use crate::context::GpuContext;
+    use crate::display::Border;
     use rendrix_css::Color;
+
+    fn gfx_border_solid(widths: [f32; 4], color: Color) -> Border {
+        Border::solid(widths, color)
+    }
 
     fn render(list: &DisplayList, w: u32, h: u32) -> Option<Vec<u8>> {
         let ctx = GpuContext::headless().ok()?;
@@ -1348,9 +2549,51 @@ mod tests {
     }
 
     #[test]
+    fn per_side_border_colors_and_dashes() {
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        let sides = Border {
+            widths: [6.0; 4],
+            colors: [
+                Color::from_u8(255, 0, 0, 1.0),   // top
+                Color::from_u8(0, 255, 0, 1.0),   // right
+                Color::from_u8(0, 0, 255, 1.0),   // bottom
+                Color::from_u8(255, 255, 0, 1.0), // left
+            ],
+            styles: [0; 4],
+        };
+        l.push(Item::Rect(RectItem {
+            rect: [8.0, 8.0, 48.0, 48.0],
+            radii: [0.0; 4],
+            fill: Fill::Solid(Color::BLACK),
+            border: Some(sides),
+        }));
+        let Some(img) = render(&l, 64, 64) else { return };
+        assert_eq!(px(&img, 64, 32, 10), [255, 0, 0, 255], "top border is red");
+        assert_eq!(px(&img, 64, 54, 32), [0, 255, 0, 255], "right border is green");
+        assert_eq!(px(&img, 64, 32, 54), [0, 0, 255, 255], "bottom border is blue");
+        assert_eq!(px(&img, 64, 10, 32), [255, 255, 0, 255], "left border is yellow");
+
+        // Dashed border alternates colour and fill along the edge.
+        let mut d = DisplayList::new(64.0, 64.0, Color::WHITE);
+        d.push(Item::Rect(RectItem {
+            rect: [8.0, 8.0, 48.0, 48.0],
+            radii: [0.0; 4],
+            fill: Fill::Solid(Color::WHITE),
+            border: Some(Border {
+                widths: [6.0; 4],
+                colors: [Color::from_u8(255, 0, 0, 1.0); 4],
+                styles: [1; 4],
+            }),
+        }));
+        let Some(img) = render(&d, 64, 64) else { return };
+        assert_eq!(px(&img, 64, 10, 10), [255, 0, 0, 255], "dash is painted");
+        assert_eq!(px(&img, 64, 28, 10), [255, 255, 255, 255], "gap shows the fill");
+    }
+
+    #[test]
     fn rounded_corners_borders_and_clip() {
         let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
-        l.push(Item::Rect(RectItem { rect: [4.0, 4.0, 56.0, 56.0], radii: [20.0; 4], fill: Fill::Solid(Color::BLACK), border: Some(([4.0; 4], Color::from_u8(0, 255, 0, 1.0))) }));
+        l.push(Item::Rect(RectItem { rect: [4.0, 4.0, 56.0, 56.0], radii: [20.0; 4], fill: Fill::Solid(Color::BLACK), border: Some(gfx_border_solid([4.0; 4], Color::from_u8(0, 255, 0, 1.0))) }));
         l.push(Item::PushClip { rect: [0.0, 0.0, 64.0, 10.0], radius: 0.0 });
         l.push(rect(0.0, 0.0, 64.0, 64.0, Color::from_u8(255, 0, 255, 0.5)));
         l.push(Item::PopClip);
@@ -1529,6 +2772,59 @@ mod tests {
         assert!(near > inside && near < 255 && far > near, "falls off with distance: {inside} {near} {far}");
     }
 
+    // ---- Shared image atlas ----------------------------------------------------------------
+
+    #[test]
+    fn small_images_share_one_atlas_batch() {
+        let Some(ctx) = GpuContext::headless().ok() else { eprintln!("no GPU adapter, skipping"); return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut red = Vec::new();
+        let mut blue = Vec::new();
+        for _ in 0..16 {
+            red.extend_from_slice(&[255, 0, 0, 255]);
+            blue.extend_from_slice(&[0, 0, 255, 255]);
+        }
+        let red_id = r.upload_image(&red, 4, 4);
+        let blue_id = r.upload_image(&blue, 4, 4);
+        assert!(r.image_atlas.slots.contains_key(&red_id), "small images go to the shared atlas");
+        assert!(r.image_atlas.slots.contains_key(&blue_id));
+        assert!(r.images.is_empty(), "no per-image textures are created for small images");
+        let mut l = DisplayList::new(64.0, 32.0, Color::WHITE);
+        l.push(Item::Image(ImageItem { image: red_id, rect: [0.0, 0.0, 32.0, 32.0], radii: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0] }));
+        l.push(Item::Image(ImageItem { image: blue_id, rect: [32.0, 0.0, 32.0, 32.0], radii: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0] }));
+        let mut t = TextSystem::new();
+        let img = r.render_to_rgba(&l, &mut t, (64, 32), 1.0);
+        assert_eq!(r.last_batches, 1, "two adjacent atlas images merge into one batch (old code: 2)");
+        assert_eq!(r.last_instances, 2);
+        assert_eq!(px(&img, 64, 16, 16), [255, 0, 0, 255]);
+        assert_eq!(px(&img, 64, 48, 16), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn image_reupload_overwrites_and_large_images_fall_back() {
+        let Some(ctx) = GpuContext::headless().ok() else { eprintln!("no GPU adapter, skipping"); return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let solid = |rgba: [u8; 4]| {
+            let mut v = Vec::with_capacity(16 * 4);
+            for _ in 0..16 { v.extend_from_slice(&rgba); }
+            v
+        };
+        let id = r.upload_image(&solid([255, 0, 0, 255]), 4, 4);
+        let slot = *r.image_atlas.slots.get(&id).unwrap();
+        r.upload_image_as(id, &solid([0, 0, 255, 255]), 4, 4);
+        assert_eq!(*r.image_atlas.slots.get(&id).unwrap(), slot, "same-size re-upload reuses the slot");
+        let mut l = DisplayList::new(16.0, 16.0, Color::WHITE);
+        l.push(Item::Image(ImageItem { image: id, rect: [0.0, 0.0, 16.0, 16.0], radii: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0] }));
+        let mut t = TextSystem::new();
+        let img = r.render_to_rgba(&l, &mut t, (16, 16), 1.0);
+        assert_eq!(px(&img, 16, 8, 8), [0, 0, 255, 255], "re-upload overwrote stale pixels");
+        // Oversized images keep the dedicated per-image texture path.
+        let big = r.upload_image(&vec![255u8; 513 * 4], 513, 1);
+        assert!(!r.image_atlas.slots.contains_key(&big));
+        assert!(r.images.contains_key(&big));
+        assert_eq!(r.image_size(big), Some((513, 1)));
+    }
+
     // ---- Canvas 2D targets (A3) ------------------------------------------------------------
 
     fn solid_canvas(w: u32, h: u32, c: Color) -> Vec<u8> {
@@ -1627,6 +2923,283 @@ mod tests {
         let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
         assert_eq!(r.last_3d_meshes, 0);
         assert!(img.chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
+    }
+
+    /// Regression: all draws share one encoder/submit, so uniform writes must use
+    /// distinct dynamic-offset slots. With a single slot, both boxes below render
+    /// with the *last* mesh's transform+material (two overlapping blue boxes).
+    #[test]
+    fn scene3d_two_meshes_keep_their_own_transform_and_color() {
+        use crate::scene3d;
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let id = 0x3D00_0002u64;
+        scene3d::upsert_scene(
+            id,
+            r#"{"camera": {"position": [0, 0, 5], "lookAt": [0, 0, 0]},
+                "meshes": [
+                  {"geo": {"kind": "box"},
+                   "material": {"color": [1, 0, 0, 1]},
+                   "transform": {"pos": [-1.8, 0, 0], "scale": [1.6, 1.6, 1.6]}},
+                  {"geo": {"kind": "box"},
+                   "material": {"color": [0, 0, 1, 1]},
+                   "transform": {"pos": [1.8, 0, 0], "scale": [1.6, 1.6, 1.6]}}
+                ]}"#,
+        )
+        .unwrap();
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(Item::Scene3D(Scene3DItem { scene_id: id, rect: [0.0, 0.0, 64.0, 64.0] }));
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        scene3d::remove_scene(id);
+        assert_eq!(r.last_3d_meshes, 2, "both box meshes drawn");
+
+        let is_red = |p: &[u8]| p[0] > 150 && p[1] < 120 && p[2] < 120;
+        let is_blue = |p: &[u8]| p[2] > 150 && p[0] < 120 && p[1] < 120;
+        let (mut red_count, mut blue_count) = (0u32, 0u32);
+        let (mut red_max_x, mut blue_min_x) = (0u32, 64u32);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let p = px(&img, 64, x, y);
+                if is_red(&p) {
+                    red_count += 1;
+                    red_max_x = red_max_x.max(x);
+                }
+                if is_blue(&p) {
+                    blue_count += 1;
+                    blue_min_x = blue_min_x.min(x);
+                }
+            }
+        }
+        assert!(red_count > 100, "red mesh painted {red_count} pixels");
+        assert!(blue_count > 100, "blue mesh painted {blue_count} pixels");
+        assert!(red_max_x < blue_min_x, "distinct spots: red ends at x={red_max_x}, blue starts at x={blue_min_x}");
+    }
+
+    #[test]
+    fn render_to_rgba_zero_size_returns_empty_without_panicking() {
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let l = DisplayList::new(8.0, 8.0, Color::WHITE);
+        assert!(r.render_to_rgba(&l, &mut t, (0, 0), 1.0).is_empty());
+        assert!(r.render_to_rgba(&l, &mut t, (0, 8), 1.0).is_empty());
+        assert!(r.render_to_rgba(&l, &mut t, (8, 0), 1.0).is_empty());
+        // A valid capture still works afterwards (the renderer stays usable).
+        assert_eq!(r.render_to_rgba(&l, &mut t, (8, 8), 1.0).len(), 8 * 8 * 4);
+    }
+
+    // ---- Offscreen compositing layers --------------------------------------------------
+
+    fn layer(rect: [f32; 4]) -> LayerInfo {
+        LayerInfo { rect, radius: 0.0, opacity: 1.0, filter: Vec::new(), backdrop: Vec::new(), polygon: Vec::new() }
+    }
+
+    #[test]
+    fn layer_composites_children_over_the_background() {
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(rect(0.0, 0.0, 64.0, 64.0, Color::from_u8(0, 255, 0, 1.0)));
+        l.push(Item::PushLayer(layer([16.0, 16.0, 32.0, 32.0])));
+        l.push(rect(16.0, 16.0, 32.0, 32.0, Color::from_u8(255, 0, 0, 1.0)));
+        l.push(Item::PopLayer);
+        let Some(img) = render(&l, 64, 64) else { eprintln!("no GPU adapter, skipping"); return };
+        assert_eq!(px(&img, 64, 32, 32), [255, 0, 0, 255], "layer child paints inside");
+        assert_eq!(px(&img, 64, 4, 4), [0, 255, 0, 255], "background outside the layer stays");
+        assert_eq!(px(&img, 64, 60, 60), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn layer_inside_a_transform_keeps_geometry() {
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(Item::PushTransform([1.0, 0.0, 0.0, 1.0, 10.0, 0.0]));
+        l.push(Item::PushLayer(layer([8.0, 8.0, 16.0, 16.0])));
+        l.push(rect(8.0, 8.0, 16.0, 16.0, Color::BLACK));
+        l.push(Item::PopLayer);
+        l.push(Item::PopTransform);
+        let Some(img) = render(&l, 64, 64) else { eprintln!("no GPU adapter, skipping"); return };
+        assert_eq!(px(&img, 64, 22, 16), [0, 0, 0, 255], "layer child follows its ancestor transform");
+        assert_eq!(px(&img, 64, 10, 16), [255, 255, 255, 255], "no paint left at the untransformed spot");
+    }
+
+    #[test]
+    fn later_flat_run_paints_over_layer_in_display_order() {
+        // [Flat A, Layer, Flat B]: B must land on top of the layer, and the layer's
+        // backdrop must be snapshotted before B is painted. With deferred composites
+        // submitted after all flat runs this painted B underneath the layer instead.
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(rect(0.0, 0.0, 64.0, 64.0, Color::from_u8(0, 255, 0, 1.0)));
+        l.push(Item::PushLayer(layer([16.0, 16.0, 32.0, 32.0])));
+        l.push(rect(16.0, 16.0, 32.0, 32.0, Color::from_u8(0, 0, 255, 1.0)));
+        l.push(Item::PopLayer);
+        l.push(rect(24.0, 24.0, 16.0, 16.0, Color::from_u8(255, 0, 0, 1.0)));
+        let Some(img) = render(&l, 64, 64) else { eprintln!("no GPU adapter, skipping"); return };
+        assert_eq!(px(&img, 64, 32, 32), [255, 0, 0, 255], "later flat run is on top of the layer");
+        assert_eq!(px(&img, 64, 20, 20), [0, 0, 255, 255], "layer child still shows outside the overlap");
+        assert_eq!(px(&img, 64, 4, 4), [0, 255, 0, 255], "earlier flat run stays beneath");
+    }
+
+    #[test]
+    fn backdrop_snapshot_excludes_later_flat_runs() {
+        // A translucent layer child lets the backdrop through. The later green run is
+        // opaque: if it leaked into the backdrop snapshot it would be mixed with the
+        // translucent child instead of appearing at full strength on top.
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(rect(0.0, 0.0, 32.0, 64.0, Color::BLACK));
+        l.push(rect(32.0, 0.0, 32.0, 64.0, Color::WHITE));
+        let mut info = layer([0.0, 0.0, 64.0, 64.0]);
+        info.backdrop = vec![FilterOp::Blur(0.0)];
+        l.push(Item::PushLayer(info));
+        l.push(rect(0.0, 0.0, 64.0, 64.0, Color::from_u8(0, 0, 255, 0.5)));
+        l.push(Item::PopLayer);
+        l.push(rect(0.0, 0.0, 16.0, 64.0, Color::from_u8(0, 255, 0, 1.0)));
+        let Some(img) = render(&l, 64, 64) else { eprintln!("no GPU adapter, skipping"); return };
+        assert_eq!(px(&img, 64, 8, 32), [0, 255, 0, 255], "later run painted after the layer, undiluted");
+        let right = px(&img, 64, 48, 32);
+        assert!(right[2] > right[0] && right[2] > right[1], "backdrop is the prefix, not the later run: {right:?}");
+    }
+
+    #[test]
+    fn pooled_layer_target_starts_transparent_each_frame() {
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        // Frame 1 fills the whole (padded) layer target with red.
+        let mut a = DisplayList::new(64.0, 64.0, Color::WHITE);
+        a.push(Item::PushLayer(layer([8.0, 8.0, 32.0, 32.0])));
+        a.push(rect(8.0, 8.0, 32.0, 32.0, Color::from_u8(255, 0, 0, 1.0)));
+        a.push(Item::PopLayer);
+        let first = r.render_to_rgba(&a, &mut t, (64, 64), 1.0);
+        assert_eq!(px(&first, 64, 12, 12), [255, 0, 0, 255]);
+        // Frame 2 reuses the same target but only covers a small corner: everything
+        // else must be transparent so the page background shows through.
+        let mut b = DisplayList::new(64.0, 64.0, Color::WHITE);
+        b.push(Item::PushLayer(layer([8.0, 8.0, 32.0, 32.0])));
+        b.push(rect(32.0, 32.0, 8.0, 8.0, Color::from_u8(0, 0, 255, 1.0)));
+        b.push(Item::PopLayer);
+        let second = r.render_to_rgba(&b, &mut t, (64, 64), 1.0);
+        assert_eq!(px(&second, 64, 12, 12), [255, 255, 255, 255], "no stale pixels in the reused layer target");
+        assert_eq!(px(&second, 64, 36, 36), [0, 0, 255, 255], "new child still paints");
+    }
+
+    #[test]
+    fn backdrop_filter_grayscale_desaturates_the_backdrop() {
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(rect(0.0, 0.0, 64.0, 64.0, Color::from_u8(255, 0, 0, 1.0)));
+        let mut info = layer([0.0, 0.0, 64.0, 64.0]);
+        info.backdrop = vec![FilterOp::Grayscale(1.0)];
+        l.push(Item::PushLayer(info));
+        // Translucent content lets the filtered backdrop show through the layer.
+        l.push(rect(0.0, 0.0, 64.0, 64.0, Color::from_u8(255, 255, 255, 0.5)));
+        l.push(Item::PopLayer);
+        let Some(img) = render(&l, 64, 64) else { eprintln!("no GPU adapter, skipping"); return };
+        let p = px(&img, 64, 32, 32);
+        assert!((p[0] as i32 - p[1] as i32).abs() <= 4 && (p[1] as i32 - p[2] as i32).abs() <= 4,
+            "backdrop-filter:grayscale must make the backdrop neutral: {p:?}");
+        assert!(p[0] < 210, "backdrop is grey, not red: {p:?}");
+    }
+
+    #[test]
+    fn polygon_clip_cuts_per_pixel() {
+        // A triangle covering the top-left half of the layer box.
+        let mut info = layer([8.0, 8.0, 48.0, 48.0]);
+        info.polygon = vec![[0.0, 0.0], [48.0, 0.0], [0.0, 48.0]];
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(Item::PushLayer(info));
+        l.push(rect(8.0, 8.0, 48.0, 48.0, Color::BLACK));
+        l.push(Item::PopLayer);
+        let Some(img) = render(&l, 64, 64) else { eprintln!("no GPU adapter, skipping"); return };
+        assert_eq!(px(&img, 64, 18, 14), [0, 0, 0, 255], "inside the triangle");
+        assert_eq!(px(&img, 64, 50, 50), [255, 255, 255, 255], "outside the triangle");
+    }
+
+    #[test]
+    fn backdrop_filter_blurs_what_is_behind() {
+        // Sharp black/white vertical stripes behind a translucent layer. Without a real
+        // backdrop pass the stripes stay razor sharp; with blur the boundary is smoothed.
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        for i in 0..8 {
+            let c = if i % 2 == 0 { Color::BLACK } else { Color::WHITE };
+            l.push(rect(i as f32 * 8.0, 0.0, 8.0, 64.0, c));
+        }
+        let mut info = layer([0.0, 0.0, 64.0, 64.0]);
+        info.backdrop = vec![FilterOp::Blur(6.0)];
+        l.push(Item::PushLayer(info));
+        // Empty layer: nothing of its own, so only the filtered backdrop should show.
+        l.push(Item::PopLayer);
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        assert_eq!(r.last_layers, 1, "one offscreen pass");
+        // At x=8 (a stripe edge) the blurred result is grey, not pure black or white.
+        let edge = px(&img, 64, 8, 32)[0];
+        assert!(edge > 40 && edge < 215, "backdrop edge was blurred: {edge}");
+        // Away from the edge the original colours still dominate.
+        assert!(px(&img, 64, 2, 32)[0] < 90, "dark stripe stays dark: {:?}", px(&img, 64, 2, 32));
+        assert!(px(&img, 64, 62, 32)[0] > 165, "light stripe stays light: {:?}", px(&img, 64, 62, 32));
+    }
+
+    #[test]
+    fn translucent_backdrop_is_not_composited_twice() {
+        // A translucent page background under a backdrop-filter layer used to be painted
+        // twice: once inside `out = layer + backdrop*(1-out.a)` and again by the pipeline's
+        // premultiplied blend over a framebuffer that already held the same backdrop.
+        let mut l = DisplayList::new(64.0, 64.0, Color::from_u8(128, 0, 0, 0.5));
+        let mut info = layer([0.0, 0.0, 64.0, 64.0]);
+        info.backdrop = vec![FilterOp::Blur(0.0)]; // requests the backdrop pass, no blur
+        l.push(Item::PushLayer(info));
+        l.push(Item::PopLayer); // empty layer: the result is just the backdrop
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        // Exactly one copy of the translucent background: no brighter RGB (double blend)
+        // and no higher alpha (0.5 + 0.5*0.5 = 0.75 under the old double-composite).
+        for &(x, y) in &[(32, 32), (2, 2)] {
+            let p = px(&img, 64, x, y);
+            assert!((p[0] as i32 - 128).abs() <= 2 && p[1] == 0 && p[2] == 0 && (p[3] as i32 - 128).abs() <= 2,
+                "backdrop applied once at ({x},{y}): {p:?}");
+        }
+    }
+
+    #[test]
+    fn multiple_backdrop_layers_sample_the_accumulated_prefix() {
+        // The second layer's backdrop must include the first layer's result. The old code
+        // re-rendered the whole prefix per layer; the new path snapshots the painted frame.
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(rect(0.0, 0.0, 32.0, 64.0, Color::BLACK));
+        // Layer 1: an opaque blue child, no backdrop filter.
+        l.push(Item::PushLayer(layer([0.0, 0.0, 32.0, 64.0])));
+        l.push(rect(0.0, 0.0, 32.0, 64.0, Color::from_u8(0, 0, 255, 1.0)));
+        l.push(Item::PopLayer);
+        // Layer 2: empty, but with a backdrop filter over the whole frame.
+        let mut info = layer([0.0, 0.0, 64.0, 64.0]);
+        info.backdrop = vec![FilterOp::Blur(0.0)];
+        l.push(Item::PushLayer(info));
+        l.push(Item::PopLayer);
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        assert_eq!(r.last_layers, 2, "two offscreen layers in one frame");
+        assert_eq!(px(&img, 64, 16, 32), [0, 0, 255, 255], "layer 1's blue survives into layer 2's backdrop");
+        assert_eq!(px(&img, 64, 48, 32), [255, 255, 255, 255], "unpainted half keeps the background");
+    }
+
+    #[test]
+    fn target_pool_is_bounded_across_changing_layer_sizes() {
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        for i in 0..(MAX_TARGETS * 2) as u32 {
+            let w = 8.0 + (i % 17) as f32 * 3.0;
+            let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+            l.push(Item::PushLayer(layer([0.0, 0.0, w, 16.0])));
+            l.push(rect(0.0, 0.0, w, 16.0, Color::from_u8(255, 0, 0, 1.0)));
+            l.push(Item::PopLayer);
+            let _ = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+            assert!(r.target_pool_len() <= MAX_TARGETS, "idle target pool exceeded cap on frame {i}: {}", r.target_pool_len());
+        }
     }
 
     #[test]

@@ -36,15 +36,30 @@ tasks now done. Headline deltas vs the audit above (cumulative):
   snapshot shape, hot-reload + failed-update session tests, Solid 13-step
   headless matrix, existing TS app suite green.
 
+## 2026-11-16 update (supersedes the stale rows below)
+
+The capability matrix below is a historical snapshot from 2026-11-14. Several rows marked ❌ are now
+implemented in the working tree. [COMPATIBILITY.md](COMPATIBILITY.md) is the current source of truth.
+Since that audit the following landed: Canvas 2D (plus SVG painting and `OffscreenCanvas`), WebSocket,
+dedicated Workers, IntersectionObserver, Shadow DOM and custom elements, `Range`/`Selection`,
+`contenteditable`, drag-and-drop of files, `:has()`, `@supports`/`@layer`/`@container`/nesting/`@import`,
+`calc()` with mixed units, text-shadow/ellipsis/line-clamp/word-break, real blur/backdrop-filter/polygon
+clips, per-side and dashed borders, form validation/pickers/undo, cookie jar and `crypto.subtle.digest`,
+an AccessKit tree + OS bridge, multi-window, native dialogs, update client, source maps, state-preserving
+hot reload, a `--inspect` snapshot, a Solid adapter, a WebAssembly web target (`rendrix-web`), an
+experimental 3D scene API, touch/gamepad entry points, and a font-DB cache. The full Rust suite is now
+**375 passed / 0 failed / 2 ignored** (CLI 22/22, Solid 2/2). The two ignored session-level regression
+variants are superseded by engine/renderer-level tests.
+
 ## Executive summary
 
-1. **What Rendrix can genuinely do today.** On Windows 11 it can build, run and package a native desktop application written in TypeScript/TSX with CSS, a real DOM, flexbox/grid/block layout, CSS cascade/animations/transitions, wgpu rendering, OS input, text editing, fetch, storage and observers, in a single ~13.8 MB executable with no Chromium/Electron/WebView. Verified by 156 Rust tests, 9 CLI tests, an end-to-end scripted run (`npm run e2e`, 26 steps) and a real-window run.
-2. **What is partially implemented.** Form controls (no validation UI, no select popup), positioning (sticky = relative, auto-inset absolutes), gradients (≤4 stops), images (PNG tested; JPEG/GIF/WebP decoded but untested), `calc()`, `@font-face` (local fonts only), `getComputedStyle` (fixed property list), `ResizeObserver`, layout size queries, scrolling (overlay, not draggable), media queries, transforms (2D only).
-3. **What is not implemented.** Canvas 2D/WebGL/WebGPU, WebSocket, XHR, Web Workers, Service Workers, IndexedDB, Shadow DOM, custom elements, tables/floats/multi-column, `:has()`, 3D rendering, accessibility tree, file dialogs, multi-window, tray, global shortcuts, auto-update, framework adapters, source maps, hot reload, macOS/Linux validation, `crypto.subtle`, `Intl`, `WebAssembly`, `Temporal`.
-4. **JavaScript.** JavaScript and TypeScript are both supported through the same build pipeline; both are transpiled to ES2022 ES modules and run in QuickJS. JavaScript is not executed as raw source by the runtime without the build step, but it does not require type-checking.
-5. **External packages that should remain.** wgpu, winit, Taffy, cosmic-text, QuickJS (rquickjs), image, ureq, arboard, serde/serde_json. None should be rewritten for originality.
-6. **Performance.** Measured on Windows 11 / RTX 3060 / Vulkan, 1000-item list (9009 nodes): idle 1.09 ms/frame, hover 1.03 ms, scroll 1.16 ms, DOM mutation 6.9–8.4 ms, viewport resize 36.1 ms. Startup 607 ms. Bottleneck is whole-tree box generation (~5 ms) and full restyle on viewport change (~23 ms).
-7. **Highest-priority next steps.** Incremental box generation; accessibility tree (AccessKit); macOS/Linux validation; Canvas 2D; framework adapters (Solid first); hot reload + source maps; cold-start font cache.
+1. **What Rendrix can genuinely do today.** On Windows 11 it builds, runs and packages a native desktop application written in TypeScript/TSX with CSS, a real DOM, flexbox/grid/block layout, a real CSS cascade with animations and at-rules, wgpu rendering (including offscreen compositing), OS input, text editing, Canvas 2D, WebSocket, Workers, observers, fetch/storage and an AccessKit bridge, in a single ~13.8 MB executable with no Chromium, Electron or WebView. Verified by 375 Rust tests, 22 CLI tests, an end-to-end scripted run (`npm run e2e`) and a real-window run.
+2. **What is partially implemented.** Tables, floats and multi-column are grid-like approximations; sticky positioning and auto-inset absolutes are simplified; gradients are limited to four stops; JPEG/GIF/WebP decode but only PNG is tested; `@font-face` is local fonts only; `getComputedStyle` covers a fixed property list; `ResizeObserver` reports one content box; scrollbars are overlay indicators, not draggable; transforms are 2D only; masks are spatially approximated; 3D scenes are CPU-rasterized with no depth buffer; macOS/Linux and screen readers are unvalidated.
+3. **What is not implemented.** Service Workers, XHR, IndexedDB, Notifications, Geolocation, video/audio playback, a canvas WebGPU context, fully general tables/floats, `writing-mode`, WOFF2, `cqw`/`cqh`, tray and global shortcuts, mobile OS shells, a React adapter, a multi-process security model and any full browser-compatibility claim. Rendrix is not a browser.
+4. **JavaScript.** JavaScript and TypeScript are both supported through the same build pipeline; both are transpiled to ES2022 ES modules and run in QuickJS. JavaScript is not executed as raw source by the runtime without the build step, but it does not require type-checking. Source maps, workers and a 5 s/task execution-budget interrupt for runaway scripts are in place.
+5. **External packages that should remain.** wgpu, winit, Taffy, cosmic-text, QuickJS (rquickjs), image, ureq, arboard, serde/serde_json, plus the narrow additions in [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md). None should be rewritten for originality.
+6. **Performance.** Measured on Windows 11 / RTX 3060 / Vulkan, 1000-item list (9009 nodes): idle ≈1.2 ms/frame, hover ≈1.2 ms, scroll ≈1.2 ms, DOM mutation ≈6.5–7 ms, viewport resize ≈10 ms. The last clean reference table is in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md). Incremental box generation and media-query pruning removed the old whole-tree rebuild (~5 ms) and full restyle (~23 ms) bottlenecks; the mutation target of < 3 ms is still open. A font-DB cache landed after those numbers were recorded, so cold-start figures need a fresh quiet re-measurement.
+7. **Highest-priority next steps.** Re-measure cold start and mutations; macOS/Linux hardware validation plus the manual screen-reader pass; WebGL2 fallback and browser-backed APIs on the web target; 50k-node and second-machine benchmarks; remaining CSS/API gaps; React adapter and overlay inspector. See [ROADMAP.md](ROADMAP.md).
 
 ## Crate and module inventory
 
