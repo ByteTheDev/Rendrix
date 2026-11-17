@@ -1729,3 +1729,34 @@ fn scene3d_element_removal_drops_the_scene() {
         "the scene died with its element"
     );
 }
+
+#[test]
+fn scene3d_js_scenes_reach_the_gpu_store() {
+    // The JS scene API bridges every upsert into the gfx scene store, which drives the
+    // GPU viewport for <rendrix-scene> / <canvas data-3d>. A schema mismatch used to be
+    // silently discarded by upsert(), leaving the GPU path empty. This test pins the
+    // bridge end to end: JS desc -> canonical JSON -> gfx Scene::from_json -> store.
+    let mut r = rt("<canvas id=c data-3d width=20 height=10></canvas><rendrix-scene id=s></rendrix-scene>");
+    let (canvas_id, host_id) = {
+        let e = r.engine.borrow();
+        (e.doc.get_element_by_id("c").unwrap(), e.doc.get_element_by_id("s").unwrap())
+    };
+    rendrix_gfx::scene3d::remove_scene(canvas_id as u64);
+    rendrix_gfx::scene3d::remove_scene(host_id as u64);
+
+    run(
+        &mut r,
+        "globalThis.hc = RendrixScene.createScene('c', Rendrix3D.createBoxScene({ color: [1,0,0,1] }));
+         globalThis.hs = RendrixScene.createScene(document.getElementById('s'), Rendrix3D.createBoxScene({ color: [0,1,0,1] }));",
+    );
+    let ids = rendrix_gfx::scene3d::scene_ids();
+    assert!(ids.contains(&(canvas_id as u64)), "canvas data-3d host must reach the GPU store: {ids:?}");
+    assert!(ids.contains(&(host_id as u64)), "<rendrix-scene> host must reach the GPU store: {ids:?}");
+
+    // Updating the desc must refresh the GPU scene too, and removal must drop it.
+    run(&mut r, "hc.setCamera({ fovY: 60 }); hs.remove();");
+    let ids = rendrix_gfx::scene3d::scene_ids();
+    assert!(ids.contains(&(canvas_id as u64)), "updated scene stays in the GPU store");
+    assert!(!ids.contains(&(host_id as u64)), "removed scene leaves the GPU store");
+    rendrix_gfx::scene3d::remove_scene(canvas_id as u64);
+}

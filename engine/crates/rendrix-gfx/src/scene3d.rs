@@ -133,6 +133,15 @@ fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
+/// Which faces the GPU pipeline should cull. `None` is the v1 default because raw
+/// triangle soup has no enforced winding convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaceCull {
+    None,
+    Back,
+    Front,
+}
+
 /// Surface response. `texture_id` is stored for a future textured-PBR pass and
 /// ignored by the v1 forward renderer.
 #[derive(Debug, Clone)]
@@ -142,11 +151,19 @@ pub struct Material {
     pub roughness: f32,
     pub emissive: [f32; 3],
     pub texture_id: Option<u32>,
+    pub cull: FaceCull,
 }
 
 impl Default for Material {
     fn default() -> Self {
-        Material { base_color: [1.0, 1.0, 1.0, 1.0], metallic: 0.0, roughness: 0.8, emissive: [0.0; 3], texture_id: None }
+        Material {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            metallic: 0.0,
+            roughness: 0.8,
+            emissive: [0.0; 3],
+            texture_id: None,
+            cull: FaceCull::None,
+        }
     }
 }
 
@@ -172,12 +189,35 @@ impl Mesh {
     }
 }
 
-/// v1 lighting: one directional + ambient. Extra lights parse but do not shade.
+/// Lights retained by the scene. All directional/point lights shade; ambient sums.
 #[derive(Debug, Clone)]
 pub enum Light {
     /// `dir` is the direction light travels (like the CSS/sample convention here).
     Directional { dir: Vec3, color: [f32; 3], intensity: f32 },
     Ambient { color: [f32; 3], intensity: f32 },
+    /// `pos` is the light position; `range` <= 0 means no distance attenuation.
+    Point { pos: Vec3, color: [f32; 3], intensity: f32, range: f32 },
+}
+
+/// Fixed capacities of the per-frame light arrays in the GPU uniform block. Lights
+/// beyond these limits are ignored (parsed but not shaded), keeping the slot stride fixed.
+pub const MAX_DIR_LIGHTS: usize = 4;
+pub const MAX_POINT_LIGHTS: usize = 4;
+
+/// Packed lighting for the GPU's per-scene uniform block.
+#[derive(Debug, Clone, Copy)]
+pub struct Lighting {
+    /// xyz = normalized travel direction, w = intensity.
+    pub dir: [[f32; 4]; MAX_DIR_LIGHTS],
+    /// rgb = color, a unused.
+    pub dir_color: [[f32; 4]; MAX_DIR_LIGHTS],
+    pub dir_count: u32,
+    /// xyz = position, w = range (<= 0 = infinite).
+    pub point: [[f32; 4]; MAX_POINT_LIGHTS],
+    /// rgb = color, a = intensity.
+    pub point_color: [[f32; 4]; MAX_POINT_LIGHTS],
+    pub point_count: u32,
+    pub ambient: [f32; 3],
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +254,53 @@ impl Scene {
             }
         }
         if any { acc } else { [0.35, 0.35, 0.35] }
+    }
+
+    /// Pack every directional and point light into fixed-size arrays for the GPU frame
+    /// block. Extra lights beyond the shader capacities are ignored, not an error.
+    pub fn lighting(&self) -> Lighting {
+        let mut out = Lighting {
+            dir: [[0.0; 4]; MAX_DIR_LIGHTS],
+            dir_color: [[0.0; 4]; MAX_DIR_LIGHTS],
+            dir_count: 0,
+            point: [[0.0; 4]; MAX_POINT_LIGHTS],
+            point_color: [[0.0; 4]; MAX_POINT_LIGHTS],
+            point_count: 0,
+            ambient: self.ambient(),
+        };
+        for l in &self.lights {
+            match l {
+                Light::Directional { dir, color, intensity } => {
+                    if (out.dir_count as usize) >= MAX_DIR_LIGHTS {
+                        continue;
+                    }
+                    let d = if dir.length_squared() > 1e-12 { dir.normalize() } else { Vec3::new(0.35, -0.7, -0.9).normalize() };
+                    let i = out.dir_count as usize;
+                    out.dir[i] = [d.x, d.y, d.z, *intensity];
+                    out.dir_color[i] = [color[0], color[1], color[2], 0.0];
+                    out.dir_count += 1;
+                }
+                Light::Point { pos, color, intensity, range } => {
+                    if (out.point_count as usize) >= MAX_POINT_LIGHTS {
+                        continue;
+                    }
+                    let i = out.point_count as usize;
+                    out.point[i] = [pos.x, pos.y, pos.z, *range];
+                    out.point_color[i] = [color[0], color[1], color[2], *intensity];
+                    out.point_count += 1;
+                }
+                Light::Ambient { .. } => {}
+            }
+        }
+        // If the desc named no directional light, keep the previous default so scenes
+        // with only point/ambient lights are still readable.
+        if out.dir_count == 0 {
+            let d = Vec3::new(0.35, -0.7, -0.9).normalize();
+            out.dir[0] = [d.x, d.y, d.z, 1.0];
+            out.dir_color[0] = [1.0, 1.0, 1.0, 0.0];
+            out.dir_count = 1;
+        }
+        out
     }
 
     /// Indices of meshes whose world sphere intersects the view frustum.
@@ -297,15 +384,16 @@ pub fn build_box() -> (Vec<Vertex3>, Vec<u32>) {
     (verts, idx)
 }
 
-/// 1x1 ground plane in XZ facing +Y.
+/// 1x1 plane in XY facing +Z. Matches the JS/CPU scene schema (the GPU and canvas
+/// paths must render the same orientation for the same `plane` desc).
 pub fn build_plane() -> (Vec<Vertex3>, Vec<u32>) {
     let verts = vec![
-        Vertex3 { pos: [-0.5, 0.0, -0.5], normal: [0.0, 1.0, 0.0] },
-        Vertex3 { pos: [0.5, 0.0, -0.5], normal: [0.0, 1.0, 0.0] },
-        Vertex3 { pos: [0.5, 0.0, 0.5], normal: [0.0, 1.0, 0.0] },
-        Vertex3 { pos: [-0.5, 0.0, 0.5], normal: [0.0, 1.0, 0.0] },
+        Vertex3 { pos: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0] },
+        Vertex3 { pos: [0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0] },
+        Vertex3 { pos: [0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0] },
+        Vertex3 { pos: [-0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0] },
     ];
-    (verts, vec![0, 2, 1, 0, 3, 2])
+    (verts, vec![0, 1, 2, 0, 2, 3])
 }
 
 /// Low-poly UV sphere, radius 0.5 (12 segments x 8 rings), with single-vertex
@@ -464,11 +552,17 @@ struct MatDesc {
     emissive: Vec<f32>,
     #[serde(rename = "textureId", default)]
     texture_id: Option<u32>,
+    #[serde(default = "d_cull")]
+    cull: String,
+}
+
+fn d_cull() -> String {
+    "none".to_string()
 }
 
 impl Default for MatDesc {
     fn default() -> Self {
-        MatDesc { color: d_color(), metallic: 0.0, roughness: d_rough(), emissive: d_emis(), texture_id: None }
+        MatDesc { color: d_color(), metallic: 0.0, roughness: d_rough(), emissive: d_emis(), texture_id: None, cull: d_cull() }
     }
 }
 
@@ -518,6 +612,10 @@ struct LightDesc {
     color: Vec<f32>,
     #[serde(default = "d_intensity")]
     intensity: f32,
+    #[serde(default = "d_light_pos")]
+    pos: Vec<f32>,
+    #[serde(default = "d_range")]
+    range: f32,
 }
 
 fn d_light_kind() -> String {
@@ -531,6 +629,12 @@ fn d_light_color() -> Vec<f32> {
 }
 fn d_intensity() -> f32 {
     1.0
+}
+fn d_light_pos() -> Vec<f32> {
+    vec![0.0, 0.0, 0.0]
+}
+fn d_range() -> f32 {
+    0.0
 }
 
 fn f3(name: &str, v: &[f32], what: &str) -> Result<[f32; 3], String> {
@@ -686,12 +790,19 @@ impl Scene {
             if !mat.roughness.is_finite() || !(0.0..=1.0).contains(&mat.roughness) {
                 return Err(format!("{tag}.material.rough must be in [0, 1], got {}", mat.roughness));
             }
+            let cull = match mat.cull.as_str() {
+                "none" => FaceCull::None,
+                "back" => FaceCull::Back,
+                "front" => FaceCull::Front,
+                other => return Err(format!("{tag}.material.cull must be one of none|back|front, got \"{other}\"")),
+            };
             let material = Material {
                 base_color,
                 metallic: mat.metallic,
                 roughness: mat.roughness,
                 emissive: emissive(&format!("{tag}.material"), &mat.emissive)?,
                 texture_id: mat.texture_id,
+                cull,
             };
             let pos = f3(&tag, &m.transform.pos, "transform.pos")?;
             let rot = f3(&tag, &m.transform.rot, "transform.rotEulerDeg")?;
@@ -723,7 +834,18 @@ impl Scene {
                     }
                     lights.push(Light::Ambient { color, intensity: l.intensity });
                 }
-                other => return Err(format!("{tag}: kind must be one of dir|ambient, got \"{other}\"")),
+                "point" => {
+                    let pos = f3(&tag, &l.pos, "pos")?;
+                    let color = emissive(&tag, &l.color)?;
+                    if !l.intensity.is_finite() || l.intensity < 0.0 {
+                        return Err(format!("{tag}: intensity must be >= 0, got {}", l.intensity));
+                    }
+                    if !l.range.is_finite() || l.range < 0.0 {
+                        return Err(format!("{tag}: range must be >= 0, got {}", l.range));
+                    }
+                    lights.push(Light::Point { pos: Vec3::from(pos), color, intensity: l.intensity, range: l.range });
+                }
+                other => return Err(format!("{tag}: kind must be one of dir|ambient|point, got \"{other}\"")),
             }
         }
 
@@ -862,6 +984,48 @@ mod tests {
     }
 
     #[test]
+    fn material_cull_selects_a_face_mode() {
+        for (cull, expected) in [
+            ("none", FaceCull::None),
+            ("back", FaceCull::Back),
+            ("front", FaceCull::Front),
+        ] {
+            let json = format!(r#"{{"meshes":[{{"material":{{"cull":"{cull}"}}}}]}}"#);
+            let s = Scene::from_json(&json).unwrap();
+            assert_eq!(s.meshes[0].material.cull, expected);
+        }
+        assert!(Scene::from_json(r#"{"meshes":[{"material":{"cull":"both"}}]}"#)
+            .unwrap_err()
+            .contains("cull"));
+    }
+
+    #[test]
+    fn multiple_directional_and_point_lights_pack_into_the_frame_block() {
+        let json = r#"{
+            "meshes": [{ "geo": { "kind": "box" } }],
+            "lights": [
+                { "kind": "dir", "dir": [1,0,0], "color": [1,0,0], "intensity": 1.0 },
+                { "kind": "dir", "dir": [0,1,0], "color": [0,1,0], "intensity": 0.5 },
+                { "kind": "point", "pos": [0,2,0], "color": [0,0,1], "intensity": 2.0, "range": 5.0 },
+                { "kind": "ambient", "color": [0.2,0.2,0.2], "intensity": 1.0 }
+            ]
+        }"#;
+        let s = Scene::from_json(json).unwrap();
+        let l = s.lighting();
+        assert_eq!(l.dir_count, 2);
+        assert_eq!(l.point_count, 1);
+        assert!((l.dir[0][0] - 1.0).abs() < 1e-6, "first dir normalized +X");
+        assert_eq!(l.dir[0][3], 1.0);
+        assert_eq!(l.dir[1][3], 0.5);
+        assert_eq!(l.point[0], [0.0, 2.0, 0.0, 5.0]);
+        assert_eq!(l.point_color[0], [0.0, 0.0, 1.0, 2.0]);
+        assert_eq!(l.ambient, [0.2, 0.2, 0.2]);
+        // Capacity is bounded: a 9th light is parsed but not shaded.
+        let many = format!(r#"{{"lights":[{}]}}"#, (0..9).map(|_| r#"{"kind":"dir","dir":[1,0,0]}"#).collect::<Vec<_>>().join(","));
+        assert_eq!(Scene::from_json(&many).unwrap().lighting().dir_count, MAX_DIR_LIGHTS as u32);
+    }
+
+    #[test]
     fn defaults_and_invalid_values() {
         let s = Scene::from_json("{}").unwrap();
         assert!(s.meshes.is_empty());
@@ -879,7 +1043,8 @@ mod tests {
             (r#"{"meshes":[{"material":{"color":[1,2]}}]}"#, "color"),
             (r#"{"meshes":[{"material":{"metal":2}}]}"#, "metal"),
             (r#"{"meshes":[{"transform":{"scale":[1,2]}}]}"#, "scale"),
-            (r#"{"lights":[{"kind":"point"}]}"#, "kind"),
+            (r#"{"lights":[{"kind":"spot"}]}"#, "kind"),
+            (r#"{"lights":[{"kind":"point","pos":[1,2]}]}"#, "pos"),
             (r#"{"meshes":[{"geo":{"kind":"tris","verts":[[0,0,0],[1,0,0]]}}]}"#, "verts"),
         ] {
             let err = Scene::from_json(json).unwrap_err();
@@ -967,7 +1132,7 @@ mod tests {
     fn procedural_geometry_is_indexed_and_outward() {
         for (name, (verts, idx), outward) in [
             ("box", build_box(), None),
-            ("plane", build_plane(), Some(Vec3::Y)),
+            ("plane", build_plane(), Some(Vec3::Z)),
             ("sphere", build_sphere(), None),
         ] {
             assert!(!verts.is_empty() && idx.len() % 3 == 0, "{name}: indexed triangles");

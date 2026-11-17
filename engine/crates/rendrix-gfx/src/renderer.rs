@@ -1,7 +1,10 @@
 //! The wgpu renderer: flattens a [`DisplayList`] into GPU instances and draws them.
 
 use crate::display::*;
-use crate::scene3d::{build_box, build_plane, build_sphere, cloned_scene, Geometry, SceneDraw, Vertex3};
+use crate::scene3d::{
+    build_box, build_plane, build_sphere, cloned_scene, FaceCull, Geometry, SceneDraw, Vertex3, MAX_DIR_LIGHTS,
+    MAX_POINT_LIGHTS,
+};
 use crate::text::TextSystem;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -439,8 +442,16 @@ impl From<Vertex3> for V3 {
 struct FrameU {
     view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 4],
-    light_dir: [f32; 4],
-    light_color: [f32; 4],
+    /// xyz = travel direction, w = intensity.
+    dir: [[f32; 4]; MAX_DIR_LIGHTS],
+    /// rgb = color.
+    dir_color: [[f32; 4]; MAX_DIR_LIGHTS],
+    /// xyz = position, w = range (<= 0 = infinite).
+    point: [[f32; 4]; MAX_POINT_LIGHTS],
+    /// rgb = color, a = intensity.
+    point_color: [[f32; 4]; MAX_POINT_LIGHTS],
+    /// x = directional count, y = point count.
+    counts: [f32; 4],
     ambient: [f32; 4],
 }
 
@@ -460,6 +471,25 @@ struct GpuMesh {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     count: u32,
+}
+
+/// Opaque and alpha-blended pipeline variants for each face-cull mode. wgpu has no
+/// dynamic blend/cull state, so the six combinations are created up front and selected
+/// per draw. Index order: none, back, front.
+struct TdPipelines {
+    opaque: [wgpu::RenderPipeline; 3],
+    blend: [wgpu::RenderPipeline; 3],
+}
+
+impl TdPipelines {
+    fn get(&self, transparent: bool, cull: FaceCull) -> &wgpu::RenderPipeline {
+        let set = if transparent { &self.blend } else { &self.opaque };
+        &set[match cull {
+            FaceCull::None => 0,
+            FaceCull::Back => 1,
+            FaceCull::Front => 2,
+        }]
+    }
 }
 
 pub struct Renderer {
@@ -489,7 +519,7 @@ pub struct Renderer {
     pub last_instances: usize,
     pub last_batches: usize,
     // ---- 3D forward pass (R6.2 v1) -------------------------------------------------
-    td_pipeline: wgpu::RenderPipeline,
+    td_pipelines: TdPipelines,
     /// Kept so the 3D bind group can be rebuilt when the uniform buffers grow.
     td_layout: wgpu::BindGroupLayout,
     td_bind: wgpu::BindGroup,
@@ -702,39 +732,55 @@ impl Renderer {
         });
         let td_bind = Renderer::make_td_bind(&device, &td_layout, &td_frame_buf, &td_mesh_buf, td_frame_slot_nz, td_mesh_slot_nz);
         let td_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("rendrix 3d layout"), bind_group_layouts: &[&td_layout], push_constant_ranges: &[] });
-        let td_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rendrix 3d pipeline"),
-            layout: Some(&td_pl),
-            vertex: wgpu::VertexState {
-                module: &td_module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<V3>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &td_module,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
-            }),
-            // No face culling in v1: procedural shapes and imported triangle soup do
-            // not share one winding convention; low-poly scenes stay cheap anyway.
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, front_face: wgpu::FrontFace::Ccw, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        // Opaque uses REPLACE + depth writes; transparent uses source-alpha blending
+        // with depth testing but no depth writes so overlapping translucent meshes stack.
+        let make_td_pipeline = |transparent: bool, cull: Option<wgpu::Face>, label: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&td_pl),
+                vertex: wgpu::VertexState {
+                    module: &td_module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<V3>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &td_module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(if transparent { wgpu::BlendState::ALPHA_BLENDING } else { wgpu::BlendState::REPLACE }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: cull,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: !transparent,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let culls = [None, Some(wgpu::Face::Back), Some(wgpu::Face::Front)];
+        let td_pipelines = TdPipelines {
+            opaque: std::array::from_fn(|i| make_td_pipeline(false, culls[i], "rendrix 3d opaque")),
+            blend: std::array::from_fn(|i| make_td_pipeline(true, culls[i], "rendrix 3d blend")),
+        };
         let gpu_mesh = |verts: &[Vertex3], idx: &[u32], label: &str| {
             let v: Vec<V3> = verts.iter().copied().map(V3::from).collect();
             let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX });
@@ -767,7 +813,7 @@ impl Renderer {
             inst_cap,
             last_instances: 0,
             last_batches: 0,
-            td_pipeline,
+            td_pipelines,
             td_layout,
             td_bind,
             td_frame_buf,
@@ -2129,6 +2175,10 @@ impl Renderer {
         struct TdMeshSlot {
             slot: usize,
             geom: TdGeom,
+            transparent: bool,
+            cull: FaceCull,
+            /// Squared distance from the camera to the mesh centre, for back-to-front sorting.
+            depth: f32,
         }
         struct TdPreparedDraw {
             frame_slot: usize,
@@ -2163,14 +2213,16 @@ impl Renderer {
             if cx1 - cx0 < 1.0 || cy1 - cy0 < 1.0 {
                 continue;
             }
-            let (dir, lcol) = scene.key_light();
-            let amb = scene.ambient();
+            let lighting = scene.lighting();
             let frame = FrameU {
                 view_proj: vp.to_cols_array_2d(),
                 cam_pos: [scene.camera.position.x, scene.camera.position.y, scene.camera.position.z, 1.0],
-                light_dir: [dir.x, dir.y, dir.z, 0.0],
-                light_color: [lcol[0], lcol[1], lcol[2], 1.0],
-                ambient: [amb[0], amb[1], amb[2], 1.0],
+                dir: lighting.dir,
+                dir_color: lighting.dir_color,
+                point: lighting.point,
+                point_color: lighting.point_color,
+                counts: [lighting.dir_count as f32, lighting.point_count as f32, 0.0, 0.0],
+                ambient: [lighting.ambient[0], lighting.ambient[1], lighting.ambient[2], 1.0],
             };
             let mut mesh_slots = Vec::with_capacity(visible.len());
             for mi in visible {
@@ -2198,11 +2250,27 @@ impl Renderer {
                         TdGeom::Tris(key)
                     }
                 };
-                mesh_slots.push(TdMeshSlot { slot, geom });
+                let centre = mesh.world_sphere().0;
+                let cam = scene.camera.position;
+                let dc = [centre[0] - cam.x, centre[1] - cam.y, centre[2] - cam.z];
+                mesh_slots.push(TdMeshSlot {
+                    slot,
+                    geom,
+                    transparent: mesh.material.base_color[3] < 1.0,
+                    cull: mesh.material.cull,
+                    depth: dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2],
+                });
             }
             if mesh_slots.is_empty() {
                 continue;
             }
+            // Opaque first (depth writes on), then translucent meshes back-to-front so
+            // source-alpha blending stacks in a stable order.
+            let (mut opaque, mut transparent): (Vec<_>, Vec<_>) =
+                mesh_slots.into_iter().partition(|m| m.transparent);
+            transparent.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
+            opaque.extend(transparent);
+            let mesh_slots = opaque;
             let frame_slot = frames.len();
             frames.push(frame);
             prepared.push(TdPreparedDraw {
@@ -2252,7 +2320,6 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.td_pipeline);
             pass.set_viewport(p.vp[0], p.vp[1], p.vp[2], p.vp[3], 0.0, 1.0);
             pass.set_scissor_rect(p.scissor[0], p.scissor[1], p.scissor[2], p.scissor[3]);
             let frame_off = (p.frame_slot as u64) * fs;
@@ -2266,6 +2333,7 @@ impl Renderer {
                         None => continue,
                     },
                 };
+                pass.set_pipeline(self.td_pipelines.get(pm.transparent, pm.cull));
                 let mesh_off = (pm.slot as u64) * ms;
                 pass.set_bind_group(0, &self.td_bind, &[frame_off as u32, mesh_off as u32]);
                 pass.set_vertex_buffer(0, gpu.vbuf.slice(..));
@@ -2974,6 +3042,41 @@ mod tests {
         assert!(red_count > 100, "red mesh painted {red_count} pixels");
         assert!(blue_count > 100, "blue mesh painted {blue_count} pixels");
         assert!(red_max_x < blue_min_x, "distinct spots: red ends at x={red_max_x}, blue starts at x={blue_min_x}");
+    }
+
+    /// A material alpha < 1 must select the alpha-blended pipeline and let the 2D
+    /// frame show through, rather than being written as opaque (the old shader
+    /// hardcoded `1.0` and the old pipeline used `BlendState::REPLACE`).
+    #[test]
+    fn scene3d_translucent_mesh_blends_over_the_2d_frame() {
+        use crate::scene3d;
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let id = 0x3D00_0003u64;
+        let desc = |alpha: f32| {
+            format!(
+                r#"{{"camera": {{"position": [0, 0, 5], "lookAt": [0, 0, 0]}},
+                    "meshes": [{{"geo": {{"kind": "box"}},
+                                "material": {{"color": [1, 0, 0, {alpha}]}},
+                                "transform": {{"scale": [2, 2, 2]}}}}]}}"#
+            )
+        };
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(Item::Scene3D(Scene3DItem { scene_id: id, rect: [0.0, 0.0, 64.0, 64.0] }));
+
+        scene3d::upsert_scene(id, &desc(1.0)).unwrap();
+        let opaque = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        scene3d::upsert_scene(id, &desc(0.35)).unwrap();
+        let translucent = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        scene3d::remove_scene(id);
+        assert_eq!(r.last_3d_meshes, 1);
+
+        let solid = px(&opaque, 64, 32, 32);
+        let blended = px(&translucent, 64, 32, 32);
+        assert!(solid[0] > solid[1] + 40, "opaque box is clearly red: {solid:?}");
+        assert!(blended[1] > solid[1] + 20, "white 2D frame shows through: {solid:?} -> {blended:?}");
+        assert!(blended[2] > solid[2] + 20, "white 2D frame shows through: {solid:?} -> {blended:?}");
     }
 
     #[test]

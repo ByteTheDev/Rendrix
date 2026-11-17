@@ -474,7 +474,11 @@ fn upsert(host: &DomHost, n: u32, json: &str) -> Result<(), String> {
     // (`<rendrix-scene>` / `<canvas data-3d>`) while the CPU rasterizer above covers
     // plain `<canvas>` bitmaps. Best-effort: a gfx-side parse rejection never fails
     // the JS call (the CPU path is the source of truth for validation).
-    let _ = rendrix_gfx::scene3d::upsert_scene(n as u64, &canonical);
+    // Best-effort, but never silent: a schema mismatch here used to be discarded and left
+    // `<rendrix-scene>` / `<canvas data-3d>` hosts with no GPU scene at all.
+    if let Err(e) = rendrix_gfx::scene3d::upsert_scene(n as u64, &canonical) {
+        eprintln!("[rendrix] GPU scene bridge rejected scene {n}: {e}");
+    }
     // Invalidation reuses the Canvas 2D path: the element repaints without restyle/relayout.
     canvas::mark_dirty(key, n);
     host.engine.borrow_mut().doc.dirty.paint = true;
@@ -631,16 +635,20 @@ fn canonical_json(d: &SceneFile) -> String {
         .meshes
         .iter()
         .map(|m| {
-            let (kind, extra) = match &m.geo {
-                Geo::Box(s) => ("box", serde_json::json!({ "size": s })),
-                Geo::Plane(s) => ("plane", serde_json::json!({ "size": s })),
-                Geo::Sphere(r) => ("sphere", serde_json::json!({ "size": r })),
+            // The GPU backend uses unit primitives and applies `transform.scale`, while the
+            // JS schema carries a per-geometry `size`. Bake size into the scale so both the
+            // CPU bitmap rasterizer and the GPU viewport render the same sized object.
+            let (kind, extra, size_scale) = match &m.geo {
+                Geo::Box(s) => ("box", serde_json::json!({}), *s),
+                Geo::Plane(s) => ("plane", serde_json::json!({}), [s[0], s[1], 1.0]),
+                Geo::Sphere(r) => ("sphere", serde_json::json!({}), [*r * 2.0, *r * 2.0, *r * 2.0]),
                 Geo::Tris(pts, idx) => (
                     "tris",
                     serde_json::json!({
                         "verts": pts.iter().flat_map(|p| [p[0], p[1], p[2]]).collect::<Vec<f32>>(),
                         "indices": idx,
                     }),
+                    [1.0, 1.0, 1.0],
                 ),
             };
             let mut geo = serde_json::Map::new();
@@ -648,10 +656,15 @@ fn canonical_json(d: &SceneFile) -> String {
             for (k, v) in extra.as_object().unwrap() {
                 geo.insert(k.clone(), v.clone());
             }
+            let scale: Vec<f32> =
+                m.xf.scale.iter().zip(size_scale).map(|(a, b)| a * b).collect();
+            // `emissive` must be a 3-vector: the GPU MatDesc deserializes Vec<f32>, and a
+            // JSON number here silently rejected every scene before this fix.
+            let emissive = [m.mat.emissive, m.mat.emissive, m.mat.emissive];
             serde_json::json!({
                 "geo": geo,
-                "material": { "color": m.mat.color, "emissive": 0.0 },
-                "transform": { "pos": m.xf.pos, "rotEulerDeg": m.xf.rot_deg, "scale": m.xf.scale },
+                "material": { "color": m.mat.color, "emissive": emissive },
+                "transform": { "pos": m.xf.pos, "rotEulerDeg": m.xf.rot_deg, "scale": scale },
             })
         })
         .collect();
