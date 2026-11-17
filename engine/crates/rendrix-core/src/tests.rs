@@ -265,6 +265,32 @@ fn text_input_editing_operations() {
 }
 
 #[test]
+fn text_input_undo_redo_restores_snapshots() {
+    let mut e = engine(r#"<input id="i" value="">"#, "body{margin:0}", 800.0, 600.0);
+    let i = by_id(&e, "i");
+    e.doc.set_focus(Some(i));
+    assert!(!e.edit(i, EditOp::Undo).value_changed, "empty undo stack is a no-op");
+    e.edit(i, EditOp::Insert("hello".into()));
+    e.edit(i, EditOp::Insert(" world".into()));
+    assert_eq!(e.doc.value(i), "hello world");
+    assert!(e.edit(i, EditOp::Undo).value_changed);
+    assert_eq!(e.doc.value(i), "hello");
+    assert!(e.edit(i, EditOp::Undo).value_changed);
+    assert_eq!(e.doc.value(i), "");
+    assert!(!e.edit(i, EditOp::Undo).value_changed, "stack exhausted");
+    assert!(e.edit(i, EditOp::Redo).value_changed);
+    assert_eq!(e.doc.value(i), "hello");
+    assert!(e.edit(i, EditOp::Redo).value_changed);
+    assert_eq!(e.doc.value(i), "hello world");
+    assert!(!e.edit(i, EditOp::Redo).value_changed, "redo stack exhausted");
+    // A new edit clears the redo stack.
+    e.edit(i, EditOp::Undo);
+    e.edit(i, EditOp::Insert("!".into()));
+    assert_eq!(e.doc.value(i), "hello!");
+    assert!(!e.edit(i, EditOp::Redo).value_changed);
+}
+
+#[test]
 fn textarea_keeps_newlines_and_moves_vertically() {
     let mut e = engine(r#"<textarea id="t" style="width:200px;height:80px"></textarea>"#, "body{margin:0}", 800.0, 600.0);
     let t = by_id(&e, "t");
@@ -294,9 +320,33 @@ fn display_list_contains_backgrounds_borders_radius_and_text() {
     assert_eq!(rects.len(), 1, "body background is not painted twice");
     assert!(matches!(rects[0].fill, Fill::Solid(c) if c == Color::from_u8(255, 0, 0, 1.0)));
     assert_eq!(rects[0].radii, [12.0; 4]);
-    assert_eq!(rects[0].border.as_ref().unwrap().0, [2.0; 4]);
+    assert_eq!(rects[0].border.as_ref().unwrap().widths, [2.0; 4]);
     assert!(list.items.iter().any(|i| matches!(i, Item::Shadow(_))));
     assert!(list.items.iter().any(|i| matches!(i, Item::Text(_))));
+}
+
+#[test]
+fn per_side_border_colors_and_styles_reach_the_display_list() {
+    use rendrix_gfx::Item;
+    let e = engine(
+        r#"<div id="d">x</div>"#,
+        "body{margin:0} #d{width:40px;height:20px;border-width:2px 3px 4px 5px;border-style:solid dashed dotted double;border-color:red green blue yellow}",
+        400.0,
+        300.0,
+    );
+    let rects: Vec<_> = e
+        .display_list()
+        .items
+        .iter()
+        .filter_map(|i| if let Item::Rect(r) = i { Some(r) } else { None })
+        .collect();
+    let b = rects.iter().find_map(|r| r.border.as_ref()).expect("border in display list");
+    assert_eq!(b.widths, [2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(b.colors[0], Color::from_u8(255, 0, 0, 1.0));
+    assert_eq!(b.colors[1], Color::from_u8(0, 128, 0, 1.0));
+    assert_eq!(b.colors[2], Color::from_u8(0, 0, 255, 1.0));
+    assert_eq!(b.colors[3], Color::from_u8(255, 255, 0, 1.0));
+    assert_eq!(b.styles, [0, 1, 2, 3]);
 }
 
 #[test]
@@ -509,6 +559,58 @@ fn text_overflow_ellipsis_truncates_with_ellipsis() {
         .filter_map(|i| if let Item::Text(t) = i { Some(t.content.runs.iter().map(|r| r.text.clone()).collect::<String>()) } else { None })
         .collect();
     assert!(full_text.contains("overflow") && !full_text.contains('…'), "no truncation without text-overflow:ellipsis: {full_text:?}");
+}
+
+#[test]
+fn line_clamp_limits_visible_lines_with_ellipsis() {
+    use rendrix_gfx::Item;
+    let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+    let html = format!(r#"<div id="a">{long}</div>"#);
+    let e = engine(
+        &html,
+        "body{margin:0} #a{width:80px;font-size:16px;line-height:20px;overflow:hidden;-webkit-line-clamp:2}",
+        800.0,
+        600.0,
+    );
+    let shown: String = e
+        .display_list()
+        .items
+        .iter()
+        .filter_map(|i| if let Item::Text(t) = i { Some(t.content.runs.iter().map(|r| r.text.clone()).collect::<String>()) } else { None })
+        .collect();
+    assert!(shown.contains('…'), "clamped text ends with ellipsis: {shown:?}");
+    assert!(shown.len() < long.len(), "clamped text is shorter than the source: {shown:?}");
+    // Without line-clamp the full text is painted.
+    let full = engine(
+        &html,
+        "body{margin:0} #a{width:80px;font-size:16px;line-height:20px;overflow:hidden}",
+        800.0,
+        600.0,
+    );
+    let full_text: String = full
+        .display_list()
+        .items
+        .iter()
+        .filter_map(|i| if let Item::Text(t) = i { Some(t.content.runs.iter().map(|r| r.text.clone()).collect::<String>()) } else { None })
+        .collect();
+    assert_eq!(full_text, long, "no clamp keeps all text: {full_text:?}");
+}
+
+#[test]
+fn container_query_uses_the_containers_box_size() {
+    let mut e = engine(
+        r#"<div id="box"><span id="child">x</span></div>"#,
+        "body{margin:0} #box{width:200px;height:40px;container-type:inline-size;container-name:card} #child{color:red} \
+         @container card (min-width:180px){#child{color:lime}} \
+         @container card (min-width:400px){#child{background:blue}}",
+        400.0,
+        300.0,
+    );
+    // First frame lays out the container; its size feeds the next restyle.
+    assert_eq!(e.computed_value(by_id(&e, "child"), "color"), "rgb(255, 0, 0)");
+    e.update(1.0);
+    assert_eq!(e.computed_value(by_id(&e, "child"), "color"), "rgb(0, 255, 0)");
+    assert_eq!(e.computed_value(by_id(&e, "child"), "background-color"), "rgba(0, 0, 0, 0)");
 }
 
 #[test]

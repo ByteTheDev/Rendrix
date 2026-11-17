@@ -52,6 +52,21 @@ pub struct EngineStats {
     pub last_layout_micros: u64,
     pub last_style_micros: u64,
     pub last_paint_micros: u64,
+    /// Fine-grained sub-phases of the most recent update. `last_layout_micros` remains the
+    /// combined box-build + Taffy time; these split it without changing that public value.
+    pub last_box_build_micros: u64,
+    pub last_taffy_layout_micros: u64,
+    /// Nanoseconds (converted to micros) spent shaping text during the most recent update,
+    /// snapshotted from `TextSystem::shape_nanos`. Includes layout measurement and display-list
+    /// painting (both call `TextSystem::paragraph`); excludes renderer glyph rasterisation / GPU.
+    pub last_text_shape_micros: u64,
+    /// First repainted update of the session, latched before `frames` increments so a second
+    /// `update` in the same frame cannot overwrite it. Zero until that phase actually runs.
+    pub first_style_micros: u64,
+    pub first_box_build_micros: u64,
+    pub first_taffy_layout_micros: u64,
+    pub first_text_shape_micros: u64,
+    pub first_paint_micros: u64,
     /// M0 shaping signals (populated per frame; Taffy new/restyled node counts
     /// stay inside `TaffyEngine` until its layout API exposes them).
     pub shape_count: usize,
@@ -87,6 +102,8 @@ pub struct Engine {
     /// be rebuilt and spliced by NodeId instead of rebuilding the whole tree.
     pub(crate) layout_tree: Option<LayoutNode>,
     layout_result: LayoutResult,
+    /// Container sizes from the last layout, used to evaluate `@container` during restyle.
+    pub(crate) container_sizes: Arc<HashMap<u64, (String, f32, f32)>>,
     display: DisplayList,
     hits: Vec<HitEntry>,
     scrolls: Vec<ScrollInfo>,
@@ -98,9 +115,16 @@ pub struct Engine {
     viewport_changed: bool,
     force_repaint: bool,
     pub(crate) style_changed: bool,
+    /// True when the last `restyle` changed a layout-affecting property (or added
+    /// a box). Paint-only restyles leave this false so `update` can skip Taffy.
+    pub(crate) style_layout_changed: bool,
     last_gc: f64,
     freed_log: Vec<NodeId>,
     pub stats: EngineStats,
+    /// Undo/redo stacks per text control: (value, selection_start, selection_end).
+    /// Capped at 50 entries; cleared when the node is freed.
+    pub(crate) undo: std::collections::HashMap<rendrix_dom::NodeId, Vec<(String, usize, usize)>>,
+    pub(crate) redo: std::collections::HashMap<rendrix_dom::NodeId, Vec<(String, usize, usize)>>,
 }
 
 impl Engine {
@@ -131,6 +155,7 @@ impl Engine {
             now: 0.0,
             layout_tree: None,
             layout_result: LayoutResult::default(),
+            container_sizes: Arc::new(HashMap::new()),
             display: DisplayList::new(800.0, 600.0, Color::WHITE),
             hits: Vec::new(),
             scrolls: Vec::new(),
@@ -142,9 +167,12 @@ impl Engine {
             viewport_changed: true,
             force_repaint: true,
             style_changed: false,
+            style_layout_changed: false,
             last_gc: 0.0,
             freed_log: Vec::new(),
             stats: EngineStats::default(),
+            undo: std::collections::HashMap::new(),
+            redo: std::collections::HashMap::new(),
         }
     }
 
@@ -302,6 +330,16 @@ impl Engine {
         self.stats.last_style_micros = 0;
         self.stats.last_layout_micros = 0;
         self.stats.last_paint_micros = 0;
+        self.stats.last_box_build_micros = 0;
+        self.stats.last_taffy_layout_micros = 0;
+        self.stats.last_text_shape_micros = 0;
+        // Latch the first repainted update. A second `update` inside the same `Session::frame`
+        // sees `frames >= 1` and leaves the first-frame snapshot alone.
+        let is_first = self.stats.frames == 0;
+        let shape_nanos_start = self.text.borrow().shape_nanos;
+        // Fresh per-frame: `restyle` sets this when a layout-affecting style changes;
+        // when restyle is skipped it must read false (not the previous frame's value).
+        self.style_layout_changed = false;
         let t0 = web_time::Instant::now();
         let sheets_were_dirty = self.doc.sheets_dirty || self.rules_dirty;
         let rules_rebuilt = self.refresh_rules();
@@ -337,8 +375,10 @@ impl Engine {
         // mode) with no `@media` rules, no viewport-relative declarations and no inline
         // viewport styles provably changes no computed style: percentages resolve at layout
         // time, never in the cascade. Skip the restyle; layout still reruns below.
-        let viewport_neutral =
-            !self.rules.has_media_rules && !self.rules.uses_viewport_units && !self.doc.inline_viewport_units;
+        let viewport_neutral = !self.rules.has_media_rules
+            && !self.rules.has_container_rules
+            && !self.rules.uses_viewport_units
+            && !self.doc.inline_viewport_units;
         let media_only_rebuild = rules_rebuilt && !sheets_were_dirty && !dirty.all_style;
         let mut all = dirty.all_style || rules_rebuilt || self.viewport_changed;
         if media_only_rebuild && self.viewport_changed && viewport_neutral {
@@ -364,12 +404,86 @@ impl Engine {
         if !needs {
             return UpdateInfo { repainted: false, animating: false, next_wake: self.next_wake() };
         }
-        let relayout = restyled || dirty.layout || self.viewport_changed || self.layout_tree.is_none() || animating;
+        // Paint-only fast path: when no box geometry can have changed, rebuild boxes
+        // for fresh (effective) styles but reuse the last Taffy solution. This skips
+        // the ~5 ms full-tree Taffy re-solve on 9k nodes for e.g. background-color
+        // toggles and opacity/transform transitions.
+        let anim_layout = self.anim_needs_layout();
+        let layout_needed = self.viewport_changed
+            || dirty.structure
+            || dirty.content
+            || self.style_layout_changed
+            || anim_layout
+            || self.layout_tree.is_none()
+            || !dirty.detached.is_empty();
         let vp_changed = self.viewport_changed;
         self.viewport_changed = false;
         self.force_repaint = false;
 
-        if relayout {
+        if !layout_needed {
+            let t1 = web_time::Instant::now();
+            let mut refreshed = false;
+            // Paint-only: geometry is unchanged, so reuse the Taffy solution. Patch the
+            // dirty box units instead of rebuilding the whole tree — a class/text toggle
+            // now touches one subtree rather than all ~9k boxes.
+            if let Some(mut tree) = self.layout_tree.take() {
+                let roots: Vec<NodeId> = dirty
+                    .style_roots
+                    .iter()
+                    .chain(dirty.state_roots.iter())
+                    .copied()
+                    .filter(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n))
+                    .collect();
+                let anim_paint = !self.anim_paint_ids().is_empty();
+                if !all && !anim_paint && roots.is_empty() {
+                    // No box input changed (e.g. caret blink, static fill): reuse as-is.
+                    self.layout_tree = Some(tree);
+                    refreshed = true;
+                } else if !all && !anim_paint && !roots.is_empty()
+                    && boxtree::patch_tree(self, &mut tree, &roots)
+                {
+                    // Only the dirty units were rebuilt; the old Taffy solution is still
+                    // valid because no geometry-affecting property changed.
+                    self.layout_tree = Some(tree);
+                    refreshed = true;
+                } else if let Some(mut fresh) = boxtree::Builder::new(self).build_root() {
+                    let mut s = (*fresh.style).clone();
+                    s.width = rendrix_css::Dim::Px(self.viewport.0);
+                    fresh.style = Arc::new(s);
+                    self.layout_tree = Some(fresh);
+                    refreshed = true;
+                } else {
+                    // No root box (e.g. root display:none): keep None, paint handles it.
+                    refreshed = true;
+                }
+                // `layout_result` (old Taffy solution) is kept in every branch above.
+            } else if boxtree::Builder::new(self).build_root().is_some() {
+                // layout_tree was None but layout_needed false should not happen;
+                // fall through to full layout below for safety.
+            }
+            // Paint-only path: the box work above is the whole geometry phase (no Taffy re-solve).
+            self.stats.last_box_build_micros = t1.elapsed().as_micros() as u64;
+            if refreshed {
+                // No Taffy run: geometry is provably unchanged.
+                self.stats.last_layout_micros = t1.elapsed().as_micros() as u64;
+                let t2 = web_time::Instant::now();
+                self.paint();
+                self.stats.last_paint_micros = t2.elapsed().as_micros() as u64;
+                {
+                    let text = self.text.borrow();
+                    self.stats.shape_count = text.shape_count;
+                    self.stats.cache_hits = text.cache_hits;
+                    self.stats.cache_len = text.cache_len();
+                }
+                self.finalize_frame_stats(shape_nanos_start, is_first);
+                self.stats.frames += 1;
+                return UpdateInfo { repainted: true, animating, next_wake: self.next_wake() };
+            }
+            // Fall through to the full layout path (correctness first).
+        }
+
+        // Full layout path (geometry may have changed).
+        {
             let t1 = web_time::Instant::now();
             // P1: incremental box generation. The previous frame's tree persists in
             // `layout_tree`; dirty regions are rebuilt and spliced by NodeId while clean
@@ -381,19 +495,41 @@ impl Engine {
                     let mut roots: Vec<NodeId> =
                         dirty.style_roots.iter().chain(dirty.state_roots.iter()).copied().collect();
                     roots.retain(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n));
+                    let mut dirty_boxes: HashSet<u64> = HashSet::new();
                     if roots.is_empty() {
                         // No style-affecting change (e.g. a viewport-only resize whose
                         // restyle P3 skipped): styles — hence boxes — are identical, so the
                         // persisted tree is reused and only Taffy re-solves.
                         patched = true;
+                        // No hint available: TaffyEngine falls back to a full sync.
                     } else {
-                        patched = boxtree::patch_tree(self, &mut tree, &roots);
+                        let (ok, units) = boxtree::patch_tree_with_units(self, &mut tree, &roots);
+                        patched = ok;
+                        // The *box ids* of the rebuilt units — exact, even when a dirty DOM
+                        // node has no box of its own (display:contents / pseudo / table parts).
+                        dirty_boxes = units.into_iter().collect();
                     }
                     if patched {
                         if vp_changed {
                             boxtree::refresh_root_width(&mut tree, self.viewport.0);
                         }
-                        self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
+                        // Thread the dirty box ids into Taffy: clean subtrees skip `to_taffy`
+                        // conversion, and unchanged boxes are carried forward in place rather
+                        // than re-inserted into a fresh ~9000-entry map. TaffyEngine expands the
+                        // hint to box-tree ancestors and guards it with the cached source Arc,
+                        // so correctness never depends on the hint being complete.
+                        let box_elapsed = t1.elapsed();
+                        self.stats.last_box_build_micros += box_elapsed.as_micros() as u64;
+                        let hint = if dirty_boxes.is_empty() { None } else { Some(&dirty_boxes) };
+                        self.layout.layout_incremental_in_place(
+                            &tree,
+                            self.viewport,
+                            &mut Measurer(&self.text),
+                            &mut self.layout_result,
+                            hint,
+                        );
+                        self.stats.last_taffy_layout_micros +=
+                            t1.elapsed().saturating_sub(box_elapsed).as_micros() as u64;
                         self.layout_tree = Some(tree);
                         self.apply_float_clear();
                     }
@@ -408,7 +544,11 @@ impl Engine {
                     let mut s = (*tree.style).clone();
                     s.width = rendrix_css::Dim::Px(self.viewport.0);
                     tree.style = Arc::new(s);
+                    let box_elapsed = t1.elapsed();
+                    self.stats.last_box_build_micros += box_elapsed.as_micros() as u64;
                     self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
+                    self.stats.last_taffy_layout_micros +=
+                        t1.elapsed().saturating_sub(box_elapsed).as_micros() as u64;
                     self.layout_tree = Some(tree);
                     self.apply_float_clear();
                 } else {
@@ -418,6 +558,15 @@ impl Engine {
             }
             self.stats.layouts += 1;
             self.stats.last_layout_micros = t1.elapsed().as_micros() as u64;
+        }
+        // `@container` conditions need geometry. Refresh the map and, when a container
+        // changed size, force a rule rebuild so the next frame restyles with fresh sizes.
+        if self.rules.has_container_rules {
+            let previous = self.container_sizes.clone();
+            self.refresh_container_sizes();
+            if previous != self.container_sizes {
+                self.rules_dirty = true;
+            }
         }
 
         let t2 = web_time::Instant::now();
@@ -429,8 +578,23 @@ impl Engine {
             self.stats.cache_hits = text.cache_hits;
             self.stats.cache_len = text.cache_len();
         }
+        self.finalize_frame_stats(shape_nanos_start, is_first);
         self.stats.frames += 1;
         UpdateInfo { repainted: true, animating, next_wake: self.next_wake() }
+    }
+
+    /// Convert the shaping-nanos delta into micros and, on the first repainted update, latch the
+    /// startup breakdown so a second `update` in the same frame cannot overwrite it.
+    fn finalize_frame_stats(&mut self, shape_nanos_start: u64, is_first: bool) {
+        let shape_nanos = self.text.borrow().shape_nanos;
+        self.stats.last_text_shape_micros = shape_nanos.saturating_sub(shape_nanos_start) / 1000;
+        if is_first {
+            self.stats.first_style_micros = self.stats.last_style_micros;
+            self.stats.first_box_build_micros = self.stats.last_box_build_micros;
+            self.stats.first_taffy_layout_micros = self.stats.last_taffy_layout_micros;
+            self.stats.first_text_shape_micros = self.stats.last_text_shape_micros;
+            self.stats.first_paint_micros = self.stats.last_paint_micros;
+        }
     }
 
     fn next_wake(&self) -> Option<f64> {

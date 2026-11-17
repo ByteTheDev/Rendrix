@@ -243,6 +243,17 @@ fn run(host: &DomHost, op: &str, args: &[Val]) -> Result<Val, String> {
             with(host, n, 0, 0, |c| c.set_alpha(num(args, 1)))?;
             Ok(Val::Undefined)
         }
+        "canvas_set_composite" => {
+            let n = node(args, 0)?;
+            let op = canvas::CompositeOp::parse(&str_of(args, 1));
+            with(host, n, 0, 0, |c| c.set_composite(op))?;
+            Ok(Val::Undefined)
+        }
+        "canvas_get_composite" => {
+            let n = node(args, 0)?;
+            let name = canvas::read_canvas(doc_key(host), n, |c| c.map(|c| c.composite().as_str()).unwrap_or("source-over"));
+            Ok(Val::Str(name.to_string()))
+        }
         "canvas_set_shadow_color" => {
             let n = node(args, 0)?;
             let col = canvas::parse_color(&str_of(args, 1))

@@ -177,6 +177,161 @@ class DocumentFragment extends Node {
 }
 parentNodeMixin(DocumentFragment.prototype);
 
+// ----- Range / Selection (minimal but functional) --------------------------------------
+let designModeValue = 'off';
+
+function nodeLength(n) {
+  if (!n) return 0;
+  if (n.nodeType === 3 || n.nodeType === 8) return (n.data || '').length;
+  return n.childNodes ? n.childNodes.length : 0;
+}
+function textIn(node) {
+  if (!node) return '';
+  if (node.nodeType === 3) return node.data || '';
+  if (node.nodeType === 1 || node.nodeType === 11 || node.nodeType === 9) {
+    let s = '';
+    for (const c of node.childNodes || []) s += textIn(c);
+    return s;
+  }
+  return '';
+}
+
+class Range {
+  constructor() { this.startContainer = null; this.startOffset = 0; this.endContainer = null; this.endOffset = 0; }
+  get collapsed() { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; }
+  get commonAncestorContainer() {
+    if (!this.startContainer || !this.endContainer) return null;
+    if (this.startContainer === this.endContainer) return this.startContainer;
+    // Walk up from start until it contains end.
+    let n = this.startContainer;
+    while (n) { if (n.contains && n.contains(this.endContainer)) return n; n = n.parentNode; }
+    return document;
+  }
+  setStart(n, o) { this.startContainer = n; this.startOffset = Math.max(0, Math.min(o | 0, nodeLength(n))); if (!this.endContainer) { this.endContainer = n; this.endOffset = this.startOffset; } }
+  setEnd(n, o) { this.endContainer = n; this.endOffset = Math.max(0, Math.min(o | 0, nodeLength(n))); if (!this.startContainer) { this.startContainer = n; this.startOffset = this.endOffset; } }
+  setStartBefore(n) { const p = n.parentNode; this.setStart(p, [...(p.childNodes || [])].indexOf(n)); }
+  setStartAfter(n) { const p = n.parentNode; this.setStart(p, [...(p.childNodes || [])].indexOf(n) + 1); }
+  setEndBefore(n) { const p = n.parentNode; this.setEnd(p, [...(p.childNodes || [])].indexOf(n)); }
+  setEndAfter(n) { const p = n.parentNode; this.setEnd(p, [...(p.childNodes || [])].indexOf(n) + 1); }
+  selectNode(n) { this.setStartBefore(n); this.setEndAfter(n); }
+  selectNodeContents(n) {
+    this.startContainer = n; this.startOffset = 0;
+    this.endContainer = n; this.endOffset = nodeLength(n);
+  }
+  collapse(toStart = false) {
+    if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; }
+    else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
+  }
+  cloneRange() { const r = new Range(); r.startContainer = this.startContainer; r.startOffset = this.startOffset; r.endContainer = this.endContainer; r.endOffset = this.endOffset; return r; }
+  toString() {
+    if (!this.startContainer) return '';
+    if (this.startContainer === this.endContainer && this.startContainer.nodeType === 3) {
+      return (this.startContainer.data || '').slice(this.startOffset, this.endOffset);
+    }
+    // Best-effort: text of the common ancestor (covers selectAllChildren + simple ranges).
+    const root = this.commonAncestorContainer;
+    return textIn(root);
+  }
+}
+
+const docSelectionRanges = [];
+class Selection {
+  get rangeCount() { return docSelectionRanges.length; }
+  get anchorNode() { return docSelectionRanges.length ? docSelectionRanges[0].startContainer : null; }
+  get focusNode() { return docSelectionRanges.length ? docSelectionRanges[0].endContainer : null; }
+  get anchorOffset() { return docSelectionRanges.length ? docSelectionRanges[0].startOffset : 0; }
+  get focusOffset() { return docSelectionRanges.length ? docSelectionRanges[0].endOffset : 0; }
+  get isCollapsed() { return !docSelectionRanges.length || docSelectionRanges[0].collapsed; }
+  getRangeAt(i) {
+    if (i < 0 || i >= docSelectionRanges.length) throw new DOMException('Invalid range index', 'IndexSizeError');
+    return docSelectionRanges[i];
+  }
+  addRange(r) { if (r instanceof Range) { docSelectionRanges.length = 0; docSelectionRanges.push(r.cloneRange()); } }
+  removeAllRanges() { docSelectionRanges.length = 0; }
+  removeRange(r) { const i = docSelectionRanges.indexOf(r); if (i >= 0) docSelectionRanges.splice(i, 1); }
+  collapse(n, o = 0) { docSelectionRanges.length = 0; if (n) { const r = new Range(); r.selectNodeContents(n); r.collapse(true); try { r.setStart(n, o); r.collapse(true); } catch (_) {} docSelectionRanges.push(r); } }
+  selectAllChildren(n) { const r = new Range(); r.selectNodeContents(n); docSelectionRanges.length = 0; docSelectionRanges.push(r); }
+  deleteFromDocument() { this.toString(); this.removeAllRanges(); }
+  toString() { return docSelectionRanges.map(r => { try { return r.toString(); } catch (_) { return ''; } }).join(''); }
+}
+const docSelection = new Selection();
+
+// ----- Shadow DOM (lightweight) + custom elements registry -----------------------------
+const shadowRoots = new WeakMap();
+const customRegistry = new Map();
+const customPending = new Map();
+
+class ShadowRoot extends DocumentFragment {
+  constructor(host, mode) {
+    super();
+    Object.defineProperty(this, 'host', { value: host });
+    this.mode = mode === 'closed' ? 'closed' : 'open';
+  }
+  get activeElement() { return null; }
+}
+
+function upgradeCustom(el) {
+  if (!el || el.nodeType !== 1) return;
+  const name = (el.localName || '').toLowerCase();
+  const ctor = customRegistry.get(name);
+  if (ctor && Object.getPrototypeOf(el) !== ctor.prototype) {
+    Object.setPrototypeOf(el, ctor.prototype);
+    try { if (el.connectedCallback && el.isConnected) el.connectedCallback(); } catch (e) { reportError(e); }
+  }
+  // Upgrade descendants created via innerHTML/parser.
+  try {
+    for (const d of el.querySelectorAll('*')) {
+      const n = (d.localName || '').toLowerCase();
+      const c = customRegistry.get(n);
+      if (c && Object.getPrototypeOf(d) !== c.prototype) Object.setPrototypeOf(d, c.prototype);
+    }
+  } catch (_) {}
+}
+const origAppendChild = Node.prototype.appendChild;
+Node.prototype.appendChild = function (c) {
+  const r = origAppendChild.call(this, c);
+  try { upgradeCustom(c); if (c.connectedCallback && c.isConnected) c.connectedCallback(); } catch (e) { reportError(e); }
+  return r;
+};
+const origInsertBefore = Node.prototype.insertBefore;
+Node.prototype.insertBefore = function (c, ref) {
+  const r = origInsertBefore.call(this, c, ref);
+  try { upgradeCustom(c); if (c.connectedCallback && c.isConnected) c.connectedCallback(); } catch (e) { reportError(e); }
+  return r;
+};
+const origRemoveChild = Node.prototype.removeChild;
+Node.prototype.removeChild = function (c) {
+  try { if (c.disconnectedCallback) c.disconnectedCallback(); } catch (e) { reportError(e); }
+  return origRemoveChild.call(this, c);
+};
+
+const customElementsImpl = {
+  define(name, ctor, opts) {
+    name = String(name).toLowerCase();
+    if (!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)) throw new DOMException(`'${name}' is not a valid custom element name`, 'SyntaxError');
+    if (customRegistry.has(name)) throw new DOMException(`'${name}' has already been defined`, 'NotSupportedError');
+    customRegistry.set(name, ctor);
+    const pend = customPending.get(name);
+    if (pend) { customPending.delete(name); for (const res of pend) try { res(ctor); } catch (_) {} }
+  },
+  get(name) { return customRegistry.get(String(name).toLowerCase()); },
+  whenDefined(name) {
+    name = String(name).toLowerCase();
+    if (customRegistry.has(name)) return Promise.resolve(customRegistry.get(name));
+    return new Promise(res => {
+      if (!customPending.has(name)) customPending.set(name, []);
+      customPending.get(name).push(res);
+    });
+  },
+  upgrade(root) {
+    try {
+      const all = root.querySelectorAll ? [...root.querySelectorAll('*')] : [];
+      if (root.nodeType === 1) all.unshift(root);
+      for (const el of all) upgradeCustom(el);
+    } catch (_) {}
+  },
+};
+
 // ----- style / classList / dataset ------------------------------------------------------------
 
 function splitDecls(text) {
@@ -387,9 +542,38 @@ class Element extends Node {
   set dir(v) { this.setAttribute('dir', v); }
   get draggable() { return this.getAttribute('draggable') === 'true'; }
   set draggable(v) { this.setAttribute('draggable', v ? 'true' : 'false'); }
-  get isContentEditable() { return false; }
+  get contentEditable() {
+    const v = this.getAttribute('contenteditable');
+    if (v === null) return 'inherit';
+    const l = String(v).toLowerCase();
+    if (l === '' || l === 'true' || l === 'plaintext-only') return l === '' ? 'true' : l;
+    return 'false';
+  }
+  set contentEditable(v) { this.setAttribute('contenteditable', String(v)); }
+  get isContentEditable() {
+    let el = this;
+    while (el && el.getAttribute) {
+      const ce = el.getAttribute('contenteditable');
+      if (ce !== null) {
+        const l = String(ce).toLowerCase();
+        if (l === '' || l === 'true' || l === 'plaintext-only') return true;
+        if (l === 'false') return false;
+      }
+      el = el.parentElement;
+    }
+    try { return designModeValue === 'on'; } catch (_) { return false; }
+  }
   setPointerCapture() {} releasePointerCapture() {} hasPointerCapture() { return false; }
-  attachShadow() { throw new DOMException('Shadow DOM is not supported', 'NotSupportedError'); }
+  attachShadow(init) {
+    if (shadowRoots.has(this)) throw new DOMException('Shadow root already attached', 'NotSupportedError');
+    const mode = init && init.mode === 'closed' ? 'closed' : 'open';
+    const root = new ShadowRoot(this, mode);
+    shadowRoots.set(this, root);
+    if (mode === 'open') this._openRoot = root;
+    else this._closedRoot = root;
+    return root;
+  }
+  get shadowRoot() { return this._openRoot || null; }
   animate() { throw new DOMException('Element.animate() is not supported; use CSS transitions and @keyframes', 'NotSupportedError'); }
   get ownerSVGElement() { return null; }
 }
@@ -422,6 +606,203 @@ function reflectNum(P, prop, attr = prop.toLowerCase(), def = 0) {
 
 function formOf(el) { return el.closest('form'); }
 
+// ----- constraint validation ---------------------------------------------------------------
+// Minimal spec-faithful validation shared by input/textarea/select/button + form.
+// Custom messages stored per-wrapper (identity is stable via wrapperCache).
+const customValidityMsg = new WeakMap();
+function validityStateFor(el) {
+  const custom = customValidityMsg.get(el) || '';
+  if (custom) return { valid: false, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: true };
+  const tag = (el.localName || '').toLowerCase();
+  const disabled = el.disabled === true;
+  if (disabled) return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+  const required = el.hasAttribute && el.hasAttribute('required');
+  if (tag === 'input') {
+    const type = (el.type || 'text').toLowerCase();
+    if (['hidden', 'button', 'reset', 'submit', 'image'].includes(type)) return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+    if (type === 'checkbox') {
+      const missing = !!required && !el.checked;
+      return { valid: !missing, valueMissing: missing, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+    }
+    if (type === 'radio') {
+      if (required) {
+        const name = el.getAttribute('name');
+        const form = formOf(el);
+        const scope = form || (el.getRootNode ? el.getRootNode() : document);
+        let group = [];
+        try { group = [...scope.querySelectorAll(`input[type=radio][name="${(name || '').replace(/"/g, '\\"')}"]`)]; } catch (_) { group = [el]; }
+        const anyChecked = group.some(r => r.checked);
+        const missing = !anyChecked;
+        return { valid: !missing, valueMissing: missing, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+      }
+      return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+    }
+    const value = el.value || '';
+    if (required && value === '' && type !== 'checkbox' && type !== 'radio') return { valid: false, valueMissing: true, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+    if (value === '') return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+    let typeMismatch = false, badInput = false;
+    if (type === 'email') {
+      const multiple = el.hasAttribute('multiple');
+      const parts = multiple ? value.split(',').map(s => s.trim()).filter(s => s) : [value.trim()];
+      typeMismatch = parts.length === 0 || parts.some(p => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p));
+    } else if (type === 'url') {
+      try { const u = new URL(value); if (u.protocol !== 'http:' && u.protocol !== 'https:' && u.protocol !== 'ftp:') typeMismatch = true; } catch (_) { typeMismatch = true; }
+    } else if (type === 'number' || type === 'range') {
+      const n = Number(value);
+      if (!Number.isFinite(n)) { typeMismatch = true; badInput = true; }
+    }
+    let patternMismatch = false;
+    const pattern = el.getAttribute('pattern');
+    if (pattern !== null && ['text', 'search', 'url', 'tel', 'email', 'password'].includes(type)) {
+      try { if (!new RegExp(`^(?:${pattern})$`, 'u').test(value)) patternMismatch = true; } catch (_) { /* invalid pattern never matches per spec */ patternMismatch = true; }
+    }
+    const maxLen = parseInt(el.getAttribute('maxlength') || '', 10);
+    const minLen = parseInt(el.getAttribute('minlength') || '', 10);
+    const tooLong = Number.isFinite(maxLen) && maxLen >= 0 && [...value].length > maxLen;
+    const tooShort = Number.isFinite(minLen) && minLen > 0 && [...value].length < minLen;
+    let under = false, over = false, stepMismatch = false;
+    const min = el.getAttribute('min'), max = el.getAttribute('max');
+    if ((type === 'number' || type === 'range') && !badInput) {
+      const n = Number(value);
+      if (min !== null && min !== '' && Number.isFinite(Number(min)) && n < Number(min)) under = true;
+      if (max !== null && max !== '' && Number.isFinite(Number(max)) && n > Number(max)) over = true;
+      const step = el.getAttribute('step');
+      if (step !== null && step !== '' && step.toLowerCase() !== 'any') {
+        const s = Number(step);
+        const base = (min !== null && min !== '' && Number.isFinite(Number(min))) ? Number(min) : 0;
+        if (Number.isFinite(s) && s > 0) {
+          const diff = (n - base) / s;
+          if (Math.abs(diff - Math.round(diff)) > 1e-9) stepMismatch = true;
+        }
+      }
+    }
+    const valid = !(typeMismatch || patternMismatch || tooLong || tooShort || under || over || stepMismatch || badInput);
+    return { valid, valueMissing: false, typeMismatch, patternMismatch, tooLong, tooShort, rangeUnderflow: under, rangeOverflow: over, stepMismatch, badInput, customError: false };
+  }
+  if (tag === 'textarea') {
+    const value = el.value || '';
+    if (required && value === '') return { valid: false, valueMissing: true, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+    const maxLen = parseInt(el.getAttribute('maxlength') || '', 10);
+    const minLen = parseInt(el.getAttribute('minlength') || '', 10);
+    const tooLong = Number.isFinite(maxLen) && maxLen >= 0 && [...value].length > maxLen;
+    const tooShort = Number.isFinite(minLen) && minLen > 0 && value !== '' && [...value].length < minLen;
+    const valid = !(tooLong || tooShort);
+    return { valid, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong, tooShort, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+  }
+  if (tag === 'select') {
+    if (required) {
+      const v = el.value || '';
+      // A placeholder label option (empty value) fails required.
+      const missing = v === '';
+      return { valid: !missing, valueMissing: missing, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+    }
+    return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+  }
+  return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false };
+}
+function checkValidityOf(el) {
+  const v = validityStateFor(el);
+  if (v.valid) return true;
+  try { el.dispatchEvent(new Event('invalid', { cancelable: true, bubbles: false })); } catch (_) {}
+  return false;
+}
+function reportValidityOf(el) {
+  const ok = checkValidityOf(el);
+  if (!ok) { try { if (el.focus) el.focus(); } catch (_) {} }
+  return ok;
+}
+
+// Picker UIs. File inputs use the real OS dialog; select/date render an in-engine popup
+// (there is no OS-level list/calendar widget in the native runtime).
+function fileNameOf(p) { return String(p).replace(/\\/g, '/').split('/').pop() || 'file'; }
+function dismissOnOutside(popup) {
+  setTimeout(() => {
+    const close = e => {
+      if (!popup.contains(e.target)) {
+        popup.remove();
+        document.removeEventListener('pointerdown', close, true);
+      }
+    };
+    document.addEventListener('pointerdown', close, true);
+  }, 0);
+}
+function openFilePicker(input) {
+  const accept = input.getAttribute('accept') || '';
+  const exts = accept.split(',').map(s => s.trim().replace(/^\./, '')).filter(s => s && !s.includes('/'));
+  const opts = { title: 'Choose a file', multiple: input.hasAttribute('multiple'), properties: ['openFile'] };
+  if (exts.length) opts.filters = [{ name: 'Accepted files', extensions: exts }];
+  nativeDialog(false, opts).then(paths => {
+    if (!paths || !paths.length) return;
+    const files = paths.map(p => new File([], fileNameOf(p), { path: p }));
+    input.files = files;
+    if (files[0]) input.value = files[0].path;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }).catch(() => {});
+}
+function openDatePicker(input) {
+  const r = input.getBoundingClientRect();
+  let year, month;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input.value)) {
+    const d = new Date(input.value + 'T00:00:00'); year = d.getFullYear(); month = d.getMonth();
+  } else { const d = new Date(); year = d.getFullYear(); month = d.getMonth(); }
+  const popup = document.createElement('div');
+  Object.assign(popup.style, { position: 'fixed', left: r.left + 'px', top: r.bottom + 'px', zIndex: '10000',
+    background: '#fff', border: '1px solid #888', padding: '6px', boxShadow: '0 2px 8px #0004', font: '12px sans-serif', color: '#000' });
+  const title = document.createElement('div');
+  const grid = document.createElement('div');
+  Object.assign(grid.style, { display: 'grid', gridTemplateColumns: 'repeat(7, 24px)', gap: '2px' });
+  const render = () => {
+    title.textContent = year + '-' + String(month + 1).padStart(2, '0');
+    grid.textContent = '';
+    for (const [label, step] of [['<', -1], ['>', 1]]) {
+      const b = document.createElement('button'); b.textContent = label;
+      b.onclick = () => { month += step; if (month < 0) { month = 11; year--; } if (month > 11) { month = 0; year++; } render(); };
+      grid.appendChild(b);
+    }
+    grid.appendChild(document.createElement('span'));
+    const first = new Date(year, month, 1).getDay();
+    for (let i = 0; i < first; i++) grid.appendChild(document.createElement('span'));
+    const days = new Date(year, month + 1, 0).getDate();
+    for (let d = 1; d <= days; d++) {
+      const b = document.createElement('button'); b.textContent = String(d);
+      b.onclick = () => {
+        input.value = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        popup.remove();
+      };
+      grid.appendChild(b);
+    }
+  };
+  popup.appendChild(title); popup.appendChild(grid); render();
+  document.body.appendChild(popup);
+  dismissOnOutside(popup);
+}
+function openSelectPicker(select) {
+  const r = select.getBoundingClientRect();
+  const opts = [...select.options];
+  if (!opts.length) return;
+  const popup = document.createElement('div');
+  Object.assign(popup.style, { position: 'fixed', left: r.left + 'px', top: r.bottom + 'px', minWidth: Math.max(r.width, 60) + 'px',
+    zIndex: '10000', background: '#fff', border: '1px solid #888', boxShadow: '0 2px 8px #0004', font: '13px sans-serif', color: '#000' });
+  const current = select.selectedIndex;
+  opts.forEach((o, i) => {
+    const item = document.createElement('div');
+    item.textContent = o.textContent;
+    Object.assign(item.style, { padding: '3px 8px', cursor: 'pointer', background: i === current ? '#06f' : 'transparent', color: i === current ? '#fff' : '#000' });
+    item.onclick = () => {
+      select.selectedIndex = i;
+      select.dispatchEvent(new Event('input', { bubbles: true }));
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      popup.remove();
+    };
+    popup.appendChild(item);
+  });
+  document.body.appendChild(popup);
+  dismissOnOutside(popup);
+}
+
 class HTMLInputElement extends HTMLElement {
   get value() { return N('value', this[ID]); }
   set value(v) { N('set_value', this[ID], v == null ? '' : String(v)); }
@@ -434,6 +815,53 @@ class HTMLInputElement extends HTMLElement {
   set type(v) { this.setAttribute('type', v); }
   get valueAsNumber() { const n = parseFloat(this.value); return Number.isNaN(n) ? NaN : n; }
   set valueAsNumber(v) { this.value = String(v); }
+  get valueAsDate() {
+    const v = this.value;
+    if (!v) return null;
+    const d = new Date(v.length === 10 ? v + 'T00:00:00' : v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  set valueAsDate(d) {
+    if (d === null || d === undefined) { this.value = ''; return; }
+    const t = (this.type || '').toLowerCase();
+    const dt = d instanceof Date ? d : new Date(d);
+    if (Number.isNaN(dt.getTime())) { this.value = ''; return; }
+    const pad = n => String(n).padStart(2, '0');
+    if (t === 'date') this.value = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+    else if (t === 'month') this.value = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}`;
+    else if (t === 'time') this.value = `${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    else this.value = dt.toISOString();
+  }
+  stepUp(n = 1) { this._stepBy(+n || 0); }
+  stepDown(n = 1) { this._stepBy(-(+n || 0)); }
+  _stepBy(delta) {
+    const t = (this.type || '').toLowerCase();
+    if (!['number', 'range'].includes(t)) return;
+    const cur = Number(this.value);
+    const base = Number.isFinite(cur) ? cur : 0;
+    const stepAttr = this.getAttribute('step');
+    let step = 1;
+    if (stepAttr !== null && stepAttr !== '' && stepAttr.toLowerCase() !== 'any') {
+      const s = Number(stepAttr);
+      if (Number.isFinite(s) && s > 0) step = s;
+    }
+    const next = base + step * delta;
+    const min = this.getAttribute('min'), max = this.getAttribute('max');
+    let v = next;
+    if (min !== null && min !== '' && Number.isFinite(Number(min))) v = Math.max(v, Number(min));
+    if (max !== null && max !== '' && Number.isFinite(Number(max))) v = Math.min(v, Number(max));
+    this.value = String(v);
+    try { this.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+    try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+  }
+  showPicker() {
+    const t = (this.type || '').toLowerCase();
+    if (t === 'checkbox' || t === 'radio') { this.click(); return; }
+    try { this.focus(); } catch (_) {}
+    if (t === 'file') { openFilePicker(this); return; }
+    if (t === 'date') { openDatePicker(this); return; }
+    // Other input types have no picker; focusing is the honest fallback.
+  }
   get selectionStart() { const s = N('selection', this[ID]); return s ? s[0] : null; }
   set selectionStart(v) { const s = N('selection', this[ID]); N('set_selection', this[ID], +v, s[1]); }
   get selectionEnd() { const s = N('selection', this[ID]); return s ? s[1] : null; }
@@ -443,11 +871,15 @@ class HTMLInputElement extends HTMLElement {
   select() { N('set_selection', this[ID], 0, this.value.length); }
   setRangeText(t, s, e) { const v = this.value; s = s ?? this.selectionStart; e = e ?? this.selectionEnd; this.value = v.slice(0, s) + t + v.slice(e); }
   get form() { return formOf(this); }
-  get files() { return null; }
+  get files() { return this._files || []; }
+  set files(v) { this._files = v; }
   get labels() { return NodeList.from([]); }
-  get validity() { return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false }; }
-  get willValidate() { return !this.disabled; }
-  checkValidity() { return true; } reportValidity() { return true; } setCustomValidity() {}
+  get validity() { return validityStateFor(this); }
+  get validationMessage() { return customValidityMsg.get(this) || ''; }
+  get willValidate() { const t = (this.type || '').toLowerCase(); return !this.disabled && !['hidden', 'button', 'reset', 'submit', 'image'].includes(t); }
+  checkValidity() { return checkValidityOf(this); }
+  reportValidity() { return reportValidityOf(this); }
+  setCustomValidity(m) { customValidityMsg.set(this, String(m || '')); }
   get indeterminate() { return false; } set indeterminate(v) {}
 }
 for (const p of ['name', 'placeholder', 'autocomplete', 'min', 'max', 'step', 'pattern', 'accept', 'alt', 'src']) reflectStr(HTMLInputElement.prototype, p);
@@ -467,7 +899,12 @@ class HTMLTextAreaElement extends HTMLElement {
   setSelectionRange(a, b) { N('set_selection', this[ID], a, b); }
   select() { N('set_selection', this[ID], 0, this.value.length); }
   get form() { return formOf(this); }
-  checkValidity() { return true; } reportValidity() { return true; } setCustomValidity() {}
+  get validity() { return validityStateFor(this); }
+  get validationMessage() { return customValidityMsg.get(this) || ''; }
+  get willValidate() { return !this.disabled; }
+  checkValidity() { return checkValidityOf(this); }
+  reportValidity() { return reportValidityOf(this); }
+  setCustomValidity(m) { customValidityMsg.set(this, String(m || '')); }
 }
 for (const p of ['name', 'placeholder', 'wrap']) reflectStr(HTMLTextAreaElement.prototype, p);
 for (const p of ['disabled', 'required', 'readOnly', 'autofocus']) reflectBool(HTMLTextAreaElement.prototype, p);
@@ -495,7 +932,17 @@ class HTMLSelectElement extends HTMLElement {
   get type() { return 'select-one'; }
   get form() { return formOf(this); }
   add(o, before) { this.insertBefore(o, before || null); }
-  checkValidity() { return true; } reportValidity() { return true; }
+  showPicker() {
+    // Render an in-engine popup list anchored to the select. Keyboard arrows/Home/End
+    // still work directly on the focused control (see the runtime input driver).
+    openSelectPicker(this);
+  }
+  get validity() { return validityStateFor(this); }
+  get validationMessage() { return customValidityMsg.get(this) || ''; }
+  get willValidate() { return !this.disabled; }
+  checkValidity() { return checkValidityOf(this); }
+  reportValidity() { return reportValidityOf(this); }
+  setCustomValidity(m) { customValidityMsg.set(this, String(m || '')); }
 }
 for (const p of ['name']) reflectStr(HTMLSelectElement.prototype, p);
 for (const p of ['disabled', 'required', 'multiple']) reflectBool(HTMLSelectElement.prototype, p);
@@ -506,7 +953,12 @@ class HTMLButtonElement extends HTMLElement {
   get form() { return formOf(this); }
   get value() { return this.getAttribute('value') || ''; }
   set value(v) { this.setAttribute('value', v); }
-  checkValidity() { return true; } reportValidity() { return true; }
+  get validity() { return { valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false }; }
+  get validationMessage() { return ''; }
+  get willValidate() { return false; }
+  checkValidity() { return true; }
+  reportValidity() { return true; }
+  setCustomValidity() {}
 }
 reflectStr(HTMLButtonElement.prototype, 'name'); reflectBool(HTMLButtonElement.prototype, 'disabled'); reflectBool(HTMLButtonElement.prototype, 'autofocus');
 
@@ -515,6 +967,7 @@ class HTMLFormElement extends HTMLElement {
   get length() { return this.elements.length; }
   submit() { /* no navigation in Rendrix */ }
   requestSubmit(submitter) {
+    if (!this.hasAttribute('novalidate') && !this.checkValidity()) return;
     const ev = new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter || null });
     this.dispatchEvent(ev);
   }
@@ -526,7 +979,23 @@ class HTMLFormElement extends HTMLElement {
       else if (c.localName === 'textarea') c.value = c.defaultValue;
     }
   }
-  checkValidity() { return true; } reportValidity() { return true; }
+  checkValidity() {
+    if (this.hasAttribute('novalidate')) return true;
+    let ok = true;
+    for (const c of this.elements) {
+      if (c.checkValidity && !c.checkValidity()) ok = false;
+    }
+    return ok;
+  }
+  reportValidity() {
+    const ok = this.checkValidity();
+    if (!ok) {
+      for (const c of this.elements) {
+        if (c.validity && !c.validity.valid) { try { c.focus(); } catch (_) {} break; }
+      }
+    }
+    return ok;
+  }
 }
 reflectStr(HTMLFormElement.prototype, 'action'); reflectStr(HTMLFormElement.prototype, 'method', 'method', 'get'); reflectStr(HTMLFormElement.prototype, 'name');
 
@@ -605,19 +1074,20 @@ class CanvasRenderingContext2D {
     this._fill = '#000000'; this._stroke = '#000000';
     this._font = '10px sans-serif'; this._align = 'start'; this._baseline = 'alphabetic';
     this._shadowColor = 'rgba(0, 0, 0, 0)'; this._shadowBlur = 0; this._shadowX = 0; this._shadowY = 0;
+    this._composite = 'source-over';
     this._stack = [];
   }
   get canvas() { return wrap(this._id); }
   // ----- state -----
   save() {
     N('canvas_save', this._id);
-    this._stack.push([this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha,
+    this._stack.push([this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha, this._composite,
       this._font, this._align, this._baseline, this._shadowColor, this._shadowBlur, this._shadowX, this._shadowY]);
   }
   restore() {
     N('canvas_restore', this._id);
     const s = this._stack.pop();
-    if (s) [this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha,
+    if (s) [this._fill, this._stroke, this._lineWidth, this._lineCap, this._lineJoin, this._alpha, this._composite,
       this._font, this._align, this._baseline, this._shadowColor, this._shadowBlur, this._shadowX, this._shadowY] = s;
   }
   // ----- transform (canvas matrix convention: x' = a*x + c*y + e) -----
@@ -661,9 +1131,13 @@ class CanvasRenderingContext2D {
   set shadowOffsetX(v) { v = +v; if (Number.isFinite(v)) { N('canvas_set_shadow_offset', this._id, v, this._shadowY); this._shadowX = v; } }
   get shadowOffsetY() { return this._shadowY; }
   set shadowOffsetY(v) { v = +v; if (Number.isFinite(v)) { N('canvas_set_shadow_offset', this._id, this._shadowX, v); this._shadowY = v; } }
-  // Only source-over compositing is supported; other modes are ignored (documented).
-  get globalCompositeOperation() { return 'source-over'; }
-  set globalCompositeOperation(_) {}
+  // Porter-Duff and separable blend modes are honoured by the CPU rasterizer.
+  // Non-separable modes (hue/saturation/color/luminosity) fall back to source-over.
+  get globalCompositeOperation() { return N('canvas_get_composite', this._id); }
+  set globalCompositeOperation(v) {
+    const mode = String(v);
+    try { N('canvas_set_composite', this._id, mode); this._composite = mode; } catch (_) {}
+  }
   // ----- text (shaped through the shared TextSystem; invalid values are ignored) -----
   get font() { return this._font; }
   set font(v) { v = String(v); try { mut('canvas_set_font', this._id, v); this._font = v; } catch (_) {} }
@@ -723,7 +1197,7 @@ class CanvasRenderingContext2D {
   // ----- images -----
   drawImage(src, ...a) {
     let sj, sx, sy, sw, sh, dx, dy, dw, dh;
-    if (src instanceof HTMLCanvasElement) {
+    if (src instanceof HTMLCanvasElement || src instanceof ImageBitmap) {
       sj = JSON.stringify({ canvas: src[ID] }); sw = src.width; sh = src.height;
     } else if (src instanceof HTMLImageElement) {
       const info = N('image_info', src.getAttribute('src') || '');
@@ -799,8 +1273,48 @@ class HTMLCanvasElement extends HTMLElement {
     if (this.width === 0 || this.height === 0) return 'data:,';
     return N('canvas_data_url', this[ID]);
   }
+  toBlob(callback, type) {
+    if (typeof callback !== 'function') throw new TypeError('Failed to execute \'toBlob\' on \'HTMLCanvasElement\': parameter 1 is not of type \'Function\'.');
+    if (this.width === 0 || this.height === 0) { callback(null); return; }
+    const url = N('canvas_data_url', this[ID]);
+    if (url === 'data:,') { callback(null); return; }
+    const bytes = b64ToBytes(url.slice(url.indexOf(',') + 1));
+    // PNG is the only encoding the raster backend exposes; other requested types fall back to it.
+    callback(new Blob([bytes], { type: 'image/png' }));
+  }
   get width() { return parseInt(this.getAttribute('width') || '300', 10); } set width(v) { this.setAttribute('width', String(v)); N('canvas_resize', this[ID]); if (this._ctx2d) this._ctx2d._resetCache(); }
   get height() { return parseInt(this.getAttribute('height') || '150', 10); } set height(v) { this.setAttribute('height', String(v)); N('canvas_resize', this[ID]); if (this._ctx2d) this._ctx2d._resetCache(); }
+}
+// OffscreenCanvas is backed by a detached native canvas sharing the Canvas 2D rasterizer.
+// It never enters the display list, so it can be drawn into and read back but not painted
+// directly; `transferToImageBitmap()` yields a source usable by `drawImage`.
+class ImageBitmap {
+  constructor(canvas) { this[ID] = canvas[ID]; this.width = canvas.width; this.height = canvas.height; this._canvas = canvas; }
+  close() { /* the backing canvas is owned by the OffscreenCanvas that produced it */ }
+}
+class OffscreenCanvas {
+  constructor(w = 300, h = 150) {
+    const el = document.createElement('canvas');
+    el.width = w; el.height = h;
+    this._el = el;
+    this._ctx = null;
+  }
+  get width() { return this._el.width; }
+  set width(v) { this._el.width = v; if (this._ctx) this._ctx._resetCache(); }
+  get height() { return this._el.height; }
+  set height(v) { this._el.height = v; if (this._ctx) this._ctx._resetCache(); }
+  getContext(kind) {
+    if (kind === '2d') {
+      if (!this._ctx) this._ctx = this._el.getContext('2d');
+      return this._ctx;
+    }
+    return null;
+  }
+  convertToBlob(opts) {
+    const type = opts && opts.type;
+    return new Promise(resolve => this._el.toBlob(resolve, type));
+  }
+  transferToImageBitmap() { return new ImageBitmap(this._el); }
 }
 class HTMLStyleElement extends HTMLElement { get sheet() { return null; } }
 class HTMLLinkElement extends HTMLElement {}
@@ -1080,27 +1594,54 @@ class Document extends Node {
   get styleSheets() { return []; }
   get adoptedStyleSheets() { return []; }
   set adoptedStyleSheets(v) { for (const s of v || []) if (s && s._cssText) N('add_stylesheet', s._cssText); }
-  get cookie() { return cookieJar; }
-  set cookie(v) { cookieJar = String(v).split(';')[0]; }
+  get cookie() { return N('cookie_get'); }
+  set cookie(v) { N('cookie_set', String(v)); }
   hasFocus() { return true; }
-  createElement(tag) { return wrap(N('create_element', String(tag))); }
-  createElementNS(ns, tag) { return wrap(N('create_element', String(tag))); }
+  get designMode() { return designModeValue; }
+  set designMode(v) { designModeValue = String(v).toLowerCase() === 'on' ? 'on' : 'off'; }
+  createElement(tag) {
+    const el = wrap(N('create_element', String(tag)));
+    try { upgradeCustom(el); } catch (_) {}
+    return el;
+  }
+  createElementNS(ns, tag) { const el = wrap(N('create_element', String(tag))); try { upgradeCustom(el); } catch (_) {} return el; }
   createTextNode(t) { return wrap(N('create_text', String(t))); }
   createComment(t) { return wrap(N('create_comment', String(t))); }
   createDocumentFragment() { return wrap(N('create_fragment')); }
   createEvent(type) { return /mouse/i.test(type) ? new MouseEvent('') : /key/i.test(type) ? new KeyboardEvent('') : new Event(''); }
-  createRange() { throw new DOMException('Range is not supported', 'NotSupportedError'); }
+  createRange() { return new Range(); }
   importNode(n, deep) { return n.cloneNode(deep); }
   adoptNode(n) { return n; }
-  getSelection() { return { rangeCount: 0, toString: () => '', removeAllRanges() {}, addRange() {} }; }
+  getSelection() { return docSelection; }
   elementFromPoint(x, y) { return wrap(N('hit_test', +x, +y)); }
   elementsFromPoint(x, y) { const out = []; for (let e = this.elementFromPoint(x, y); e; e = e.parentElement) out.push(e); return out; }
   getElementsByTagName(t) { return HTMLCollection.from(wrapAll(N('by_tag', this[ID], String(t)))); }
   getElementsByClassName(c) { return HTMLCollection.from(wrapAll(N('by_class', this[ID], String(c)))); }
-  execCommand() { return false; }
+  execCommand(cmd, _ui, value) {
+    cmd = String(cmd || '').toLowerCase();
+    if (cmd === 'inserttext' && value !== undefined) {
+      const ae = this.activeElement;
+      try {
+        if (ae && ae.isContentEditable) {
+          // Append into the first text child or textContent (minimal editing).
+          const fc = ae.firstChild;
+          if (fc && fc.nodeType === 3) fc.data = (fc.data || '') + String(value);
+          else ae.textContent = (ae.textContent || '') + String(value);
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+    if (cmd === 'delete' || cmd === 'forwarddelete') {
+      try { docSelection.deleteFromDocument(); return true; } catch (_) { return false; }
+    }
+    if (cmd === 'selectall') {
+      try { docSelection.selectAllChildren(this.activeElement || this.body); return true; } catch (_) { return false; }
+    }
+    return false;
+  }
   _eventParent() { return windowTarget; }
 }
 parentNodeMixin(Document.prototype);
-let cookieJar = '';
 
 const document = wrap(N('document_root'));

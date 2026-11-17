@@ -10,6 +10,9 @@ use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use web_time::Instant;
 
+// `crypto.subtle.digest` hash backends (pure Rust, available on native and wasm).
+use sha1::Digest as _;
+
 #[derive(Debug, Clone, Default)]
 pub struct Permissions {
     pub network: bool,
@@ -22,6 +25,81 @@ impl Permissions {
     pub fn allow_all() -> Permissions {
         Permissions { network: true, fs_read: vec![PathBuf::from("/")], fs_write: vec![] }
     }
+}
+
+/// One cookie in the session jar. `expires` is a Unix timestamp in seconds;
+/// `None` means a session cookie (lives until the process exits).
+#[derive(Debug, Clone)]
+struct CookieEntry {
+    value: String,
+    expires: Option<f64>,
+}
+
+impl CookieEntry {
+    fn expired(&self) -> bool {
+        self.expires.map(|t| t <= now_secs()).unwrap_or(false)
+    }
+}
+
+/// The document's origin in the single-origin `rendrix://app` runtime.
+const DOC_COOKIE_HOST: &str = "app";
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { (m - 3) as i64 } else { (m + 9) as i64 };
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parse the common HTTP-date forms used by `Set-Cookie: Expires=...`:
+/// RFC 1123 (`Wed, 21 Oct 2015 07:28:00 GMT`), RFC 850 (`Wednesday, 21-Oct-15 07:28:00 GMT`)
+/// and asctime (`Wed Oct 21 07:28:00 2015`).
+fn parse_http_date(s: &str) -> Option<f64> {
+    let normalized: String = s
+        .trim()
+        .chars()
+        .map(|c| if c == ',' || c == '-' { ' ' } else { c })
+        .collect();
+    let parts: Vec<&str> = normalized.split_whitespace().collect();
+    let time_i = parts.iter().position(|p| p.contains(':'))?;
+    let mut time = parts[time_i].split(':');
+    let hh: i64 = time.next()?.parse().ok()?;
+    let mm: i64 = time.next()?.parse().ok()?;
+    let ss: i64 = time.next()?.parse().ok()?;
+    let month_names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    let month_i = parts.iter().position(|p| {
+        let p = p.get(..3).unwrap_or(p).to_ascii_lowercase();
+        month_names.iter().position(|m| *m == p).is_some()
+    })?;
+    let month = month_names.iter().position(|m| *m == parts[month_i].get(..3).unwrap_or(parts[month_i]).to_ascii_lowercase())? as u32 + 1;
+    let numbers: Vec<i64> = parts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != time_i)
+        .filter_map(|(_, p)| p.parse::<i64>().ok())
+        .collect();
+    // In all three accepted formats the day precedes the year, so the first
+    // 1..=31 token is the day and the last numeric token is the year.
+    let day = numbers.iter().find(|n| **n >= 1 && **n <= 31)? as &i64;
+    let day = *day as u32;
+    let raw_year = *numbers.last()?;
+    let year = if raw_year < 100 {
+        if raw_year < 70 { raw_year + 2000 } else { raw_year + 1900 }
+    } else {
+        raw_year
+    };
+    Some((days_from_civil(year, month, day) * 86400 + hh * 3600 + mm * 60 + ss) as f64)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,9 +234,9 @@ pub struct DomHost {
     /// Overflow for WebSocket messages beyond `WS_MAX_PER_TICK`; oldest first.
     ws_overflow: VecDeque<FetchResult>,
     ws_cmds: HashMap<u32, Sender<WsCommand>>,
-    /// Session cookie jar: host → `name=value; ...`. No persistence, no expiry enforcement
-    /// beyond `Max-Age=0`/past-`Expires` deletion (documented native scope, see COMPATIBILITY.md).
-    cookie_jar: HashMap<String, HashMap<String, String>>,
+    /// Session cookie jar: host → name → entry with value and optional expiry. No persistence,
+    /// but `Max-Age`/`Expires` are honoured and expired cookies are dropped on access.
+    cookie_jar: HashMap<String, HashMap<String, CookieEntry>>,
     /// OS accessibility preferences (see `detect_reduced_motion`; override with
     /// `RENDRIX_REDUCED_MOTION=1` / `RENDRIX_CONTRAST_MORE=1`).
     pub prefs_reduced_motion: bool,
@@ -444,9 +522,13 @@ impl DomHost {
         let req_host = url_host(&url);
         let mut headers = headers;
         if let Some(h) = &req_host {
+            // Drop cookies whose Max-Age/Expires has passed before attaching them.
+            if let Some(jar) = self.cookie_jar.get_mut(h) {
+                jar.retain(|_, e| !e.expired());
+            }
             if let Some(jar) = self.cookie_jar.get(h) {
                 if !jar.is_empty() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
-                    let mut pairs: Vec<String> = jar.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    let mut pairs: Vec<String> = jar.iter().map(|(k, v)| format!("{}={}", k, v.value)).collect();
                     pairs.sort();
                     headers.push(("Cookie".to_string(), pairs.join("; ")));
                 }
@@ -530,15 +612,36 @@ impl DomHost {
             if name.is_empty() {
                 continue;
             }
-            let rest = parts.collect::<Vec<_>>().join(";").to_ascii_lowercase();
-            // Deletion: Max-Age=0 drops the cookie regardless of the accompanying value.
-            if rest.contains("max-age=0") {
-                if let Some(jar) = self.cookie_jar.get_mut(host) {
-                    jar.remove(&name);
+            let attrs: Vec<String> = parts.map(|a| a.trim().to_ascii_lowercase()).collect();
+            let mut expires: Option<f64> = None;
+            let mut delete = false;
+            for attr in &attrs {
+                if let Some((k, v)) = attr.split_once('=') {
+                    match k.trim() {
+                        "max-age" => {
+                            if let Ok(secs) = v.trim().parse::<f64>() {
+                                if secs <= 0.0 {
+                                    delete = true;
+                                } else {
+                                    expires = Some(now_secs() + secs);
+                                }
+                            }
+                        }
+                        "expires" => {
+                            if let Some(t) = parse_http_date(v.trim()) {
+                                expires = Some(t);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                continue;
             }
-            self.cookie_jar.entry(host.to_string()).or_default().insert(name, value);
+            let jar = self.cookie_jar.entry(host.to_string()).or_default();
+            if delete || expires.map(|t| t <= now_secs()).unwrap_or(false) {
+                jar.remove(&name);
+            } else {
+                jar.insert(name, CookieEntry { value, expires });
+            }
         }
     }
 
@@ -1433,6 +1536,18 @@ impl Host for DomHost {
                 Val::Undefined
             }
             "random" => Val::Num(self.rand()),
+            "crypto_digest" => {
+                let alg = s(a, 0).trim().to_ascii_lowercase();
+                let data = base64_decode(&s(a, 1)).ok_or_else(|| "EncodingError: invalid digest input".to_string())?;
+                let out = match alg.as_str() {
+                    "sha-1" => sha1::Sha1::digest(&data).to_vec(),
+                    "sha-256" => sha2::Sha256::digest(&data).to_vec(),
+                    "sha-384" => sha2::Sha384::digest(&data).to_vec(),
+                    "sha-512" => sha2::Sha512::digest(&data).to_vec(),
+                    _ => return Err(format!("NotSupportedError: digest algorithm '{}' is not supported", s(a, 0))),
+                };
+                Val::Str(base64_encode(&out))
+            }
             // ---- console ----
             "console" => {
                 let (level, msg) = (s(a, 0), s(a, 1));
@@ -1449,6 +1564,27 @@ impl Host for DomHost {
                 }
                 Val::Undefined
             }
+            // ---- cookies (document.cookie <-> session jar) ----
+            "cookie_get" => {
+                if let Some(jar) = self.cookie_jar.get_mut(DOC_COOKIE_HOST) {
+                    jar.retain(|_, e| !e.expired());
+                }
+                let pairs = self
+                    .cookie_jar
+                    .get(DOC_COOKIE_HOST)
+                    .map(|jar| {
+                        let mut p: Vec<String> = jar.iter().map(|(k, v)| format!("{k}={}", v.value)).collect();
+                        p.sort();
+                        p
+                    })
+                    .unwrap_or_default();
+                Val::Str(pairs.join("; "))
+            }
+            "cookie_set" => {
+                self.apply_cookies(DOC_COOKIE_HOST, &[s(a, 0)]);
+                Val::Undefined
+            }
+            "cookie_enabled" => Val::Bool(true),
             // ---- storage ----
             "storage_get" => self.storage.area(&s(a, 0)).get(&s(a, 1)).cloned().map(Val::Str).unwrap_or(Val::Null),
             "storage_set" => {
@@ -2045,9 +2181,15 @@ mod host_tests {
         let mut h = host();
         h.apply_cookies("example.com", &["a=1; Path=/".to_string(), "b=2; Secure".to_string()]);
         let jar = h.cookie_jar.get("example.com").unwrap();
-        assert_eq!(jar.get("a").map(String::as_str), Some("1"));
+        assert_eq!(jar.get("a").map(|e| e.value.as_str()), Some("1"));
         h.apply_cookies("example.com", &["a=gone; Max-Age=0".to_string()]);
         assert!(!h.cookie_jar.get("example.com").unwrap().contains_key("a"));
+        // Expiry: a past Expires date is deleted, a Max-Age entry records its deadline.
+        h.apply_cookies("example.com", &["old=x; Expires=Wed, 21 Oct 2015 07:28:00 GMT".to_string()]);
+        assert!(!h.cookie_jar.get("example.com").unwrap().contains_key("old"));
+        h.apply_cookies("example.com", &["fresh=y; Max-Age=600".to_string()]);
+        let e = h.cookie_jar.get("example.com").unwrap().get("fresh").unwrap();
+        assert!(e.expires.is_some() && !e.expired());
         assert_eq!(url_host("https://example.com:8080/p?q=1"), Some("example.com".into()));
         assert_eq!(url_host("http://user@[::1]:80/"), Some("::1".into()));
         assert_eq!(url_host("data:text/plain,hi"), None);

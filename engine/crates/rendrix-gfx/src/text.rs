@@ -5,7 +5,7 @@
 
 use cosmic_text::{Align, Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight, Wrap};
 use cosmic_text::fontdb;
-use rendrix_css::{FontStyle, TextAlign, TextTransform, WhiteSpace};
+use rendrix_css::{FontStyle, TextAlign, TextTransform, WhiteSpace, WordBreak};
 use rendrix_layout::{InlineContent, TextMeasurer};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -31,6 +31,10 @@ pub struct Segment {
 pub struct Paragraph {
     pub width: f32,
     pub height: f32,
+    /// Number of visual lines produced by shaping (one per `layout_runs()` entry,
+    /// including empty ones). Cached once at build time so the one-line reuse
+    /// check in [`TextSystem::paragraph`] needs no per-lookup allocation/hash.
+    pub line_count: usize,
     pub glyphs: Vec<GlyphInfo>,
     pub segments: Vec<Segment>,
     pub text: String,
@@ -98,6 +102,28 @@ pub struct TextSystem {
     pub shape_count: usize,
     /// Paragraph-cache lookups served without shaping.
     pub cache_hits: usize,
+    /// Cumulative nanoseconds spent inside [`TextSystem::build`] (the actual cosmic-text shaping).
+    /// Additive and monotonic; `rendrix-core` snapshots it per frame to attribute startup/first-frame
+    /// cost to text shaping without changing how paragraphs are cached or measured.
+    pub shape_nanos: u64,
+}
+
+// Phase timers for the startup breakdown in `rendrix-runtime bench`. They live here because the
+// font DB is opened inside `TextSystem::new`, before a `Session` or `Engine` exists. Thread-local
+// so independent sessions/bench threads cannot contaminate each other's observation.
+thread_local! {
+    static FONT_DB_LOAD_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FONT_DB_CACHE_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Nanoseconds spent loading/rebuilding the font database in the most recent `TextSystem::new()`.
+pub fn last_font_db_load_nanos() -> u64 {
+    FONT_DB_LOAD_NANOS.with(|c| c.get())
+}
+
+/// Whether the most recent `TextSystem::new()` was served by the on-disk font-DB cache.
+pub fn last_font_db_cache_hit() -> bool {
+    FONT_DB_CACHE_HIT.with(|c| c.get())
 }
 
 impl Default for TextSystem {
@@ -133,6 +159,7 @@ impl TextSystem {
     /// see `fonts/OFL.txt`) and map every generic family to it. Apps add their own with `@font-face`.
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
+        let start = std::time::Instant::now();
         let mut db = fontdb::Database::new();
         db.load_font_data(include_bytes!("../fonts/Inter_400Regular.ttf").to_vec());
         db.load_font_data(include_bytes!("../fonts/Inter_700Bold.ttf").to_vec());
@@ -141,6 +168,8 @@ impl TextSystem {
         db.set_monospace_family("Inter");
         db.set_cursive_family("Inter");
         db.set_fantasy_family("Inter");
+        FONT_DB_CACHE_HIT.with(|c| c.set(false));
+        FONT_DB_LOAD_NANOS.with(|c| c.set(start.elapsed().as_nanos() as u64));
         Self::from_font_system(FontSystem::new_with_locale_and_db("en-US".to_string(), db))
     }
 
@@ -149,13 +178,19 @@ impl TextSystem {
         // Cold-start fast path (R1.3): rebuilding the font DB from the on-disk
         // metadata cache skips re-scanning + re-parsing every system font
         // (~0.75s). A miss pays the full scan once and populates the cache.
+        let start = std::time::Instant::now();
         let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
-        if let Some(db) = load_font_db_cache(&locale) {
-            return Self::from_font_system(FontSystem::new_with_locale_and_db(locale, db));
-        }
-        let fonts = FontSystem::new();
-        let locale = fonts.locale().to_string();
-        save_font_db_cache(&locale, fonts.db());
+        let fonts = if let Some(db) = load_font_db_cache(&locale) {
+            FONT_DB_CACHE_HIT.with(|c| c.set(true));
+            FontSystem::new_with_locale_and_db(locale, db)
+        } else {
+            FONT_DB_CACHE_HIT.with(|c| c.set(false));
+            let fonts = FontSystem::new();
+            let locale = fonts.locale().to_string();
+            save_font_db_cache(&locale, fonts.db());
+            fonts
+        };
+        FONT_DB_LOAD_NANOS.with(|c| c.set(start.elapsed().as_nanos() as u64));
         Self::from_font_system(fonts)
     }
 
@@ -165,7 +200,7 @@ impl TextSystem {
             .faces()
             .flat_map(|f| f.families.iter().map(|(n, _)| n.to_lowercase()).collect::<Vec<_>>())
             .collect();
-        TextSystem { fonts, swash: SwashCache::new(), cache: HashMap::new(), clock: 0, installed, shape_count: 0, cache_hits: 0 }
+        TextSystem { fonts, swash: SwashCache::new(), cache: HashMap::new(), clock: 0, installed, shape_count: 0, cache_hits: 0, shape_nanos: 0 }
     }
 
     /// Number of paragraphs currently cached.
@@ -214,12 +249,26 @@ impl TextSystem {
     }
 
     fn build(&mut self, content: &InlineContent, width: Option<f32>) -> Paragraph {
+        let shape_start = std::time::Instant::now();
         self.shape_count += 1;
         let c = &content.container;
         let metrics = Metrics::new(c.font_size.max(1.0), c.line_height.resolve(c.font_size).max(1.0));
         let mut buffer = Buffer::new(&mut self.fonts, metrics);
         let nowrap = matches!(c.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre);
-        buffer.set_wrap(&mut self.fonts, if nowrap { Wrap::None } else { Wrap::WordOrGlyph });
+        // `word-break` selects how cosmic-text may break within a word:
+        //   normal    -> word boundaries, falling back to glyph breaks (CJK, long words)
+        //   break-all -> any glyph may start a line, even for Latin scripts
+        //   keep-all  -> never break inside a word (CJK runs stay intact)
+        let wrap = if nowrap {
+            Wrap::None
+        } else {
+            match c.word_break {
+                WordBreak::BreakAll => Wrap::Glyph,
+                WordBreak::KeepAll => Wrap::Word,
+                WordBreak::Normal => Wrap::WordOrGlyph,
+            }
+        };
+        buffer.set_wrap(&mut self.fonts, wrap);
         buffer.set_size(&mut self.fonts, if nowrap { None } else { width }, None);
 
         // Keep owned strings alive for the span borrow.
@@ -272,7 +321,9 @@ impl TextSystem {
         let mut segments: Vec<Segment> = Vec::new();
         let mut max_w = 0.0f32;
         let mut height = 0.0f32;
+        let mut line_count = 0usize;
         for run in buffer.layout_runs() {
+            line_count += 1;
             max_w = max_w.max(run.line_w);
             height = height.max(run.line_top + run.line_height);
             let mut cur: Option<Segment> = None;
@@ -296,7 +347,26 @@ impl TextSystem {
             }
         }
         // Empty content has no height; an explicit trailing newline still occupies a line.
-        Paragraph { width: max_w, height, glyphs, segments, text, buffer, line_starts, wrap: width }
+        let para = Paragraph { width: max_w, height, line_count, glyphs, segments, text, buffer, line_starts, wrap: width };
+        self.shape_nanos += shape_start.elapsed().as_nanos() as u64;
+        para
+    }
+
+    /// Shape a batch of `(content, width)` pairs into the paragraph cache *before* the first frame.
+    ///
+    /// This is the safe lever for moving cold-start shaping off the critical first-frame path: an app
+    /// that knows its initial content (e.g. a static first screen, or a list built by a loading script)
+    /// can call this during a loading phase, then the first frame's `measure`/paint calls are cache
+    /// hits. Each item goes through [`TextSystem::paragraph`], so prewarmed entries are exactly the
+    /// ones on-demand shaping would have produced — no separate code path, hence no identity risk.
+    ///
+    /// Intentionally opt-in: the engine cannot know future content, and forcing a prewarm by walking
+    /// the DOM would only move the work into a different bucket of the same startup number. Callers
+    /// with a genuine idle window should use it; everyone else pays nothing.
+    pub fn prewarm<'a>(&mut self, items: impl IntoIterator<Item = (&'a InlineContent, Option<f32>)>) {
+        for (content, width) in items {
+            let _ = self.paragraph(content, width);
+        }
     }
 
     pub fn paragraph(&mut self, content: &InlineContent, width: Option<f32>) -> Rc<Paragraph> {
@@ -305,7 +375,7 @@ impl TextSystem {
         if let Some(w) = width {
             if matches!(content.container.text_align, TextAlign::Left | TextAlign::Start) {
                 let natural = self.paragraph(content, None);
-                if natural.width <= w && natural.glyphs.iter().map(|g| g.line_y.to_bits()).collect::<std::collections::HashSet<_>>().len() <= 1 {
+                if natural.width <= w && natural.line_count <= 1 {
                     return natural;
                 }
             }
@@ -459,6 +529,14 @@ impl TextSystem {
 // cache below, so offscreen paragraphs cost nothing until they are measured or
 // painted (paint additionally skips fully-clipped text before shaping; see the
 // renderer), and the font DB itself is reused across runs via this cache.
+//
+// Why shaping is NOT parallelised (considered and rejected): every shaping call needs
+// `&mut FontSystem` (cosmic-text's `Buffer::new`/`set_rich_text`/`shape_until_scroll` all take
+// `&mut`), `TextSystem` is reached through a `RefCell` and hands out `Rc<Paragraph>` (not `Send`),
+// and `FontSystem` is not `Sync`. Sharing it across threads would need a lock held for the whole
+// shape (serialising anyway) plus `Arc`/`Send` rewrites across the engine — high risk for no
+// win. The safe cold-start lever is `TextSystem::prewarm`: batch known content into the cache
+// during a genuine idle window, off the critical first-frame path.
 //
 // Env overrides (tests/debugging):
 // - `RENDRIX_CACHE_DIR`: directory holding `fontdb-v1.cache`.
@@ -757,6 +835,20 @@ mod tests {
         InlineContent::new(vec![InlineRun { text: text.into(), style: s.clone(), node: 1, is_break: false }], s)
     }
 
+    /// A stable signature of everything measurement/paint consumes from a paragraph. Hashing f32
+    /// bits (not `==`) makes even a sub-ULP change in glyph position fail the assertion, so an
+    /// optimization cannot silently change rendered geometry while "still looking about right".
+    fn snapshot(p: &Paragraph) -> String {
+        let mut s = format!("{}|{}|{}|{}|", p.width.to_bits(), p.height.to_bits(), p.line_count, p.text);
+        for g in &p.glyphs {
+            s.push_str(&format!("g:{}/{}/{}/{}/{};", g.glyph.x.to_bits(), g.glyph.w.to_bits(), g.glyph.start, g.glyph.end, g.glyph.metadata));
+        }
+        for seg in &p.segments {
+            s.push_str(&format!("s:{}/{}/{}/{}/{};", seg.run, seg.x.to_bits(), seg.w.to_bits(), seg.line_y.to_bits(), seg.line_height.to_bits()));
+        }
+        s
+    }
+
     #[test]
     fn measures_and_wraps() {
         let mut t = TextSystem::new();
@@ -879,6 +971,103 @@ mod tests {
         );
         let (_, h) = t.measure(&c, None);
         assert!(h >= 2.0 * 16.0 * 1.1, "two lines: {h}");
+    }
+
+    #[test]
+    fn paragraph_records_line_count() {
+        let mut t = TextSystem::new();
+        let one = t.paragraph(&content("a single line", 16.0), None);
+        assert_eq!(one.line_count, 1, "one visual line");
+        let two = t.paragraph(&content("first line\nsecond line", 16.0), None);
+        assert_eq!(two.line_count, 2, "two newline-separated visual lines");
+    }
+
+    // ---- Cache-correctness / measurement-identity guards ---------------------------------------
+    // These pin the *result* of shaping (glyph geometry, not just counts), so any future
+    // prewarm/batching/parallelization cannot change what is rendered without failing here.
+
+    #[test]
+    fn memoized_shape_is_measurement_identical() {
+        let mut t = TextSystem::new();
+        let c = content("the quick brown fox jumps over the lazy dog", 17.0);
+        let first = snapshot(&t.paragraph(&c, Some(180.0)));
+        let shapes = t.shape_count;
+        // Several repeat lookups (including via `measure`) must all serve the cached paragraph.
+        for _ in 0..5 {
+            assert_eq!(snapshot(&t.paragraph(&c, Some(180.0))), first);
+            assert!(t.measure(&c, Some(180.0)).0 > 0.0);
+        }
+        assert_eq!(t.shape_count, shapes, "repeats never re-shape");
+        assert_eq!(snapshot(&t.paragraph(&c, Some(180.0))), first, "cache hit == fresh shape");
+    }
+
+    #[test]
+    fn width_bucket_hit_matches_fresh_shape() {
+        let mut t = TextSystem::new();
+        let c = content("a wrapped sentence that needs more than one line at this width", 16.0);
+        // 150.1 and 150.4 land in the same 0.5px bucket (floor 150.0).
+        assert_eq!(quantize_width(150.1), quantize_width(150.4));
+        assert_eq!(width_bits(quantize_width(150.1)), width_bits(quantize_width(150.4)));
+        let at_floor = {
+            let mut fresh = TextSystem::new();
+            let p = fresh.paragraph(&c, Some(150.0));
+            snapshot(&p)
+        };
+        let at_150_1 = snapshot(&t.paragraph(&c, Some(150.1)));
+        let at_150_4 = snapshot(&t.paragraph(&c, Some(150.4)));
+        assert_eq!(at_150_1, at_150_4, "both widths in a bucket share one paragraph object");
+        assert_eq!(at_150_1, at_floor, "bucket shape == a directly-shaped bucket floor");
+        // Guard the quantiser's defensive edges (non-finite / negative → zero bucket).
+        assert_eq!(quantize_width(f32::NAN), 0.0);
+        assert_eq!(quantize_width(f32::INFINITY), 0.0);
+        assert_eq!(quantize_width(-12.0), 0.0);
+    }
+
+    #[test]
+    fn eviction_then_reshape_is_measurement_identical() {
+        let mut t = TextSystem::new();
+        let c = content("identity survives an LRU eviction: measure me twice", 16.0);
+        let before = snapshot(&t.paragraph(&c, Some(220.0)));
+        // Force the original entry out of the cache.
+        for i in 0..(PARA_CACHE_CAP + 8) {
+            let other = content(&format!("filler paragraph {i} with enough words to shape"), 16.0);
+            t.measure(&other, Some(220.0));
+        }
+        assert!(t.cache_len() <= PARA_CACHE_CAP);
+        let after = snapshot(&t.paragraph(&c, Some(220.0)));
+        assert_eq!(after, before, "a re-shaped paragraph is bit-for-bit the original");
+    }
+
+    #[test]
+    fn prewarm_is_opt_in_dedup_and_identity_preserving() {
+        let c = content("prewarm this paragraph and then measure it", 16.0);
+        // Baseline: shape on demand in a fresh system.
+        let mut baseline = TextSystem::new();
+        let expected = snapshot(&baseline.paragraph(&c, Some(240.0)));
+        let expected_shapes = baseline.shape_count;
+
+        // Prewarm a second system, then look the paragraph up again.
+        let mut warmed = TextSystem::new();
+        warmed.prewarm(std::iter::once((&c, Some(240.0))));
+        assert_eq!(warmed.shape_count, expected_shapes, "prewarm shapes each item exactly once");
+        let shapes_after_prewarm = warmed.shape_count;
+        assert_eq!(snapshot(&warmed.paragraph(&c, Some(240.0))), expected, "prewarm result identical");
+        assert_eq!(warmed.shape_count, shapes_after_prewarm, "post-prewarm lookup is a cache hit");
+        assert_eq!(snapshot(&warmed.paragraph(&c, Some(240.0))), expected);
+    }
+
+    #[test]
+    fn instrumentation_counters_are_monotonic() {
+        let mut t = TextSystem::new();
+        let (shapes, nanos, hits) = (t.shape_count, t.shape_nanos, t.cache_hits);
+        let c = content("instrumentation counters must advance with real work", 16.0);
+        t.measure(&c, Some(200.0));
+        assert!(t.shape_count > shapes, "shape_count advances");
+        assert!(t.shape_nanos >= nanos, "shape_nanos never decreases");
+        assert!(t.cache_hits >= hits);
+        // The font-DB phase timer is populated by `new()` and is non-negative by construction.
+        let _ = super::last_font_db_load_nanos();
+        let _ = super::last_font_db_cache_hit();
     }
 
     /// Isolate the font-DB cache in a fresh temp dir; restores the env after.

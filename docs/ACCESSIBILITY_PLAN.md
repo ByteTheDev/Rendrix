@@ -2,22 +2,28 @@
 
 ## Status
 
-**Not implemented.** Rendrix draws its own pixels, so assistive technology cannot see the interface:
-there is no accessibility tree, no screen-reader announcements, no high-contrast or reduced-motion
-adaptation (`prefers-reduced-motion` always reports `no-preference`). Keyboard use works (Tab order,
-Enter/Space activation, text editing, caret and selection) and focus rings are drawn through normal CSS
-`:focus` / `outline`.
+**Bridge implemented, manual verification pending.** `rendrix-js` builds an AccessKit tree from the DOM
+(role from tag/`role`, name from `aria-label`/`aria-labelledby`/`<label>`/text content, state from
+`disabled`/`checked`/`aria-*`, value and selection for text controls, bounds from layout). `accesskit_winit`
+bridges it to UIA on Windows, NSAccessibility on macOS and AT-SPI on Linux, and routes Click/Focus/Blur/
+SetValue/ReplaceSelectedText actions back through `Session` entry points. The tree is pushed on repainted
+frames only, so idle frames stay at zero work. Unit and integration tests assert tree shape
+(`tests/platform.rs`, `tests/regression.rs`).
 
-## Plan
+`matchMedia('(prefers-reduced-motion)')` and `(prefers-contrast)` read host preferences (Windows builds;
+on other targets an environment override is used until per-OS queries land). Keyboard use works: Tab order,
+Enter/Space activation, text editing, caret and selection, with focus rings drawn through normal CSS
+`:focus` / `:focus-visible`.
 
-1. **Tree.** Build an [AccessKit](https://github.com/AccessKit/accesskit) tree from the DOM during
-   `Engine::update`: role from tag/`role`, name from `aria-label`/`aria-labelledby`/`<label>`/text content,
-   state from `disabled`, `checked`, `aria-*`, value/selection for text controls, bounds from layout. The
-   box tree already carries the node ids needed to map layout to DOM.
-2. **Platform bridge.** Hand the tree to `accesskit_winit` (UIA on Windows, NSAccessibility on macOS,
-   AT-SPI on Linux) and route AT actions (focus, click, set value, scroll) into the same `Session` entry
-   points real input uses.
-3. **Preferences.** Query OS settings for reduced motion, contrast and text scale and expose them through
-   `matchMedia`.
-4. **Verification.** Narrator / NVDA on Windows, VoiceOver on macOS, Orca on Linux, plus automated tests
-   that assert the tree for the example apps. No claim of support will be made before those pass.
+**No manual assistive-technology pass has been performed or recorded.** Do not claim screen-reader support
+until the procedure in [A11Y_CHECKLIST.md](A11Y_CHECKLIST.md) has been executed and logged.
+
+## Remaining work
+
+1. **Manual verification.** Narrator / NVDA on Windows, VoiceOver on macOS and Orca on Linux, following
+   [A11Y_CHECKLIST.md](A11Y_CHECKLIST.md). Record date, build, OS/AT versions and pass/fail per step.
+2. **Preference parity.** Push browser/per-OS reduced-motion and contrast settings through on the wasm
+   target instead of relying on environment overrides.
+3. **Coverage.** Expand role/state mapping to the newer controls (date picker popup, validation messages,
+   3D scene hosts), expose live regions and verify reading order against complex layout (tables, floats).
+4. **Regression.** Keep tree-shape and AT-action tests in CI; add screenshot-level focus-visibility checks.

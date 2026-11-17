@@ -8,12 +8,18 @@ pub enum ElementState {
     Hover,
     Active,
     Focus,
+    FocusVisible,
     FocusWithin,
     Disabled,
     Checked,
 }
 
 pub trait SelectorElement: Sized + Clone {
+    /// Stable numeric identity (DOM node id). Defaults to 0 for lightweight test mocks,
+    /// which therefore do not participate in container queries.
+    fn node_id(&self) -> u64 {
+        0
+    }
     fn tag(&self) -> &str;
     fn id(&self) -> Option<&str>;
     fn has_class(&self, class: &str) -> bool;
@@ -308,7 +314,8 @@ fn pseudo_matches<E: SelectorElement>(p: &PseudoClass, el: &E) -> bool {
     match p {
         PseudoClass::Hover => el.has_state(ElementState::Hover),
         PseudoClass::Active => el.has_state(ElementState::Active),
-        PseudoClass::Focus | PseudoClass::FocusVisible => el.has_state(ElementState::Focus),
+        PseudoClass::Focus => el.has_state(ElementState::Focus),
+        PseudoClass::FocusVisible => el.has_state(ElementState::FocusVisible),
         PseudoClass::FocusWithin => el.has_state(ElementState::FocusWithin) || el.has_state(ElementState::Focus),
         PseudoClass::Disabled => el.has_state(ElementState::Disabled),
         PseudoClass::Enabled => {

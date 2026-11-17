@@ -22,10 +22,11 @@ and Rendrix makes no attempt to be API-compatible with any of them.
 | `rendrix-css` | Tokenizer/parser, selectors + specificity, cascade, inheritance, custom properties (`var()`), media queries, `@keyframes`, timing functions, interpolation, computed style | `SelectorElement` trait (style any tree), `ComputedStyle`, `compute_style` |
 | `rendrix-dom` | Arena DOM: nodes, attributes, mutation records, selector queries, tolerant HTML parser/serializer, form state, dirty tracking, node GC | `Document`; `ElRef` implements `SelectorElement` |
 | `rendrix-layout` | Layout-engine-neutral box tree and the `LayoutEngine` trait; a persistent Taffy backend (flex, grid, block) that only re-lays out what changed | `LayoutNode`, `LayoutEngine`, `TextMeasurer` |
-| `rendrix-gfx` | Display list, cosmic-text shaping + paragraph cache, glyph atlas, wgpu renderer (SDF rounded rects/borders/gradients/shadows/clips/transforms, images, text) | `DisplayList`, `TextSystem`, `Renderer` |
-| `rendrix-core` | `Engine`: DOM → styles (+transitions/animations) → box generation (block/inline/flex/grid, anonymous boxes, whitespace, replaced elements, form controls) → layout → painting; hit testing, scrolling, text editing | `Engine::update(now)`, `hit_test`, `edit`, `display_list` |
-| `rendrix-js` | `JsEngine` trait + QuickJS backend, ES module loader, DOM and Web API prelude (JavaScript), host operations, event-loop glue | `JsEngine`, `Host`, `JsRuntime` |
-| `rendrix-runtime` | App bundle loader, `Session` (input state machine and frame loop), winit window driver, headless driver, benchmark | `Session`, `AppBundle` |
+| `rendrix-gfx` | Display list, cosmic-text shaping + paragraph cache + disk font-DB cache, glyph atlas with LRU, wgpu renderer (SDF rounded rects/per-side/dashed borders/gradients/shadows/clips/transforms, images, text), a shared atlas that batches small images into one draw, offscreen compositing layers (isolated opacity, separable Gaussian blur, real backdrop-filter), CPU-rasterized Canvas 2D, SVG painting and 3D scene rasterization with dynamic uniform offsets | `DisplayList`, `TextSystem`, `Renderer`, `Canvas` |
+| `rendrix-core` | `Engine`: DOM → styles (+transitions/animations) → incremental box generation and dirty-subtree patching (block/inline/flex/grid, anonymous boxes, whitespace, replaced elements, form controls) → layout → painting; hit testing, scrolling, text editing | `Engine::update(now)`, `hit_test`, `edit`, `display_list` |
+| `rendrix-js` | `JsEngine` trait + QuickJS backend, ES module loader, DOM and Web API prelude (JavaScript), host operations, event-loop glue, dedicated workers, source-map remapping and the AccessKit tree builder | `JsEngine`, `Host`, `JsRuntime` |
+| `rendrix-runtime` | App bundle loader, `Session` (input state machine and frame loop), winit window driver (multi-window, touch, gamepads, IME), headless driver, benchmark, `--inspect` snapshot | `Session`, `AppBundle` |
+| `rendrix-web` | Experimental wasm32 target: the same engine running in a Web Worker with the browser's JS engine and a transferred `OffscreenCanvas` | `WebApp`, `BrowserEngine` |
 
 ## One frame
 
@@ -44,12 +45,15 @@ and Rendrix makes no attempt to be API-compatible with any of them.
      changed or the stylesheet has non-local state/structural selectors;
    - if no computed style actually changed (most hovers), the frame stops here;
    - start transitions/keyframe animations from style changes and sample running ones;
-   - build the box tree (formatting-context rules, anonymous boxes) and run layout (Taffy keeps its tree
-     between frames, so unchanged subtrees reuse cached results);
+   - patch the **box tree** per element for dirty subtrees instead of rebuilding it (formatting-context
+     rules, anonymous boxes) and run layout (Taffy keeps its tree between frames, so unchanged subtrees
+     reuse cached results);
    - paint to a **display list** with stacking order, clips, transforms and viewport culling, producing
-     the hit-test list in the same traversal.
+     the hit-test list in the same traversal. Pixel-reading effects (`filter: blur()`, `backdrop-filter`,
+     polygon clips) route through isolated offscreen compositing layers; ordinary frames keep the
+     single-draw-call path.
 5. `Renderer` flattens the display list into one instance buffer and draws it in a single pipeline and
-   usually one draw call.
+   usually one draw call. Canvas content is uploaded as its own texture and composited in the same pass.
 
 An idle application does no work: no timer, no animation and no pending change means no frame.
 
@@ -81,13 +85,16 @@ with no live wrapper are freed by a periodic sweep and their ids reused.
 
 ## Known architectural limits
 
-* The box tree is rebuilt in full after any style or structure change (≈5 ms per 9,000 nodes); only layout
-  results are incremental. Incremental box generation is the next performance step.
-* Overlay scrollbars are painted but not interactive; there is no accessibility tree yet
-  ([ACCESSIBILITY_PLAN.md](ACCESSIBILITY_PLAN.md)).
+* Box generation is incremental per dirty subtree, but Taffy still re-solves the affected layout tree
+  (≈5–7 ms for a mutation on 9,000 nodes). Getting mutations under 3 ms is the open performance step.
+* Overlay scrollbars are painted but not draggable. The AccessKit accessibility tree and OS bridge exist
+  ([ACCESSIBILITY_PLAN.md](ACCESSIBILITY_PLAN.md)), but no manual screen-reader pass has been recorded.
 * Absolutely positioned boxes use the containing block's origin when their insets are `auto` (no static
   position), and inline elements with box styling (padding, background…) behave as inline-blocks.
-* A single window and a single JavaScript context per process.
+* Each window has its own `Session` and JavaScript context; windows do not share a document or clipboard
+  beyond the OS clipboard. There is one process and no isolation for hostile code.
+* Tables, floats and multi-column are laid out as grid-like approximations; CSS masks, 3D and the web
+  target are partial. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for exactly what is and is not supported, and
 [ENGINE_ASSESSMENT.md](ENGINE_ASSESSMENT.md) for the roadmap.

@@ -52,7 +52,7 @@
 
 use glam::{EulerRot, Mat4, Vec3, Vec4};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Scene id = the hosting element's DOM `NodeId`.
 pub type SceneId = u64;
@@ -736,9 +736,12 @@ impl Scene {
 // -------------------------------------------------------------------------------------------
 
 /// CPU-side scene map owned by whoever drives frames (unit-testable without globals).
+///
+/// Scenes are held behind an [`Arc`] so renderer retrieval is a cheap refcount bump
+/// rather than a deep copy of every mesh (which can hold up to ~1M vertices).
 #[derive(Debug, Default)]
 pub struct SceneStore {
-    scenes: HashMap<SceneId, Scene>,
+    scenes: HashMap<SceneId, Arc<Scene>>,
     next_revision: u64,
 }
 
@@ -753,7 +756,9 @@ impl SceneStore {
         let mut scene = Scene::from_json(desc_json)?;
         self.next_revision += 1;
         scene.revision = self.next_revision;
-        self.scenes.insert(id, scene);
+        // Fresh Arc on every upsert so renderers see a new allocation and rebuild
+        // their cached GPU buffers when the scene is replaced.
+        self.scenes.insert(id, Arc::new(scene));
         Ok(())
     }
 
@@ -761,8 +766,14 @@ impl SceneStore {
         self.scenes.remove(&id).is_some()
     }
 
+    /// Borrow the scene by dereferencing the stored [`Arc`].
     pub fn get(&self, id: SceneId) -> Option<&Scene> {
-        self.scenes.get(&id)
+        self.scenes.get(&id).map(|a| a.as_ref())
+    }
+
+    /// Cheap refcount-bump clone of the stored scene handle.
+    pub fn get_arc(&self, id: SceneId) -> Option<Arc<Scene>> {
+        self.scenes.get(&id).cloned()
     }
 
     pub fn ids(&self) -> Vec<SceneId> {
@@ -802,9 +813,13 @@ pub fn scene_ids() -> Vec<SceneId> {
     global().lock().map(|s| s.ids()).unwrap_or_default()
 }
 
-/// Renderer hook: clone the scene for compositing (the lock is not held across GPU work).
-pub(crate) fn cloned_scene(id: SceneId) -> Option<Scene> {
-    global().lock().ok()?.get(id).cloned()
+/// Renderer hook: fetch the scene for compositing as a cheap [`Arc`] clone (a refcount
+/// bump, not a deep copy of the meshes). The store's mutex guard is dropped when this
+/// function returns, so the lock is never held across GPU work; the returned handle
+/// keeps the scene alive on its own.
+pub(crate) fn cloned_scene(id: SceneId) -> Option<Arc<Scene>> {
+    let store = global().lock().ok()?;
+    store.get_arc(id)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -999,6 +1014,27 @@ mod tests {
         assert!(!store.remove(2));
         assert!(store.upsert_json(3, r#"{"camera":{"fovY":0}}"#).is_err(), "failed upsert leaves nothing");
         assert!(store.get(3).is_none());
+    }
+
+    #[test]
+    fn scene_handles_are_cheap_arc_clones() {
+        // Local store: two get_arc handles share the same allocation.
+        let mut store = SceneStore::new();
+        store.upsert_json(1, BOX).unwrap();
+        let a = store.get_arc(1).unwrap();
+        let b = store.get_arc(1).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "get_arc must clone the Arc, not the Scene");
+        assert_eq!(a.revision, b.revision);
+
+        // Global hook: cloned_scene is also an Arc clone, and removal drops the entry.
+        const ID: SceneId = 0xDEAD_BEEF;
+        let _ = remove_scene(ID); // clear any leftover from a prior run
+        upsert_scene(ID, BOX).unwrap();
+        let c = cloned_scene(ID).unwrap();
+        let d = cloned_scene(ID).unwrap();
+        assert!(Arc::ptr_eq(&c, &d), "cloned_scene must return the same Arc twice");
+        assert!(remove_scene(ID));
+        assert!(cloned_scene(ID).is_none(), "lookup after remove returns None");
     }
 
     #[test]

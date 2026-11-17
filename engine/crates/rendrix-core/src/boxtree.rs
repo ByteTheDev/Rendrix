@@ -146,9 +146,9 @@ impl<'a> Builder<'a> {
                         if Arc::ptr_eq(&new_style, &old.style) && !self.dirty_at_or_inside(id) {
                             return Some(old);
                         }
-                        // Shell changed (or something inside is dirty): offer the descendants
-                        // for reuse and rebuild this box from the current styles.
-                        drain_into(&mut self.taken, old);
+                        // Shell changed (or something inside is dirty): offer the direct
+                        // children for reuse and rebuild this box from the current styles.
+                        release_children(&mut self.taken, old);
                     }
                 }
             }
@@ -654,13 +654,24 @@ fn collapsible(ws: WhiteSpace) -> bool {
 //   above a non-positioned unit) are detected through the builder's `abs_stack`: the patch
 //   bails out (`false`) and the caller falls back to `build_root` — identical output.
 
-/// P1: return a dropped box's descendants to the reuse pool (anonymous leaves always rebuild).
-fn drain_into(pool: &mut HashMap<u64, LayoutNode>, mut node: LayoutNode) {
-    for child in node.children.drain(..) {
-        drain_into(pool, child);
-    }
+/// P1: offer a persisted box subtree for reuse, keyed by box id. The subtree stays
+/// intact — a clean node is returned wholesale with all of its descendants. Anonymous
+/// boxes always rebuild from inline runs, so only their (DOM-owned) children are offered.
+fn offer_subtree(pool: &mut HashMap<u64, LayoutNode>, node: LayoutNode) {
     if node.id & ANON == 0 {
         pool.insert(node.id, node);
+    } else {
+        for child in node.children {
+            offer_subtree(pool, child);
+        }
+    }
+}
+
+/// P1: a box that must be rebuilt offers its direct children individually so a dirty
+/// subtree can reuse clean siblings without losing their own descendants.
+fn release_children(pool: &mut HashMap<u64, LayoutNode>, mut node: LayoutNode) {
+    for child in node.children.drain(..) {
+        offer_subtree(pool, child);
     }
 }
 
@@ -789,25 +800,18 @@ fn remove_node(node: &mut LayoutNode, id: u64) -> bool {
     false
 }
 
-/// P1: remove the box with `id` from the old tree and pool it (with descendants) for reuse.
-fn take_unit_node(root: &mut LayoutNode, id: u64, pool: &mut HashMap<u64, LayoutNode>) -> bool {
-    if let Some(pos) = root.children.iter().position(|c| c.id == id) {
-        let node = root.children.remove(pos);
-        drain_into(pool, node);
-        return true;
-    }
-    for c in &mut root.children {
-        if take_unit_node(c, id, pool) {
-            return true;
-        }
-    }
-    false
-}
-
 /// P1: patch the previous frame's box tree in place. Returns `false` when the patch cannot
 /// preserve full-build semantics (stale shape, escaping out-of-flow boxes); the caller then
 /// discards the tree and runs `build_root`.
 pub(crate) fn patch_tree(engine: &Engine, old_root: &mut LayoutNode, dirty_ids: &[NodeId]) -> bool {
+    patch_tree_with_units(engine, old_root, dirty_ids).0
+}
+
+/// Same as [`patch_tree`], but also returns the *box ids* of the units that were actually
+/// rebuilt. The layout engine uses these as its dirty set so it can limit Taffy sync to exactly
+/// the changed subtrees (a dirty DOM node may be `display: contents` / pseudo / table internal
+/// and have no box of its own, in which case its containing unit is the real change site).
+pub(crate) fn patch_tree_with_units(engine: &Engine, old_root: &mut LayoutNode, dirty_ids: &[NodeId]) -> (bool, Vec<u64>) {
     // Resolve dirty DOM nodes to rebuild units (innermost candidate present in the old tree),
     // dropping units nested inside another unit.
     let mut units: Vec<NodeId> = Vec::new();
@@ -822,7 +826,7 @@ pub(crate) fn patch_tree(engine: &Engine, old_root: &mut LayoutNode, dirty_ids: 
                 break;
             }
         }
-        let Some(u) = chosen else { return false };
+        let Some(u) = chosen else { return (false, Vec::new()) };
         if units.iter().any(|kept| contains(engine, *kept, u)) {
             continue;
         }
@@ -830,23 +834,33 @@ pub(crate) fn patch_tree(engine: &Engine, old_root: &mut LayoutNode, dirty_ids: 
         units.push(u);
     }
     if units.is_empty() {
-        return true;
+        return (true, Vec::new());
     }
     let dirty: HashSet<NodeId> = dirty_ids.iter().copied().collect();
     let mut pool: HashMap<u64, LayoutNode> = HashMap::new();
+    let mut rebuilt_units = Vec::with_capacity(units.len());
     for u in units {
         if old_root.id == u as u64 {
             let children = std::mem::take(&mut old_root.children);
             for ch in children {
-                drain_into(&mut pool, ch);
+                offer_subtree(&mut pool, ch);
             }
-        } else if !take_unit_node(old_root, u as u64, &mut pool) {
-            return false; // unit not in the old tree: full rebuild
+        } else if let Some(node) = find_node_mut(old_root, u as u64) {
+            // Keep the unit's shell in the tree and move only its descendants into the
+            // reuse pool, so the rebuilt subtree can be spliced back into the same slot
+            // below. Removing the shell here made the re-splice lookup always fail and
+            // forced a full `build_root` for every non-root dirty unit.
+            let children = std::mem::take(&mut node.children);
+            for ch in children {
+                offer_subtree(&mut pool, ch);
+            }
+        } else {
+            return (false, Vec::new()); // unit not in the old tree: full rebuild
         }
         let mut builder = Builder { engine, abs_stack: vec![Vec::new()], taken: std::mem::take(&mut pool), dirty: dirty.clone() };
         let rebuilt = builder.build_box_cached(u);
         if !builder.abs_stack[0].is_empty() {
-            return false; // escaping out-of-flow boxes: full rebuild re-hangs them
+            return (false, Vec::new()); // escaping out-of-flow boxes: full rebuild re-hangs them
         }
         pool = std::mem::take(&mut builder.taken);
         match rebuilt {
@@ -856,19 +870,25 @@ pub(crate) fn patch_tree(engine: &Engine, old_root: &mut LayoutNode, dirty_ids: 
                 } else if let Some(slot) = find_node_mut(old_root, u as u64) {
                     *slot = node;
                 } else {
-                    return false;
+                    return (false, Vec::new());
                 }
+                // This box id is a real box in the new tree; Taffy must re-sync its subtree.
+                rebuilt_units.push(u as u64);
             }
             None => {
                 // The whole unit is now `display: none`: drop it.
                 if old_root.id == u as u64 {
-                    return false; // root `display: none`: let build_root produce None
+                    return (false, Vec::new()); // root `display: none`: let build_root produce None
                 }
                 remove_node(old_root, u as u64);
+                // The removed box is no longer in the tree, so its former parent must re-run
+                // `set_children`. Mark the root dirty to force Taffy to re-sync the whole tree
+                // rather than risk skipping that parent (removals are rarer than style edits).
+                rebuilt_units.push(old_root.id);
             }
         }
     }
-    true
+    (true, rebuilt_units)
 }
 
 /// P1: keep a reused root box's viewport width in sync when boxes survive a resize.
@@ -1000,6 +1020,26 @@ mod tests {
         fn mutate_both(a: &mut Engine, b: &mut Engine, f: impl Fn(&mut Document)) {
             f(&mut a.doc);
             f(&mut b.doc);
+        }
+
+        #[test]
+        fn patch_tree_splices_non_root_units_instead_of_rebuilding() {
+            let (mut a, _) = pair();
+            let target = a.doc.get_element_by_id("i1").unwrap();
+            a.doc.toggle_class(target, "hot", None);
+            a.update(0.0);
+
+            // A non-root dirty unit must be patched in place. Previously the unit was
+            // removed from the tree before the re-splice lookup, so the lookup always
+            // failed and every non-root mutation fell back to a full `build_root`.
+            let mut tree = a.layout_tree.clone().unwrap();
+            assert!(
+                crate::boxtree::patch_tree(&a, &mut tree, &[target]),
+                "a non-root style change must patch incrementally"
+            );
+            let mut full = crate::boxtree::Builder::new(&a).build_root().unwrap();
+            crate::boxtree::refresh_root_width(&mut full, a.viewport.0);
+            assert_same_tree(&tree, &full);
         }
 
         #[test]

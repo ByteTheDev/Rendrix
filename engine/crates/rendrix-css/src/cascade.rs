@@ -1,7 +1,7 @@
 //! The cascade: rule indexing, matching, ordering by origin/importance/specificity/source order,
 //! custom property resolution, and computed style construction.
 
-use crate::parser::{Declaration, FontFace, Keyframes, MediaContext, Rule, StyleRule, Stylesheet};
+use crate::parser::{Declaration, FontFace, Keyframes, MediaContext, MediaQueryList, Rule, StyleRule, Stylesheet, SupportsCondition};
 use crate::properties::{apply_declaration, StyleContext};
 use crate::selector::{PseudoElement, Selector, SelectorElement};
 use crate::style::{ComputedStyle, Display, Position};
@@ -21,6 +21,10 @@ struct IndexedRule {
     declarations: Arc<[Declaration]>,
     origin: Origin,
     order: u32,
+    /// Cascade layer index assigned on first appearance; `None` = unlayered.
+    layer: Option<u32>,
+    /// Container query gating this rule (name + size condition).
+    container: Option<(String, MediaQueryList)>,
 }
 
 #[derive(Debug, Default)]
@@ -33,6 +37,9 @@ pub struct RuleSet {
     pub keyframes: HashMap<String, Keyframes>,
     pub font_faces: Vec<FontFace>,
     next_order: u32,
+    /// Cascade layer names in first-appearance order.
+    layer_names: HashMap<String, u32>,
+    next_layer: u32,
     /// Some selector tests hover/active/focus on a compound other than its subject (e.g. `.a:hover .b`),
     /// so a state change can restyle descendants or siblings of the element that changed.
     pub state_deps_nonlocal: bool,
@@ -40,6 +47,8 @@ pub struct RuleSet {
     pub structural_deps: bool,
     /// The stylesheet contains at least one `@media` rule (whether or not it matched).
     pub has_media_rules: bool,
+    /// The stylesheet contains at least one `@container` rule.
+    pub has_container_rules: bool,
     /// Some declaration value can resolve against the viewport size (`vw`/`vh`/`vmin`/`vmax`,
     /// or a `var()` that might substitute one). Checked on resize to decide whether computed
     /// styles can be reused.
@@ -49,6 +58,24 @@ pub struct RuleSet {
     pub uses_percent: bool,
 }
 
+/// Evaluate an `@supports` condition by asking the property parser whether each
+/// declaration is actually accepted. Unknown properties/values and unsupported
+/// functions evaluate to false, matching CSS feature detection.
+fn supports_condition_matches(cond: &SupportsCondition) -> bool {
+    match cond {
+        SupportsCondition::Declaration(name, value) => {
+            let parent = ComputedStyle::default();
+            let mut style = ComputedStyle::default();
+            apply_declaration(&mut style, &parent, name, value, &StyleContext::default())
+        }
+        SupportsCondition::Selector(s) => Selector::parse(s).is_some(),
+        SupportsCondition::Not(c) => !supports_condition_matches(c),
+        SupportsCondition::And(cs) => cs.iter().all(supports_condition_matches),
+        SupportsCondition::Or(cs) => cs.iter().any(supports_condition_matches),
+        SupportsCondition::Unsupported => false,
+    }
+}
+
 impl RuleSet {
     pub fn new() -> Self {
         RuleSet::default()
@@ -56,18 +83,60 @@ impl RuleSet {
 
     /// Add every rule of `sheet` that applies under `media`.
     pub fn add_stylesheet(&mut self, sheet: &Stylesheet, origin: Origin, media: &MediaContext) {
-        self.add_rules(&sheet.rules, origin, media);
+        self.add_rules(&sheet.rules, origin, media, None, None);
     }
 
-    fn add_rules(&mut self, rules: &[Rule], origin: Origin, media: &MediaContext) {
+    fn layer_id(&mut self, name: &str) -> u32 {
+        if let Some(id) = self.layer_names.get(name) {
+            return *id;
+        }
+        let id = self.next_layer;
+        self.next_layer += 1;
+        self.layer_names.insert(name.to_string(), id);
+        id
+    }
+
+    fn add_rules(
+        &mut self,
+        rules: &[Rule],
+        origin: Origin,
+        media: &MediaContext,
+        layer: Option<u32>,
+        container: Option<&(String, MediaQueryList)>,
+    ) {
         for rule in rules {
             match rule {
-                Rule::Style(r) => self.add_style_rule(r, origin),
+                Rule::Style(r) => self.add_style_rule(r, origin, layer, container),
                 Rule::Media(q, inner) => {
                     self.has_media_rules = true;
                     if q.matches(media) {
-                        self.add_rules(inner, origin, media);
+                        self.add_rules(inner, origin, media, layer, container);
                     }
+                }
+                Rule::Supports(cond, inner) => {
+                    if supports_condition_matches(cond) {
+                        self.add_rules(inner, origin, media, layer, container);
+                    }
+                }
+                Rule::LayerStatement(names) => {
+                    for name in names {
+                        self.layer_id(name);
+                    }
+                }
+                Rule::Container(name, query, inner) => {
+                    self.has_container_rules = true;
+                    self.add_rules(inner, origin, media, layer, Some(&(name.clone(), query.clone())));
+                }
+                Rule::Layer(name, inner) => {
+                    let id = match name {
+                        Some(n) => self.layer_id(n),
+                        None => {
+                            let id = self.next_layer;
+                            self.next_layer += 1;
+                            id
+                        }
+                    };
+                    self.add_rules(inner, origin, media, Some(id), container);
                 }
                 Rule::Keyframes(k) => {
                     for (_, decls) in &k.frames {
@@ -76,6 +145,10 @@ impl RuleSet {
                     self.keyframes.insert(k.name.clone(), k.clone());
                 }
                 Rule::FontFace(f) => self.font_faces.push(f.clone()),
+                Rule::Import(_, _) => {
+                    // Resolved by `rendrix-core` (bundled-asset splice) before
+                    // indexing; a bare parsed sheet ignores it defensively.
+                }
             }
         }
     }
@@ -95,7 +168,7 @@ impl RuleSet {
         }
     }
 
-    fn add_style_rule(&mut self, r: &StyleRule, origin: Origin) {
+    fn add_style_rule(&mut self, r: &StyleRule, origin: Origin, layer: Option<u32>, container: Option<&(String, MediaQueryList)>) {
         let decls: Arc<[Declaration]> = r.declarations.clone().into();
         self.note_viewport_flags(&r.declarations);
         for sel in &r.selectors {
@@ -154,7 +227,14 @@ impl RuleSet {
             } else {
                 self.universal.push(idx);
             }
-            self.rules.push(IndexedRule { selector: sel.clone(), declarations: decls.clone(), origin, order: self.next_order });
+            self.rules.push(IndexedRule {
+                selector: sel.clone(),
+                declarations: decls.clone(),
+                origin,
+                order: self.next_order,
+                layer,
+                container: container.cloned(),
+            });
             self.next_order += 1;
         }
     }
@@ -169,7 +249,7 @@ impl RuleSet {
 
     /// Rules matching `el` (for `pseudo`, the originating element of that pseudo-element), sorted by
     /// ascending cascade precedence: (origin, specificity, source order).
-    fn matching<E: SelectorElement>(&self, el: &E, pseudo: Option<PseudoElement>) -> Vec<&IndexedRule> {
+    fn matching<E: SelectorElement>(&self, el: &E, pseudo: Option<PseudoElement>, sc: &StyleContext) -> Vec<&IndexedRule> {
         let mut candidates: Vec<u32> = Vec::new();
         if let Some(id) = el.id() {
             if let Some(v) = self.by_id.get(id) {
@@ -200,14 +280,76 @@ impl RuleSet {
         let mut hits: Vec<&IndexedRule> = candidates
             .into_iter()
             .map(|i| &self.rules[i as usize])
-            .filter(|r| match pseudo {
-                None => r.selector.matches(el),
-                Some(p) => r.selector.pseudo_element == Some(p) && r.selector.matches_subject(el),
+            .filter(|r| {
+                let base = match pseudo {
+                    None => r.selector.matches(el),
+                    Some(p) => r.selector.pseudo_element == Some(p) && r.selector.matches_subject(el),
+                };
+                if !base {
+                    return false;
+                }
+                match &r.container {
+                    None => true,
+                    Some((name, query)) => {
+                        let mut cur = el.parent_element();
+                        while let Some(a) = cur {
+                            if let Some((cname, w, h)) = sc.container_sizes.get(&a.node_id()) {
+                                // An unnamed query matches the nearest container of any name.
+                                if name.is_empty() || cname == name {
+                                    let mc = MediaContext {
+                                        width: *w,
+                                        height: *h,
+                                        dpr: 1.0,
+                                        dark: false,
+                                        reduced_motion: false,
+                                    };
+                                    return query.matches(&mc);
+                                }
+                            }
+                            cur = a.parent_element();
+                        }
+                        false
+                    }
+                }
             })
             .collect();
-        hits.sort_by_key(|r| (r.origin, r.selector.specificity, r.order));
+        // Unlayered rules outrank layered ones for normal declarations; `compute_style`
+        // applies the reversed layer order for `!important` declarations.
+        hits.sort_by_key(|r| (r.origin, r.layer.unwrap_or(u32::MAX), r.selector.specificity, r.order));
         hits
     }
+}
+
+/// Full cascade key: (tier, layer rank, id, class, type, source order, inline).
+/// Layer order is reversed for `!important` declarations per CSS Cascade 5.
+fn declaration_key(
+    origin: Origin,
+    important: bool,
+    layer: Option<u32>,
+    specificity: (u32, u32, u32),
+    order: u32,
+    inline: bool,
+) -> (u32, u32, u32, u32, u32, u32, u32) {
+    let tier = match (origin, important) {
+        (Origin::UserAgent, false) => 0,
+        (Origin::Author, false) => 1,
+        (Origin::Author, true) => 2,
+        (Origin::UserAgent, true) => 3,
+    };
+    let layer_rank = if important {
+        layer.map(|i| u32::MAX - i).unwrap_or(0)
+    } else {
+        layer.unwrap_or(u32::MAX)
+    };
+    (
+        tier,
+        layer_rank,
+        specificity.0,
+        specificity.1,
+        specificity.2,
+        order,
+        inline as u32,
+    )
 }
 
 /// Compute the style of one element.
@@ -225,26 +367,21 @@ pub fn compute_style<E: SelectorElement>(
     let default_parent = ComputedStyle::default();
     let parent_style = parent.unwrap_or(&default_parent);
 
-    // Gather declarations with their cascade tier.
-    // Tier order (ascending): UA normal, author normal, author important, UA important.
-    let mut tiers: [Vec<&Declaration>; 4] = Default::default();
-    for r in rules.matching(el, pseudo) {
+    // Gather declarations with their full cascade key. Last-write-wins after sorting
+    // gives origin, layer order, specificity, importance and source order in one pass.
+    let mut entries: Vec<((u32, u32, u32, u32, u32, u32, u32), &Declaration)> = Vec::new();
+    for r in rules.matching(el, pseudo, sc) {
         for d in r.declarations.iter() {
-            let tier = match (r.origin, d.important) {
-                (Origin::UserAgent, false) => 0,
-                (Origin::Author, false) => 1,
-                (Origin::Author, true) => 2,
-                (Origin::UserAgent, true) => 3,
-            };
-            tiers[tier].push(d);
+            entries.push((declaration_key(r.origin, d.important, r.layer, r.selector.specificity, r.order, false), d));
         }
     }
     if pseudo.is_none() {
         for d in inline {
-            tiers[if d.important { 2 } else { 1 }].push(d);
+            entries.push((declaration_key(Origin::Author, d.important, None, (u32::MAX, u32::MAX, u32::MAX), u32::MAX, true), d));
         }
     }
-    let ordered: Vec<&Declaration> = tiers.into_iter().flatten().collect();
+    entries.sort_by_key(|(k, _)| *k);
+    let ordered: Vec<&Declaration> = entries.into_iter().map(|(_, d)| d).collect();
 
     // Custom properties (inherited): start from the parent's, then apply in cascade order.
     // P5: the common case defines no `--x` at all, so scan first and only clone the map
@@ -418,6 +555,39 @@ mod tests {
 
         let ua = RuleSet::new();
         assert!(!ua.has_media_rules && !ua.uses_viewport_units);
+    }
+
+    #[test]
+    fn supports_conditions_are_really_evaluated() {
+        let css = r#"
+          @supports (display: grid) { div { color: lime } }
+          @supports (bogus-property: whatever) { div { color: red } }
+          @supports not (bogus-property: whatever) { div { background: blue } }
+          @supports (display: grid) and (color: red) { span { color: yellow } }
+          @supports (display: grid) or (bogus: x) { span { background: pink } }
+        "#;
+        let rs = rules(css);
+        let (div, span) = tree(false);
+        let d = compute(&div, &rs, None);
+        let s = compute(&span, &rs, None);
+        assert_eq!(d.color, Color::from_u8(0, 255, 0, 1.0), "supported declaration applies");
+        assert_eq!(d.background_color, Color::from_u8(0, 0, 255, 1.0), "not() applies when inner is unsupported");
+        assert_eq!(s.color, Color::from_u8(255, 255, 0, 1.0), "and() applies when both supported");
+        assert_eq!(s.background_color, Color::from_u8(255, 192, 203, 1.0), "or() applies when one supported");
+    }
+
+    #[test]
+    fn layers_order_normally_and_reverse_for_important() {
+        let css = r#"
+          @layer first { div { color: red !important; background: red } }
+          @layer second { #app { color: green !important } div { background: blue } }
+          div { color: purple; background: yellow }
+        "#;
+        let rs = rules(css);
+        let (div, _) = tree(false);
+        let c = compute(&div, &rs, None);
+        assert_eq!(c.background_color, Color::from_u8(255, 255, 0, 1.0), "unlayered normal beats all layers");
+        assert_eq!(c.color, Color::from_u8(255, 0, 0, 1.0), "earlier layer wins for !important despite specificity");
     }
 
     #[test]

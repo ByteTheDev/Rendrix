@@ -5,6 +5,8 @@
 
 use crate::bundle::AppBundle;
 use crate::headless::Headless;
+use crate::session::last_script_run_nanos;
+use rendrix_gfx::text::{last_font_db_cache_hit, last_font_db_load_nanos};
 use std::time::{Duration, Instant};
 
 fn bundle(items: usize) -> AppBundle {
@@ -50,6 +52,45 @@ struct Sample {
     layouts_n: f64,
 }
 
+/// One-time cold-start breakdown. These are distinct metrics so a quiet-machine run can say *where*
+/// the startup time went; they are deliberately separate from the per-scenario `Sample` table so the
+/// existing bench output format is unchanged (this section is additive). A single observation is not
+/// a publishable number — see the re-measurement note in PERFORMANCE_AUDIT.md.
+#[derive(Debug, Default)]
+struct StartupBreakdown {
+    setup_ms: f64,
+    font_db_ms: f64,
+    font_db_cache_hit: bool,
+    js_dom_ms: f64,
+    other_setup_ms: f64,
+    first_frame_ms: f64,
+    first_restyle_ms: f64,
+    first_box_build_ms: f64,
+    first_taffy_ms: f64,
+    first_shape_ms: f64,
+    first_paint_ms: f64,
+    first_gpu_submit_ms: f64,
+    first_frame_shapes: usize,
+}
+
+impl StartupBreakdown {
+    fn print(&self) {
+        println!("\nStartup breakdown (single observation — re-run on a quiet machine before publishing):");
+        println!("  setup total              {:8.2} ms", self.setup_ms);
+        println!("    font DB load           {:8.2} ms  ({})", self.font_db_ms, if self.font_db_cache_hit { "cache hit" } else { "full scan" });
+        println!("    JS DOM construction    {:8.2} ms", self.js_dom_ms);
+        println!("    other setup            {:8.2} ms  (DOM parse, JS engine init, GPU init)", self.other_setup_ms);
+        println!("  first frame (CPU)        {:8.2} ms", self.first_frame_ms);
+        println!("    first restyle          {:8.2} ms", self.first_restyle_ms);
+        println!("    first box build        {:8.2} ms", self.first_box_build_ms);
+        println!("    first Taffy layout     {:8.2} ms", self.first_taffy_ms);
+        println!("    first text shaping     {:8.2} ms  ({} paragraphs)", self.first_shape_ms, self.first_frame_shapes);
+        println!("    first paint (display)  {:8.2} ms", self.first_paint_ms);
+        println!("  first GPU submit         {:8.2} ms  (render + device poll)", self.first_gpu_submit_ms);
+        println!("  (text shaping overlaps layout + display paint; do not sum the indented rows)");
+    }
+}
+
 pub fn run(items: usize, iterations: usize) -> Result<(), String> {
     let t0 = Instant::now();
     let mut h = Headless::new(&bundle(items), (1000, 700), 1.0)?;
@@ -57,10 +98,35 @@ pub fn run(items: usize, iterations: usize) -> Result<(), String> {
     let first = Instant::now();
     h.session.frame();
     let first_frame = first.elapsed();
+    // Snapshot the first update's phase timings before any later frame can overwrite them, plus
+    // the first GPU submit of the freshly built display list. These feed only the breakdown below.
+    let fs = h.session.engine.borrow().stats.clone();
+    let shapes_first = h.session.engine.borrow().text_system().shape_count;
+    let gpu_first = h.render_timed();
     h.settle(Duration::from_secs(1));
     let nodes = h.session.engine.borrow().doc.node_count();
     println!("Rendrix pipeline benchmark: {items} list items, {nodes} DOM nodes, 1000x700 @1x on {}", h.adapter);
     println!("startup (runtime + JS builds the DOM + first frame): {:.1} ms ({:.1} ms of it the first frame)\n", startup.as_secs_f64() * 1000.0, first_frame.as_secs_f64() * 1000.0);
+
+    let setup = startup.as_secs_f64() * 1000.0;
+    let font_db = last_font_db_load_nanos() as f64 / 1e6;
+    let js_dom = last_script_run_nanos() as f64 / 1e6;
+    StartupBreakdown {
+        setup_ms: setup,
+        font_db_ms: font_db,
+        font_db_cache_hit: last_font_db_cache_hit(),
+        js_dom_ms: js_dom,
+        other_setup_ms: (setup - font_db - js_dom).max(0.0),
+        first_frame_ms: first_frame.as_secs_f64() * 1000.0,
+        first_restyle_ms: fs.first_style_micros as f64 / 1000.0,
+        first_box_build_ms: fs.first_box_build_micros as f64 / 1000.0,
+        first_taffy_ms: fs.first_taffy_layout_micros as f64 / 1000.0,
+        first_shape_ms: fs.first_text_shape_micros as f64 / 1000.0,
+        first_paint_ms: fs.first_paint_micros as f64 / 1000.0,
+        first_gpu_submit_ms: gpu_first.as_secs_f64() * 1000.0,
+        first_frame_shapes: shapes_first,
+    }
+    .print();
 
     let mut results: Vec<Sample> = Vec::new();
     let mut measure = |h: &mut Headless, name: &'static str, mut mutate: Box<dyn FnMut(&mut Headless, usize)>| {

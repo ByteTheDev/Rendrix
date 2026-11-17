@@ -37,12 +37,36 @@ pub struct FontFace {
     pub italic: bool,
 }
 
+/// A parsed `@supports` condition. Evaluated by the cascade against the property
+/// parser so unsupported declarations are genuinely rejected, not flattened away.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SupportsCondition {
+    Declaration(String, String),
+    Selector(String),
+    Not(Box<SupportsCondition>),
+    And(Vec<SupportsCondition>),
+    Or(Vec<SupportsCondition>),
+    /// An unrecognised function form; evaluates to false.
+    Unsupported,
+}
+
 #[derive(Debug, Clone)]
 pub enum Rule {
     Style(StyleRule),
     Media(MediaQueryList, Vec<Rule>),
+    Supports(SupportsCondition, Vec<Rule>),
+    /// `@layer name { ... }` (anonymous when the name is `None`).
+    Layer(Option<String>, Vec<Rule>),
+    /// `@layer a, b;` — registers layer names in declaration order.
+    LayerStatement(Vec<String>),
+    /// `@container <name>? <size-condition> { ... }`. The condition reuses media
+    /// feature syntax (min-width/max-width/etc.) evaluated against the container box.
+    Container(String, MediaQueryList, Vec<Rule>),
     Keyframes(Keyframes),
     FontFace(FontFace),
+    /// `@import "x.css" [media]` — resolved against bundled assets in `rendrix-core`.
+    /// Stored as (url, media prelude). Rules from the imported sheet splice in place.
+    Import(String, String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -169,12 +193,21 @@ fn parse_rules(s: &str) -> Vec<Rule> {
             break;
         }
         let rest = &s[i..];
-        // At-rule without a block, e.g. @import / @charset.
+        // At-rule without a block, e.g. @import / @charset / @layer statement.
         let brace = find_unquoted(rest, '{');
         let semi = find_unquoted(rest, ';');
         if rest.starts_with('@') {
             match (brace, semi) {
                 (_, Some(sp)) if brace.is_none_or(|b| sp < b) => {
+                    let stmt = s[i..i + sp].trim().to_string();
+                    if let Some((url, media)) = parse_import(&stmt) {
+                        rules.push(Rule::Import(url, media));
+                    } else if let Some(rest) = stmt.strip_prefix("@layer").or_else(|| stmt.strip_prefix("@LAYER")) {
+                        let names: Vec<String> = rest.split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
+                        if !names.is_empty() {
+                            rules.push(Rule::LayerStatement(names));
+                        }
+                    }
                     i += sp + 1;
                     continue;
                 }
@@ -193,14 +226,239 @@ fn parse_rules(s: &str) -> Vec<Rule> {
         let Some(bp) = brace else { break };
         let open = i + bp;
         let Some(close) = matching_brace(s, open) else { break };
-        let selectors = Selector::parse_list(&s[i..open]);
-        let declarations = parse_declarations(&s[open + 1..close]);
+        let selector_text = s[i..open].trim();
+        let body = &s[open + 1..close];
+        let selectors = Selector::parse_list(selector_text);
+        // Parent declarations ignore nested rule blocks (stripped first).
+        let declarations = parse_declarations(&strip_nested(body));
         if !selectors.is_empty() {
-            rules.push(Rule::Style(StyleRule { selectors, declarations }));
+            if declarations.len() > 0 || !body.contains('{') {
+                rules.push(Rule::Style(StyleRule { selectors, declarations }));
+            } else if declarations.is_empty() && !body.contains('{') {
+                // Empty rule: keep nothing.
+            } else {
+                rules.push(Rule::Style(StyleRule { selectors, declarations }));
+            }
+            // Nested rules: `parent { color: red; & .child { ... } .bare { ... } @media ... { ... } }`
+            // Expand by combining parent + child selectors (`&` = parent, else descendant).
+            for nested in expand_nested(selector_text, body) {
+                rules.push(nested);
+            }
+        } else if !selector_text.is_empty() && body.contains('{') {
+            // Parent selector failed to parse but body has nested rules (e.g. `&` at
+            // top level is invalid); try expanding raw text so valid children survive.
+            for nested in expand_nested(selector_text, body) {
+                rules.push(nested);
+            }
         }
         i = close + 1;
     }
     rules
+}
+
+/// Parse `@import "url" [media];` / `@import url(x) [media];`. Returns (url, media prelude).
+fn parse_import(stmt: &str) -> Option<(String, String)> {
+    let mut s = stmt.trim();
+    if !s.to_ascii_lowercase().starts_with("@import") {
+        return None;
+    }
+    s = s["@import".len()..].trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (url, rest) = if s.to_ascii_lowercase().starts_with("url(") {
+        let Some(end) = s.find(')') else { return None };
+        let inner = s[4..end].trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        (inner, s[end + 1..].trim().to_string())
+    } else if s.starts_with('"') || s.starts_with('\'') {
+        let q = s.as_bytes()[0] as char;
+        let Some(end) = s[1..].find(q).map(|p| p + 1) else { return None };
+        (s[1..end].to_string(), s[end + 1..].trim().to_string())
+    } else {
+        // Bare URL up to whitespace (rare, but accept).
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        (s[..end].to_string(), s[end..].trim().to_string())
+    };
+    if url.is_empty() {
+        return None;
+    }
+    Some((url, rest))
+}
+
+/// Expand nested rules inside a style block. `parent` is the raw selector prelude,
+/// `body` the raw block content. Returns style/media rules with combined selectors.
+fn expand_nested(parent: &str, body: &str) -> Vec<Rule> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let rest = &body[i..];
+        // Skip declarations / whitespace up to next `;` or `{`.
+        let brace = find_unquoted(rest, '{');
+        let semi = find_unquoted(rest, ';');
+        match (brace, semi) {
+            (Some(_), Some(sp)) if brace.is_none_or(|b| sp < b) => {
+                i += sp + 1;
+                continue;
+            }
+            (None, Some(sp)) => {
+                i += sp + 1;
+                continue;
+            }
+            (None, None) => break,
+            (Some(bp), _) => {
+                let open = i + bp;
+                let prelude = body[i..open].trim();
+                let Some(close) = matching_brace(body, open) else { break };
+                let inner = &body[open + 1..close];
+                if prelude.is_empty() {
+                    i = close + 1;
+                    continue;
+                }
+                if prelude.starts_with('@') {
+                    // Nested at-rule (e.g. `@media` inside a rule): scope inner
+                    // style selectors to the parent, then keep the at-rule wrapper.
+                    // Textual prefixing preserves selector source (no serialization).
+                    let scoped = scope_nested_at_inner(parent, inner);
+                    let wrapped = format!("{} {{{}}}", prelude, scoped);
+                    for r in parse_rules(&wrapped) {
+                        out.push(r);
+                    }
+                } else {
+                    // Nested style rule: `&` = parent, else `parent child`.
+                    for p in split_top_level(parent, ',') {
+                        let p = p.trim();
+                        if p.is_empty() {
+                            continue;
+                        }
+                        for c in split_top_level(prelude, ',') {
+                            let c = c.trim();
+                            if c.is_empty() {
+                                continue;
+                            }
+                            let combined = if c.contains('&') {
+                                c.replace('&', p)
+                            } else {
+                                format!("{} {}", p, c)
+                            };
+                            let selectors = Selector::parse_list(&combined);
+                            if selectors.is_empty() {
+                                continue;
+                            }
+                            let declarations = parse_declarations(inner);
+                            if !declarations.is_empty() {
+                                out.push(Rule::Style(StyleRule { selectors, declarations }));
+                            }
+                            // Recurse for deeper nesting.
+                            for r in expand_nested(&combined, inner) {
+                                out.push(r);
+                            }
+                        }
+                    }
+                }
+                i = close + 1;
+            }
+        }
+    }
+    out
+}
+
+/// Remove nested `{...}` blocks from a declaration body so only the rule's own
+/// declarations survive `parse_declarations` (which splits on `;`).
+fn strip_nested(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        let rest = &body[i..];
+        let brace = find_unquoted(rest, '{');
+        let semi = find_unquoted(rest, ';');
+        match (brace, semi) {
+            (Some(bp), Some(sp)) if sp < bp => {
+                out.push_str(&body[i..i + sp + 1]);
+                i += sp + 1;
+            }
+            (Some(bp), _) => {
+                let open = i + bp;
+                // Keep text before the nested prelude? No — nested prelude is not a
+                // declaration; skip the whole `prelude { ... }` segment.
+                let Some(close) = matching_brace(body, open) else { break };
+                i = close + 1;
+            }
+            (None, Some(sp)) => {
+                out.push_str(&body[i..i + sp + 1]);
+                i += sp + 1;
+            }
+            (None, None) => {
+                // Trailing declaration without `;` (only if it has no block).
+                out.push_str(&body[i..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Scope the top-level style preludes inside a nested at-rule body with `parent`.
+/// `parent .child` (or `&`-substituted) so `@media` inside a rule keeps its scope.
+fn scope_nested_at_inner(parent: &str, inner: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < inner.len() {
+        let rest = &inner[i..];
+        let brace = find_unquoted(rest, '{');
+        let semi = find_unquoted(rest, ';');
+        match (brace, semi) {
+            (Some(_), Some(sp)) if brace.is_none_or(|b| sp < b) => {
+                // Declaration (only valid if the at-rule accepts them, e.g. @font-face):
+                // keep verbatim.
+                out.push_str(&inner[i..i + sp + 1]);
+                out.push(' ');
+                i += sp + 1;
+            }
+            (None, Some(sp)) => {
+                out.push_str(&inner[i..i + sp + 1]);
+                out.push(' ');
+                i += sp + 1;
+            }
+            (None, None) => {
+                out.push_str(&inner[i..]);
+                break;
+            }
+            (Some(bp), _) => {
+                let open = i + bp;
+                let prelude = inner[i..open].trim();
+                let Some(close) = matching_brace(inner, open) else { break };
+                let body = &inner[open + 1..close];
+                if prelude.starts_with('@') {
+                    // Nested at-rule inside at-rule: recurse scoping.
+                    let scoped = scope_nested_at_inner(parent, body);
+                    out.push_str(prelude);
+                    out.push_str(" {");
+                    out.push_str(&scoped);
+                    out.push_str("} ");
+                } else {
+                    for p in split_top_level(parent, ',') {
+                        let p = p.trim();
+                        if p.is_empty() {
+                            continue;
+                        }
+                        for c in split_top_level(prelude, ',') {
+                            let c = c.trim();
+                            if c.is_empty() {
+                                continue;
+                            }
+                            let combined = if c.contains('&') { c.replace('&', p) } else { format!("{} {}", p, c) };
+                            out.push_str(&combined);
+                            out.push_str(" {");
+                            out.push_str(body);
+                            out.push_str("} ");
+                        }
+                    }
+                }
+                i = close + 1;
+            }
+        }
+    }
+    out
 }
 
 fn find_unquoted(s: &str, target: char) -> Option<usize> {
@@ -224,6 +482,125 @@ fn find_unquoted(s: &str, target: char) -> Option<usize> {
     None
 }
 
+/// Split on a whitespace-delimited keyword (`and` / `or`), ignoring parens and quotes.
+fn split_keyword(s: &str, kw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap();
+        let clen = c.len_utf8();
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += clen;
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                cur.push(c);
+                i += clen;
+            }
+            '(' | '[' => {
+                depth += 1;
+                cur.push(c);
+                i += clen;
+            }
+            ')' | ']' => {
+                depth -= 1;
+                cur.push(c);
+                i += clen;
+            }
+            _ => {
+                let after = i + kw.len();
+                if depth == 0
+                    && s[i..].to_ascii_lowercase().starts_with(kw)
+                    && (cur.is_empty() || cur.ends_with(char::is_whitespace))
+                    && (after >= s.len() || s[after..].starts_with(char::is_whitespace) || s[after..].starts_with('('))
+                {
+                    out.push(std::mem::take(&mut cur).trim().to_string());
+                    i += kw.len();
+                    while i < s.len() && s[i..].starts_with(char::is_whitespace) {
+                        i += s[i..].chars().next().unwrap().len_utf8();
+                    }
+                    continue;
+                }
+                cur.push(c);
+                i += clen;
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// If `s` is entirely wrapped in one pair of parentheses, return its inside.
+fn outer_parens(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if !t.starts_with('(') || !t.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for (i, c) in t.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && i + 1 != t.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 { Some(&t[1..t.len() - 1]) } else { None }
+}
+
+/// Parse an `@supports` prelude into a boolean condition tree.
+pub fn parse_supports_condition(s: &str) -> SupportsCondition {
+    let s = s.trim();
+    let ors = split_keyword(s, "or");
+    if ors.len() > 1 {
+        return SupportsCondition::Or(ors.iter().map(|p| parse_supports_condition(p)).collect());
+    }
+    let ands = split_keyword(s, "and");
+    if ands.len() > 1 {
+        return SupportsCondition::And(ands.iter().map(|p| parse_supports_condition(p)).collect());
+    }
+    if let Some(rest) = s.strip_prefix("not ").or_else(|| s.strip_prefix("NOT ")) {
+        return SupportsCondition::Not(Box::new(parse_supports_condition(rest)));
+    }
+    if let Some(inner) = outer_parens(s) {
+        let inner = inner.trim();
+        if let Some(rest) = inner.strip_prefix("selector(").or_else(|| inner.strip_prefix("SELECTOR(")) {
+            return rest.strip_suffix(')').map(|r| SupportsCondition::Selector(r.to_string())).unwrap_or(SupportsCondition::Unsupported);
+        }
+        // A nested condition group (contains another parenthesised term).
+        if inner.contains('(') {
+            return parse_supports_condition(inner);
+        }
+        if let Some((name, value)) = inner.split_once(':') {
+            return SupportsCondition::Declaration(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    SupportsCondition::Unsupported
+}
+
 fn parse_at_rule(prelude: &str, body: &str, out: &mut Vec<Rule>) {
     let (name, args) = match prelude.find(|c: char| c.is_whitespace() || c == '(') {
         Some(p) => (&prelude[1..p], prelude[p..].trim()),
@@ -231,7 +608,24 @@ fn parse_at_rule(prelude: &str, body: &str, out: &mut Vec<Rule>) {
     };
     match name.to_ascii_lowercase().as_str() {
         "media" => out.push(Rule::Media(MediaQueryList::parse(args), parse_rules(body))),
-        "supports" | "layer" | "container" if !body.trim().is_empty() => out.extend(parse_rules(body)),
+        "supports" => out.push(Rule::Supports(parse_supports_condition(args), parse_rules(body))),
+        "layer" => {
+            let name = args.trim();
+            out.push(Rule::Layer(if name.is_empty() { None } else { Some(name.to_string()) }, parse_rules(body)));
+        }
+        "container" if !body.trim().is_empty() => {
+            // Split optional name from the size condition. A bare `(…)` starts the condition.
+            let a = args.trim();
+            let (name, cond) = if a.starts_with('(') {
+                (String::new(), a.to_string())
+            } else {
+                match a.find(|c: char| c == '(') {
+                    Some(p) => (a[..p].trim().trim_matches(|c| c == '"' || c == '\'').to_string(), a[p..].to_string()),
+                    None => (a.to_string(), String::new()),
+                }
+            };
+            out.push(Rule::Container(name, MediaQueryList::parse(&cond), parse_rules(body)));
+        }
         "keyframes" | "-webkit-keyframes" => {
             let mut frames = Vec::new();
             let mut i = 0;
@@ -412,6 +806,60 @@ fn feature_matches(k: &str, v: Option<&str>, cx: &MediaContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_statements_parse_to_import_rules() {
+        let sheet = Stylesheet::parse("@import \"base.css\"; @import url(theme.css) screen; .a { color: red }");
+        assert_eq!(sheet.rules.len(), 3);
+        match &sheet.rules[0] {
+            Rule::Import(url, mq) => {
+                assert_eq!(url, "base.css");
+                assert!(mq.is_empty());
+            }
+            r => panic!("expected Import, got {r:?}"),
+        }
+        match &sheet.rules[1] {
+            Rule::Import(url, mq) => {
+                assert_eq!(url, "theme.css");
+                assert_eq!(mq, "screen");
+            }
+            r => panic!("expected Import, got {r:?}"),
+        }
+        assert!(matches!(&sheet.rules[2], Rule::Style(_)));
+    }
+
+    #[test]
+    fn nesting_expands_with_parent_scope() {
+        let sheet = Stylesheet::parse(".card { color: red; .title { color: blue; } &:hover { color: green; } }");
+        assert_eq!(sheet.rules.len(), 3, "parent + 2 nested: {sheet:?}");
+        let mut matched = 0;
+        for r in &sheet.rules {
+            if let Rule::Style(sr) = r {
+                let decl = sr.declarations.iter().find(|d| d.name == "color").map(|d| d.value.as_str());
+                match decl {
+                    Some("red") => matched |= 1,
+                    Some("blue") => matched |= 2,
+                    Some("green") => matched |= 4,
+                    other => panic!("unexpected color {other:?}"),
+                }
+            }
+        }
+        assert_eq!(matched, 7, "parent + descendant + &-scoped rules all present");
+    }
+
+    #[test]
+    fn nested_media_keeps_at_rule_wrapper_and_scope() {
+        let sheet = Stylesheet::parse(".card { @media (min-width: 600px) { .title { color: blue; } } }");
+        assert_eq!(sheet.rules.len(), 2, "empty parent + 1 media: {sheet:?}");
+        match &sheet.rules[1] {
+            Rule::Media(q, inner) => {
+                assert!(format!("{q:?}").contains("600") || q.matches(&MediaContext { width: 800.0, ..Default::default() }));
+                assert_eq!(inner.len(), 1);
+                assert!(matches!(&inner[0], Rule::Style(_)));
+            }
+            r => panic!("expected Media, got {r:?}"),
+        }
+    }
 
     #[test]
     fn parses_rules_and_recovers() {

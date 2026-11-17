@@ -163,6 +163,36 @@ fn allocation_and_shape_budgets() {
 }
 
 // ------------------------------------------------------------------------------------
+// Startup telemetry: the first-frame phase breakdown is latched and survives later frames.
+// ------------------------------------------------------------------------------------
+
+#[test]
+fn first_frame_breakdown_is_latched_and_idle_frames_do_not_reshape() {
+    let html = "<html><head><style>body{margin:0} .t{font-size:14px;width:200px}</style></head><body><p class=t>Startup telemetry paragraph one</p><p class=t>Startup telemetry paragraph two</p><script type=module src=main.js></script></body></html>";
+    let mut s = session(html, "");
+    let first = s.engine.borrow().stats.clone();
+    assert!(first.first_style_micros > 0, "first restyle is measured");
+    assert!(first.first_box_build_micros > 0, "first box build is measured");
+    assert!(first.first_taffy_layout_micros > 0, "first Taffy layout is measured");
+    assert!(first.first_paint_micros > 0, "first paint is measured");
+    assert!(first.first_text_shape_micros > 0, "first text shaping is measured");
+    assert!(first.shape_count > 0, "first frame shaped the text");
+
+    // Several idle frames must not overwrite the latched first-frame values or add shapes.
+    for _ in 0..4 {
+        s.frame();
+    }
+    let later = s.engine.borrow().stats.clone();
+    assert_eq!(later.first_style_micros, first.first_style_micros);
+    assert_eq!(later.first_box_build_micros, first.first_box_build_micros);
+    assert_eq!(later.first_taffy_layout_micros, first.first_taffy_layout_micros);
+    assert_eq!(later.first_text_shape_micros, first.first_text_shape_micros);
+    assert_eq!(later.first_paint_micros, first.first_paint_micros);
+    let t = s.engine.borrow();
+    assert_eq!(t.text_system().shape_count, first.shape_count, "idle frames do not reshape");
+}
+
+// ------------------------------------------------------------------------------------
 // A2: dialog mock-op resolves without OS UI (uses the A5/A2-era `set_dialog_mock` seam).
 // ------------------------------------------------------------------------------------
 

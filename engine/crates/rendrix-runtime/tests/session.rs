@@ -251,3 +251,20 @@ fn gpu_pixels_reflect_interaction() {
     assert_eq!(after.pixel(100, 60), [0, 200, 0, 255], "click handler changed class → restyle → repaint");
     assert_eq!(after.pixel(300, 150), [0, 0, 0, 255]);
 }
+
+#[test]
+fn focus_visible_follows_input_modality() {
+    let page = r#"<html><head><style>body{margin:0} button{width:60px;height:30px} button:focus-visible{background:rgb(0,255,0)}</style></head><body>
+      <button id=a>A</button><button id=b>B</button></body></html>"#;
+    let mut s = session(page, "");
+    let (ax, ay) = center(&mut s, "#a");
+    s.pointer_down(ax, ay, 0);
+    s.pointer_up(ax, ay, 0);
+    assert_eq!(eval(&mut s, "document.activeElement.id"), "a");
+    assert_eq!(eval(&mut s, "document.getElementById('a').matches(':focus-visible')"), "false");
+    assert_ne!(eval(&mut s, "getComputedStyle(document.getElementById('a')).backgroundColor"), "rgb(0, 255, 0)");
+    s.key_down(key("Tab"));
+    assert_eq!(eval(&mut s, "document.activeElement.id"), "b");
+    assert_eq!(eval(&mut s, "document.getElementById('b').matches(':focus-visible')"), "true");
+    assert_eq!(eval(&mut s, "getComputedStyle(document.getElementById('b')).backgroundColor"), "rgb(0, 255, 0)");
+}
