@@ -38,6 +38,11 @@ and runtime. See `docs/ENGINE_ASSESSMENT.md`.
 - All passes in a layered frame (flat runs, backdrop snapshots, blur, composite, blit) are recorded in display-list order into one encoder and submitted once; flat content after a layer paints above it again, and a layer's backdrop excludes later content. Pooled layer targets are cleared to transparent each frame, and `backdrop-filter` grayscale/brightness now affect the backdrop.
 - Fixed zero-size `render_to_rgba`, frame-wide profiling counters for layered frames, and mid-frame glyph-atlas recycling inside nested layers.
 
+### Performance and web target (2026-11-18)
+- First-frame shaping: `nowrap`/`pre` text now shares one shaping across min-content, max-content and definite-width queries instead of up to three, with a geometry-identity test. The paragraph LRU grows to 8192 entries so a ~10k-key first frame no longer thrashes; small apps still allocate only what they use. The benchmark's startup breakdown now prints frame-1 cache hits and cache size.
+- WebGL2 fallback: the renderer no longer needs shader storage buffers. Instance data is read from a 48-entry uniform array with chunked draws, and polygon clipping uses a uniform buffer, both selected from device limits so the native WebGPU path is byte-for-byte unchanged. A native regression test renders identical pixels under `downlevel_webgl2_defaults()`. A real no-WebGPU browser run is still unrecorded.
+- The two superseded ignored Session-level tests now print why they were replaced instead of panicking with `todo!()`, so `cargo test -- --ignored` stays green.
+
 ### Removed
 - Electron compatibility layer, Electron project importer and their docs/examples.
 - GPUI legacy host and the M0 static-tree renderer (`native/`), the build-time HTML/CSS compiler and the

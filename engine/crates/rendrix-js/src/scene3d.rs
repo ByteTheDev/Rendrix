@@ -49,7 +49,7 @@
 //!   next paint — removal stops future renders, it does not unpaint.
 
 use crate::engine_trait::Val;
-use crate::host::DomHost;
+use crate::host::{base64_decode, DomHost};
 use rendrix_gfx::canvas::{self, Paint};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -105,6 +105,17 @@ enum Geo {
 struct Material {
     color: [f32; 4],
     emissive: f32,
+    /// GPU face-cull mode: none | back | front.
+    cull: String,
+}
+
+/// Light description shared by the CPU rasterizer and the GPU viewport. The CPU path
+/// uses only the first directional light; the GPU path shades all of them.
+#[derive(Clone, Debug)]
+enum JLight {
+    Directional { dir: [f32; 3], color: [f32; 3], intensity: f32 },
+    Ambient { color: [f32; 3], intensity: f32 },
+    Point { pos: [f32; 3], color: [f32; 3], intensity: f32, range: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +137,7 @@ struct SceneFile {
     camera: Camera,
     meshes: Vec<Mesh>,
     light_dir: [f32; 3],
+    lights: Vec<JLight>,
     background: [f32; 4],
 }
 
@@ -338,6 +350,11 @@ fn parse_scene(json: &str) -> Result<SceneFile, String> {
                 .and_then(num)
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
+            cull: match mo.get("material").and_then(|m| m.get("cull")).and_then(|v| v.as_str()) {
+                Some("back") => "back".to_string(),
+                Some("front") => "front".to_string(),
+                _ => "none".to_string(),
+            },
         };
         out.push(Mesh {
             geo,
@@ -346,17 +363,36 @@ fn parse_scene(json: &str) -> Result<SceneFile, String> {
         });
     }
     let mut dir = [0.4f32, 0.8, 0.6];
-    if let Some(lights) = o.get("lights").and_then(|l| l.as_array()) {
-        if let Some(first) = lights.first() {
-            let d = first
-                .get("dir")
-                .or_else(|| first.get("direction"))
-                .map(|v| vec3(v, dir))
-                .unwrap_or(dir);
-            if d != [0.0, 0.0, 0.0] {
-                dir = d;
+    let mut lights: Vec<JLight> = Vec::new();
+    if let Some(arr) = o.get("lights").and_then(|l| l.as_array()) {
+        for l in arr {
+            let kind = l.get("kind").and_then(|v| v.as_str()).unwrap_or("dir");
+            let c = color_of(l.get("color"), [1.0, 1.0, 1.0, 1.0]);
+            let color = [c[0], c[1], c[2]];
+            let intensity = l.get("intensity").and_then(num).unwrap_or(1.0).max(0.0);
+            match kind {
+                "ambient" => lights.push(JLight::Ambient { color, intensity }),
+                "point" => {
+                    let pos = l
+                        .get("pos")
+                        .or_else(|| l.get("position"))
+                        .map(|v| vec3(v, [0.0, 0.0, 0.0]))
+                        .unwrap_or([0.0, 0.0, 0.0]);
+                    let range = l.get("range").and_then(num).unwrap_or(0.0).max(0.0);
+                    lights.push(JLight::Point { pos, color, intensity, range });
+                }
+                _ => {
+                    let d = l.get("dir").or_else(|| l.get("direction")).map(|v| vec3(v, dir)).unwrap_or(dir);
+                    if d != [0.0, 0.0, 0.0] {
+                        dir = d;
+                    }
+                    lights.push(JLight::Directional { dir: d, color, intensity });
+                }
             }
         }
+    }
+    if lights.is_empty() {
+        lights.push(JLight::Directional { dir, color: [1.0, 1.0, 1.0], intensity: 1.0 });
     }
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     if len > 0.0 {
@@ -366,6 +402,7 @@ fn parse_scene(json: &str) -> Result<SceneFile, String> {
         camera,
         meshes: out,
         light_dir: dir,
+        lights,
         background: color_of(o.get("background").or_else(|| o.get("clearColor")), [0.0, 0.0, 0.0, 0.0]),
     })
 }
@@ -420,6 +457,22 @@ fn run(host: &DomHost, op: &str, args: &[Val]) -> Result<Val, String> {
                 None => Ok(Val::Null),
             }
         }
+        "scene3d_texture" => {
+            let id = num_arg(args, 0)? as u32;
+            let payload = base64_decode(&str_of(args, 1))
+                .ok_or_else(|| "EncodingError: scene3d_texture payload is not valid base64".to_string())?;
+            let w = num_arg(args, 2)? as u32;
+            let h = num_arg(args, 3)? as u32;
+            rendrix_gfx::scene3d::set_scene_texture(id, payload, w, h)?;
+            // Invalidate cached images using this material so the GPU pass re-uploads.
+            host.engine.borrow_mut().doc.dirty.paint = true;
+            Ok(Val::Undefined)
+        }
+        "scene3d_texture_remove" => {
+            let id = num_arg(args, 0)? as u32;
+            rendrix_gfx::scene3d::remove_scene_texture(id);
+            Ok(Val::Undefined)
+        }
         _ => Err(format!("unknown native operation '{op}'")),
     }
 }
@@ -429,6 +482,12 @@ fn node(args: &[Val], i: usize) -> Result<u32, String> {
         .and_then(|v| v.as_f64())
         .map(|n| n as u32)
         .ok_or_else(|| format!("TypeError: scene op argument {i} must be a node id"))
+}
+
+fn num_arg(args: &[Val], i: usize) -> Result<f64, String> {
+    args.get(i)
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| format!("TypeError: scene op argument {i} must be a number"))
 }
 
 fn str_of(args: &[Val], i: usize) -> String {
@@ -663,9 +722,24 @@ fn canonical_json(d: &SceneFile) -> String {
             let emissive = [m.mat.emissive, m.mat.emissive, m.mat.emissive];
             serde_json::json!({
                 "geo": geo,
-                "material": { "color": m.mat.color, "emissive": emissive },
+                "material": { "color": m.mat.color, "emissive": emissive, "cull": m.mat.cull },
                 "transform": { "pos": m.xf.pos, "rotEulerDeg": m.xf.rot_deg, "scale": scale },
             })
+        })
+        .collect();
+    let lights: Vec<serde_json::Value> = d
+        .lights
+        .iter()
+        .map(|l| match l {
+            JLight::Directional { dir, color, intensity } => serde_json::json!({
+                "kind": "dir", "dir": dir, "color": color, "intensity": intensity,
+            }),
+            JLight::Ambient { color, intensity } => serde_json::json!({
+                "kind": "ambient", "color": color, "intensity": intensity,
+            }),
+            JLight::Point { pos, color, intensity, range } => serde_json::json!({
+                "kind": "point", "pos": pos, "color": color, "intensity": intensity, "range": range,
+            }),
         })
         .collect();
     serde_json::json!({
@@ -674,7 +748,7 @@ fn canonical_json(d: &SceneFile) -> String {
             "position": d.camera.pos, "lookAt": d.camera.look_at,
         },
         "meshes": meshes,
-        "lights": [{ "dir": d.light_dir }],
+        "lights": lights,
         "background": d.background,
     })
     .to_string()

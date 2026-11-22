@@ -85,7 +85,8 @@ CLI: `init`, `dev`, `build`, `run`, `check`, `package`, `render`, `doctor`. Deta
   the same engine in a browser Worker with the browser's own JS engine.
 
 Not yet: full browser parity, a manually verified screen-reader pass, macOS/Linux hardware validation,
-WebGL2 fallback for browsers without WebGPU, browser-backed WebSocket/Workers/storage on the web target,
+a browser-verified WebGL2 run (the renderer has a WebGL2 path, tested so far only under native downlevel
+limits), browser-backed WebSocket/Workers/storage on the web target,
 Service Workers, XHR, IndexedDB, video/audio playback, canvas WebGPU, a React adapter, full table/float
 fidelity, `writing-mode`, WOFF2 and complex masks. Rendrix is not a browser and makes no browser-compatibility
 claim.
@@ -102,7 +103,7 @@ claim.
 | `examples/app-3d/` | 3D scene example |
 | `website/` | Marketing site and in-page documentation tabs (synced from `docs/`) |
 | `video/` | Optional Remotion project that renders launch videos from the Render/frame-sequence pipeline (not part of the engine) |
-| `docs/` | [Architecture](docs/ARCHITECTURE.md), [compatibility](docs/COMPATIBILITY.md), [building](docs/BUILDING.md), [safety](docs/SAFETY.md), [performance](docs/PERFORMANCE_AUDIT.md), [roadmap](docs/ROADMAP.md), [accessibility plan](docs/ACCESSIBILITY_PLAN.md) |
+| `docs/` | [Architecture](docs/ARCHITECTURE.md), [compatibility](docs/COMPATIBILITY.md), [building](docs/BUILDING.md), [safety](docs/SAFETY.md), [performance](docs/PERFORMANCE_AUDIT.md), [web performance](docs/WEB_PERFORMANCE.md), [roadmap](docs/ROADMAP.md), [accessibility plan](docs/ACCESSIBILITY_PLAN.md) |
 
 Earlier versions of this project compiled a static HTML subset to a native view tree and shipped an Electron
 compatibility layer. That direction was replaced; the old code remains in git history

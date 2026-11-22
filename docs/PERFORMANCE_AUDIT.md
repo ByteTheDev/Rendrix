@@ -194,6 +194,28 @@ shaping count is inherent to the benchmark's unique text and already deduplicate
 `content.key()` and width-bucketing. See `docs/PERF_RESIZE_DESIGN.md` for the resize analysis
 and `docs/PERF_BINARY_SIZE.md` for the (unverified) release-profile size work.
 
+## Post cache/nowrap observation (2026-11-18)
+
+Single quiet-machine `bench 1000` run after raising `PARA_CACHE_CAP` to 8192 and collapsing
+nowrap widths to one shaping. The scenario table is unchanged within run-to-run variance;
+the first-frame numbers moved substantially:
+
+| Metric | Previous reference | This observation |
+|---|---:|---:|
+| Startup total | 588–952 ms | 670.4 ms |
+| First frame (CPU) | 726–1086 ms | 313.0 ms |
+| First-frame paragraphs shaped | ~9,985 | 4,017 |
+| Frame-1 text cache | not instrumented | 23,051 hits, 4,017 entries |
+| Viewport resize | 7.81–10.07 ms | 8.24 ms |
+
+The shape count is the meaningful change: with a cache large enough to hold a first-frame key
+set, layout→paint and repeat lookups hit instead of re-shaping evicted entries. The nowrap
+normalization does not affect this benchmark (its content uses normal `white-space`). First
+frame is still well above the `< 0.2 s` goal, and ~268 ms of its ~286 ms layout time is
+shaping; deriving min-content widths from the max-content paragraph instead of shaping at
+width 0 remains the next real lever. Treat this as one observation, not a published result —
+re-run on a quiet machine before replacing the numbers above.
+
 ## Pipeline cost breakdown
 
 - `Engine::update` in `engine/crates/rendrix-core/src/lib.rs`: refresh_rules → sweep GC → take dirty → restyle → tick_motion → (if needed) box tree build (`boxtree::Builder::build_root`) → Taffy layout (`TaffyEngine::layout`) → paint (display list).

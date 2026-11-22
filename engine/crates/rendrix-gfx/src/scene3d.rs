@@ -89,6 +89,9 @@ impl Camera {
 pub struct Vertex3 {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
+    /// Texture coordinates; procedural shapes map 0..1, triangle soup uses a planar
+    /// X/Y projection unless explicit UVs are supplied.
+    pub uv: [f32; 2],
 }
 
 /// Geometry kinds. Only procedural shapes + raw triangles in v1 (no glTF loader).
@@ -373,10 +376,11 @@ pub fn build_box() -> (Vec<Vertex3>, Vec<u32>) {
     ];
     let mut verts = Vec::with_capacity(24);
     let mut idx = Vec::with_capacity(36);
+    let face_uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     for (n, corners) in faces {
         let base = verts.len() as u32;
-        for p in corners {
-            verts.push(Vertex3 { pos: p, normal: n });
+        for (i, p) in corners.into_iter().enumerate() {
+            verts.push(Vertex3 { pos: p, normal: n, uv: face_uv[i] });
         }
         // Corner lists run CCW seen from outside; keep that winding in the triangles.
         idx.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
@@ -388,10 +392,10 @@ pub fn build_box() -> (Vec<Vertex3>, Vec<u32>) {
 /// paths must render the same orientation for the same `plane` desc).
 pub fn build_plane() -> (Vec<Vertex3>, Vec<u32>) {
     let verts = vec![
-        Vertex3 { pos: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0] },
-        Vertex3 { pos: [0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0] },
-        Vertex3 { pos: [0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0] },
-        Vertex3 { pos: [-0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0] },
+        Vertex3 { pos: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
+        Vertex3 { pos: [0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 0.0] },
+        Vertex3 { pos: [0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+        Vertex3 { pos: [-0.5, 0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
     ];
     (verts, vec![0, 1, 2, 0, 2, 3])
 }
@@ -401,7 +405,7 @@ pub fn build_plane() -> (Vec<Vertex3>, Vec<u32>) {
 pub fn build_sphere() -> (Vec<Vertex3>, Vec<u32>) {
     let (segs, rings) = (12usize, 8usize);
     let mut verts: Vec<Vertex3> = Vec::with_capacity(2 + (rings - 1) * segs);
-    verts.push(Vertex3 { pos: [0.0, 0.5, 0.0], normal: [0.0, 1.0, 0.0] });
+    verts.push(Vertex3 { pos: [0.0, 0.5, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.5, 0.0] });
     for j in 1..rings {
         let theta = std::f32::consts::PI * j as f32 / rings as f32;
         let (st, ct) = (theta.sin(), theta.cos());
@@ -409,11 +413,11 @@ pub fn build_sphere() -> (Vec<Vertex3>, Vec<u32>) {
             let phi = 2.0 * std::f32::consts::PI * i as f32 / segs as f32;
             let (sp, cp) = (phi.sin(), phi.cos());
             let n = [st * cp, ct, st * sp];
-            verts.push(Vertex3 { pos: [n[0] * 0.5, n[1] * 0.5, n[2] * 0.5], normal: n });
+            verts.push(Vertex3 { pos: [n[0] * 0.5, n[1] * 0.5, n[2] * 0.5], normal: n, uv: [i as f32 / segs as f32, j as f32 / rings as f32] });
         }
     }
     let bottom = verts.len() as u32;
-    verts.push(Vertex3 { pos: [0.0, -0.5, 0.0], normal: [0.0, -1.0, 0.0] });
+    verts.push(Vertex3 { pos: [0.0, -0.5, 0.0], normal: [0.0, -1.0, 0.0], uv: [0.5, 1.0] });
     let mut idx: Vec<u32> = Vec::with_capacity((rings - 1) * segs * 6);
     // Top fan (outward = pole, next-phi, phi).
     for i in 0..segs {
@@ -528,11 +532,14 @@ struct GeoDesc {
     normals: Option<Vec<f32>>,
     #[serde(default)]
     indices: Option<Vec<u32>>,
+    /// Optional flat `[u,v, …]` pairs; defaults to a planar X/Y projection.
+    #[serde(default)]
+    uvs: Option<Vec<f32>>,
 }
 
 impl Default for GeoDesc {
     fn default() -> Self {
-        GeoDesc { kind: d_kind(), verts: None, normals: None, indices: None }
+        GeoDesc { kind: d_kind(), verts: None, normals: None, indices: None, uvs: None }
     }
 }
 
@@ -776,8 +783,25 @@ impl Scene {
                         }
                         None => derive_smooth_normals(&positions, &indices),
                     };
-                    let verts =
-                        positions.into_iter().zip(normals).map(|(pos, normal)| Vertex3 { pos, normal }).collect();
+                    let uvs: Vec<[f32; 2]> = match &m.geo.uvs {
+                        Some(u) => {
+                            if u.len() != positions.len() * 2 {
+                                return Err(format!(
+                                    "{tag}.geo.uvs: need {} numbers (2 per vertex), got {}",
+                                    positions.len() * 2,
+                                    u.len()
+                                ));
+                            }
+                            u.chunks_exact(2).map(|c| [c[0], c[1]]).collect()
+                        }
+                        None => positions.iter().map(|p| [p[0] + 0.5, p[1] + 0.5]).collect(),
+                    };
+                    let verts = positions
+                        .into_iter()
+                        .zip(normals)
+                        .zip(uvs)
+                        .map(|((pos, normal), uv)| Vertex3 { pos, normal, uv })
+                        .collect();
                     Geometry::Tris { verts, indices }
                 }
                 other => return Err(format!("{tag}.geo.kind must be one of box|plane|sphere|tris, got \"{other}\"")),
@@ -917,6 +941,46 @@ fn global() -> &'static Mutex<SceneStore> {
     GLOBAL.get_or_init(|| Mutex::new(SceneStore::new()))
 }
 
+// ---- Material textures ---------------------------------------------------------------
+// RGBA payloads staged by script (`scene3d_texture`) and drained by the renderer once.
+// Keyed by the material's `textureId`, independent of the 2D image/atlas id space.
+
+static TEX_STORE: OnceLock<Mutex<HashMap<u32, (Vec<u8>, u32, u32)>>> = OnceLock::new();
+
+fn tex_store() -> &'static Mutex<HashMap<u32, (Vec<u8>, u32, u32)>> {
+    TEX_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stage an RGBA texture for a material `textureId`. The renderer uploads it on its
+/// next frame; oversized payloads are rejected to bound GPU memory.
+pub fn set_scene_texture(id: u32, rgba: Vec<u8>, width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 || width > 2048 || height > 2048 {
+        return Err(format!("texture size {width}x{height} out of range (1..2048)"));
+    }
+    if rgba.len() < width as usize * height as usize * 4 {
+        return Err(format!("texture payload too small for {width}x{height}"));
+    }
+    tex_store().lock().map_err(|_| "texture store is poisoned".to_string())?.insert(id, (rgba, width, height));
+    Ok(())
+}
+
+/// Drain staged texture uploads. Empty on ordinary frames (no per-frame cost).
+pub fn take_scene_texture_uploads() -> Vec<(u32, Vec<u8>, u32, u32)> {
+    tex_store().lock().map(|mut s| s.drain().map(|(id, (rgba, w, h))| (id, rgba, w, h)).collect()).unwrap_or_default()
+}
+
+/// Whether a texture has been staged or previously uploaded for this id.
+pub fn has_scene_texture(id: u32) -> bool {
+    tex_store().lock().map(|s| s.contains_key(&id)).unwrap_or(false)
+}
+
+/// Drop a staged texture (the renderer keeps any already-uploaded GPU texture).
+pub fn remove_scene_texture(id: u32) {
+    if let Ok(mut s) = tex_store().lock() {
+        s.remove(&id);
+    }
+}
+
 /// JS-agent contract: create or replace the scene hosted at `id`.
 ///
 /// `desc_json` follows the schema documented at the top of this module; on error the
@@ -933,6 +997,14 @@ pub fn remove_scene(id: SceneId) -> bool {
 /// JS-agent contract: ids of all live scenes.
 pub fn scene_ids() -> Vec<SceneId> {
     global().lock().map(|s| s.ids()).unwrap_or_default()
+}
+
+/// Diagnostic: how many directional / point lights the GPU scene at `id` will shade.
+/// Used by cross-crate bridge tests and the inspector; returns (0, 0) for a missing scene.
+pub fn scene_light_counts(id: SceneId) -> (u32, u32) {
+    let Some(scene) = global().lock().ok().and_then(|s| s.get_arc(id)) else { return (0, 0) };
+    let lighting = scene.lighting();
+    (lighting.dir_count, lighting.point_count)
 }
 
 /// Renderer hook: fetch the scene for compositing as a cheap [`Arc`] clone (a refcount

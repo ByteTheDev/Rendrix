@@ -6,6 +6,13 @@
 
 import init, { start } from './rendrix_web.js';
 
+// Kick off the WASM download/compile at module evaluation, in parallel with the page fetching
+// the app bundle. Previously the module only called `init()` after the bundle had arrived,
+// serialising the two slowest parts of startup. The rejection is stored and re-thrown by the
+// 'init' handler so it still reaches the page as an error event.
+let wasmError = null;
+const wasmReady = init().catch((e) => { wasmError = e; });
+
 const post = self.postMessage.bind(self);
 const addMessageListener = self.addEventListener.bind(self);
 const realSetTimeout = self.setTimeout.bind(self);
@@ -35,10 +42,23 @@ function wakeIn(ms) {
 }
 
 const last = {};
+// Scalars compare directly; only the two array fields need a structural compare. This used to
+// JSON.stringify every field on every frame (the worker's hot path).
 function changed(key, value) {
-  const s = JSON.stringify(value);
-  if (last[key] === s) return false;
-  last[key] = s;
+  if (last[key] === value) return false;
+  last[key] = value;
+  return true;
+}
+function samePair(a, b) {
+  return !!a && !!b && a.length === b.length && a.every((v, i) => v === b[i]);
+}
+function sameRects(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (x.length !== y.length) return false;
+    for (let j = 0; j < x.length; j++) if (x[j] !== y[j]) return false;
+  }
   return true;
 }
 
@@ -53,16 +73,17 @@ function tick() {
     return;
   }
   const out = {};
-  if (report.cursor && changed('cursor', report.cursor)) out.cursor = report.cursor;
-  if (changed('textInput', report.textInput)) out.textInput = report.textInput;
-  if (changed('caret', report.caret)) out.caret = report.caret;
-  if (report.title != null && changed('title', report.title)) out.title = report.title;
-  if (report.textRects && changed('textRects', report.textRects)) out.textRects = report.textRects;
-  if (report.clipboard != null) out.clipboard = report.clipboard;
-  if (report.external && report.external.length) out.external = report.external;
-  if (report.quit) out.quit = true;
-  if (report.repainted) out.painted = true;
-  if (Object.keys(out).length) post({ t: 'frame', ...out });
+  let dirty = false;
+  if (report.cursor && changed('cursor', report.cursor)) { out.cursor = report.cursor; dirty = true; }
+  if (changed('textInput', report.textInput)) { out.textInput = report.textInput; dirty = true; }
+  if (!samePair(last.caret, report.caret)) { last.caret = report.caret; out.caret = report.caret; dirty = true; }
+  if (report.title != null && changed('title', report.title)) { out.title = report.title; dirty = true; }
+  if (report.textRects && !sameRects(last.textRects, report.textRects)) { last.textRects = report.textRects; out.textRects = report.textRects; dirty = true; }
+  if (report.clipboard != null) { out.clipboard = report.clipboard; dirty = true; }
+  if (report.external && report.external.length) { out.external = report.external; dirty = true; }
+  if (report.quit) { out.quit = true; dirty = true; }
+  if (report.repainted) { out.painted = true; dirty = true; }
+  if (dirty) post({ t: 'frame', ...out });
   if (report.quit) { app = null; return; }
   if (settle > 0) { settle--; requestFrame(); }
   else if (report.continuous) requestFrame();
@@ -115,7 +136,8 @@ addMessageListener('message', async (e) => {
     if (booting) return;
     booting = true;
     try {
-      await init();
+      await wasmReady;
+      if (wasmError) throw wasmError;
       app = await start(m.canvas, m.bundle, m.w, m.h, m.dpr);
       post({ t: 'ready', adapter: app.adapter() });
       for (const q of early.splice(0)) handle(q);

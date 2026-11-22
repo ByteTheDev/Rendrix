@@ -4,17 +4,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, watch, statSync } from 'node:fs';
-import { readFile, writeFile, mkdir, mkdtemp, readdir, copyFile, rm, stat, chmod } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, readdir, copyFile, rm, stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { buildApp, writeBundle, bundleStats, typeCheck, loadProject, BuildError, BUNDLE_FORMAT } from './build.mjs';
+import { resolveTarget, currentTarget, isCrossTarget, supportedTargets } from './target.mjs';
+import { packExecutable, MAGIC, writeMacApp, zipDirectory, writeLinuxRoot, tarDirectory } from './packaging.mjs';
+import { resolveIcon, icnsFromIcon, pngFromIcon } from './icon.mjs';
 import { writeManifest, resolveSignCommand, signArtifact, notarizeArtifact, findSigntool, findCodesign } from '../signing.mjs';
-import { nsisScript, buildNsis } from '../installer/nsis.mjs';
+import { buildNsis } from '../installer/nsis.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cliRoot = path.resolve(here, '..', '..');
 const repoRoot = path.resolve(cliRoot, '..', '..');
-export const MAGIC = Buffer.from('RENDRAPP');
-const exe = process.platform === 'win32' ? '.exe' : '';
+
+// Keep the original public imports working for consumers of this module.
+export { MAGIC, packExecutable };
 
 const color = (c, s) => (process.stdout.isTTY ? `\x1b[${c}m${s}\x1b[0m` : s);
 const ok = s => console.log(color(32, '✓'), s);
@@ -22,20 +26,31 @@ const info = s => console.log(color(36, '›'), s);
 const warn = s => console.warn(color(33, '!'), s);
 const fail = s => console.error(color(31, '✗'), s);
 
-/** Locate the prebuilt runtime executable. */
-export function findRuntime() {
+/**
+ * Locate a prebuilt runtime for `target`. Local `engine/target` builds are host-only: when
+ * cross-packaging we must not silently embed a binary for the wrong OS/architecture, so only
+ * an explicit RENDRIX_RUNTIME / --runtime path or a RENDRIX_HOME distribution is considered.
+ */
+export function findRuntime(target = currentTarget()) {
+  const binary = 'rendrix-runtime' + target.exe;
+  const cross = isCrossTarget(target);
   const candidates = [
     process.env.RENDRIX_RUNTIME,
-    path.join(repoRoot, 'engine', 'target', 'release', 'rendrix-runtime' + exe),
-    path.join(repoRoot, 'engine', 'target', 'debug', 'rendrix-runtime' + exe),
-    process.env.RENDRIX_HOME && path.join(process.env.RENDRIX_HOME, 'runtime', `${process.platform}-${process.arch}`, 'rendrix-runtime' + exe),
+    !cross && path.join(repoRoot, 'engine', 'target', 'release', binary),
+    !cross && path.join(repoRoot, 'engine', 'target', 'debug', binary),
+    process.env.RENDRIX_HOME && path.join(process.env.RENDRIX_HOME, 'runtime', target.key, binary),
   ].filter(Boolean);
   return candidates.find(p => existsSync(p)) || null;
 }
 
-function needRuntime() {
-  const rt = findRuntime();
-  if (!rt) throw new BuildError('The Rendrix runtime is not built. Run `cargo build --release -p rendrix-runtime --manifest-path engine/Cargo.toml`, or set RENDRIX_RUNTIME to a rendrix-runtime executable. `rendrix doctor` shows what was searched.');
+function needRuntime(target) {
+  const rt = findRuntime(target);
+  if (!rt) {
+    const hint = target && isCrossTarget(target)
+      ? `No runtime for ${target.key} was found. Set RENDRIX_HOME to a distribution containing runtime/${target.key}/, or pass --runtime /path/to/rendrix-runtime${target.exe}. Local engine/target builds are host-only.`
+      : 'The Rendrix runtime is not built. Run `cargo build --release -p rendrix-runtime --manifest-path engine/Cargo.toml`, or set RENDRIX_RUNTIME to a rendrix-runtime executable. `rendrix doctor` shows what was searched.';
+    throw new BuildError(hint);
+  }
   return rt;
 }
 
@@ -65,49 +80,64 @@ export async function run(dir, opts = {}) {
   return child.status ?? 1;
 }
 
-/** Append the bundle to a copy of the runtime executable (`[json][u64 LE length][RENDRAPP]`). */
-export async function packExecutable(runtimePath, bundle, outFile) {
-  let bytes = await readFile(runtimePath);
-  if (bytes.subarray(bytes.length - 8).equals(MAGIC)) {
-    const len = Number(bytes.readBigUInt64LE(bytes.length - 16));
-    bytes = bytes.subarray(0, bytes.length - 16 - len);
-  }
-  const json = Buffer.from(JSON.stringify(bundle));
-  const trailer = Buffer.alloc(16);
-  trailer.writeBigUInt64LE(BigInt(json.length), 0);
-  MAGIC.copy(trailer, 8);
-  await mkdir(path.dirname(outFile), { recursive: true });
-  await writeFile(outFile, Buffer.concat([bytes, json, trailer]));
-  if (process.platform !== 'win32') await chmod(outFile, 0o755);
-}
-
 export async function pack(dir, opts = {}) {
+  const target = resolveTarget(opts.target);
   const { bundle, project } = await build(dir, { ...opts, out: opts.bundleOut });
-  const rt = opts.runtime || needRuntime();
+  const rt = opts.runtime || needRuntime(target);
   const version = await appVersion(project.dir, opts);
-  const artifacts = [];
-  if (process.platform === 'darwin') {
-    // macOS app bundle: dist/<Name>.app/Contents/{MacOS/<Name>,Info.plist}. The .app directory
-    // is the distributable artifact (zip it; notarize the binary via signing.mjs helpers).
-    const appDir = path.resolve(opts.out || path.join(project.dir, 'dist', `${project.name}.app`));
-    const macos = path.join(appDir, 'Contents', 'MacOS');
-    await mkdir(macos, { recursive: true });
-    const exe = path.join(macos, project.name);
-    await packExecutable(rt, bundle, exe);
-    await writeFile(path.join(appDir, 'Contents', 'Info.plist'), macosPlist(project, version));
-    artifacts.push(exe);
-    ok(`packaged ${path.relative(process.cwd(), appDir)} (${(statSync(exe).size / 1048576).toFixed(1)} MB, standalone; needs no Node, Bun or browser)`);
-    if (opts.installer && opts.installer !== 'none') throw new BuildError(`installer '${opts.installer}' is only supported on Windows (NSIS); on macOS zip the .app bundle`);
-    return finishPack({ project, version, artifacts, appDir, out: exe }, opts);
+  const icon = await resolveIcon(project.dir, opts.icon);
+  const dist = path.join(project.dir, 'dist');
+
+  if (target.platform === 'darwin') {
+    // A complete .app bundle with Resources, icon and metadata, zipped for distribution and
+    // notarization. The binary is signed inside the bundle before the archive is created.
+    const appDir = path.resolve(opts.out || path.join(dist, `${project.name}.app`));
+    if (!appDir.endsWith('.app')) throw new BuildError(`--out for macOS must name a .app bundle (got '${appDir}')`);
+    if (opts.installer && !['none', 'zip'].includes(opts.installer)) {
+      throw new BuildError(`installer '${opts.installer}' is not supported on macOS; the .app is zipped automatically`);
+    }
+    const { executable } = await writeMacApp({
+      appDir, project, version, runtime: rt, bundle, target, icon,
+      icns: icnsFromIcon(icon, warn),
+    });
+    const zipPath = path.join(path.dirname(appDir), `${project.name}-${version}-${target.key}.zip`);
+    // --keepParent semantics: notarytool expects the .app folder itself inside the zip.
+    await writeFile(zipPath, await zipDirectory(appDir, path.basename(appDir)));
+    ok(`packaged ${path.relative(process.cwd(), appDir)} (${(statSync(executable).size / 1048576).toFixed(1)} MB standalone binary, zipped for distribution)`);
+    return finishPack({
+      project, version, out: appDir, artifacts: [zipPath], signFiles: [appDir],
+      notarize: { app: appDir, zip: zipPath },
+    }, opts);
   }
-  const out = path.resolve(opts.out || path.join(project.dir, 'dist', project.name + exe));
-  await packExecutable(rt, bundle, out);
-  artifacts.push(out);
+
+  if (target.platform === 'linux') {
+    if (opts.installer && !['none', 'tarball'].includes(opts.installer)) {
+      throw new BuildError(`installer '${opts.installer}' is not supported on Linux (the tarball is the distributable)`);
+    }
+    const rootName = `${project.name}-${version}-${target.key}`;
+    const root = path.join(dist, rootName);
+    await rm(root, { recursive: true, force: true });
+    const { executable } = await writeLinuxRoot({
+      root, project, version, runtime: rt, bundle, target,
+      png: pngFromIcon(icon, warn),
+    });
+    const tarPath = path.resolve(opts.out || path.join(dist, `${rootName}.tar.gz`));
+    await writeFile(tarPath, await tarDirectory(root));
+    ok(`packaged ${path.relative(process.cwd(), tarPath)} (${(statSync(executable).size / 1048576).toFixed(1)} MB standalone binary + desktop entry)`);
+    return finishPack({ project, version, out: executable, artifacts: [tarPath], signFiles: [tarPath] }, opts);
+  }
+
+  // Windows
+  if (opts.installer && !['none', 'nsis'].includes(opts.installer)) {
+    throw new BuildError(`unknown installer '${opts.installer}' (supported: none, nsis)`);
+  }
+  const out = path.resolve(opts.out || path.join(dist, project.name + target.exe));
+  await packExecutable(rt, bundle, out, target);
+  const artifacts = [out];
   ok(`packaged ${path.relative(process.cwd(), out)} (${(statSync(out).size / 1048576).toFixed(1)} MB, standalone; needs no Node, Bun or browser)`);
   let installer = null;
-  if (opts.installer && opts.installer !== 'none') {
-    if (opts.installer !== 'nsis') throw new BuildError(`unknown installer '${opts.installer}' (supported: none, nsis)`);
-    if (process.platform !== 'win32') throw new BuildError('the NSIS installer can only be built on Windows');
+  if (opts.installer === 'nsis') {
+    if (process.platform !== 'win32') throw new BuildError('building an NSIS installer requires Windows (makensis); cross-packaging the plain executable is supported');
     const scriptPath = path.join(path.dirname(out), `${project.name}.nsi`);
     const setupOut = path.join(path.dirname(out), `${project.name}-setup-${version}.exe`);
     info(`building NSIS installer → ${path.relative(process.cwd(), setupOut)}`);
@@ -115,7 +145,7 @@ export async function pack(dir, opts = {}) {
     installer = setupOut;
     artifacts.push(installer);
   }
-  return finishPack({ project, version, artifacts, out, installer }, opts);
+  return finishPack({ project, version, artifacts, signFiles: [out, installer].filter(Boolean), out, installer }, opts);
 }
 
 async function appVersion(projectDir, opts) {
@@ -128,38 +158,19 @@ async function appVersion(projectDir, opts) {
   return '0.0.0';
 }
 
-function macosPlist(project, version) {
-  const id = `dev.rendrix.${project.name.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>${project.name}</string>
-  <key>CFBundleDisplayName</key><string>${project.title}</string>
-  <key>CFBundleIdentifier</key><string>${id}</string>
-  <key>CFBundleVersion</key><string>${version}</string>
-  <key>CFBundleShortVersionString</key><string>${version}</string>
-  <key>CFBundleExecutable</key><string>${project.name}</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
-  <key>NSHighResolutionCapable</key><true/>
-</dict>
-</plist>
-`;
-}
-
 /// Sign artifacts, write the SHA-256 manifest (+ detached `.sig` with `--manifest-key`), and
-/// notarize on macOS. Wiring for S1: `rendrix package --sign --installer nsis
-/// --manifest dist/manifest.json --publish-url https://example.com/app`.
+/// notarize the zipped .app on macOS.
 async function finishPack(pack, opts) {
   if (opts.sign) {
     const command = typeof opts.sign === 'string' ? opts.sign : resolveSignCommand();
     if (!command) throw new BuildError('signing requested but no signing command is configured (set RENDRIX_SIGN_COMMAND, or RENDRIX_CERT_FILE on Windows / RENDRIX_CODESIGN_IDENTITY on macOS)');
-    for (const file of pack.artifacts) {
+    for (const file of pack.signFiles || pack.artifacts) {
       info(`signing ${path.basename(file)}`);
       await signArtifact(file, command);
     }
-    if (process.platform === 'darwin' && process.env.APPLE_ID) await notarizeArtifact(pack.out);
+    if (pack.notarize && process.env.APPLE_ID) {
+      await notarizeArtifact(pack.notarize.zip, { app: pack.notarize.app, zip: pack.notarize.zip });
+    }
   }
   if (opts.manifest) {
     const manifestPath = path.resolve(opts.manifest);
@@ -308,6 +319,7 @@ export async function doctor(dir) {
   row(!!tsv, 'TypeScript compiler', tsv || 'not installed (npm i -D typescript)');
   const rt = findRuntime();
   row(!!rt, 'Rendrix runtime', rt || 'not found. Build with: cargo build --release -p rendrix-runtime --manifest-path engine/Cargo.toml (or set RENDRIX_RUNTIME)');
+  row(true, 'release targets', `${currentTarget().key} (host); packaging: ${supportedTargets().join(', ')}`);
   if (rt) {
     const r = spawnSync(rt, ['doctor'], { encoding: 'utf8' });
     if (r.status === 0) for (const line of r.stdout.trim().split('\n')) row(!/no suitable|error|failed/i.test(line), line.split(':')[0].trim(), line.split(':').slice(1).join(':').trim());

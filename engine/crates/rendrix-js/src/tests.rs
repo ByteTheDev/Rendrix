@@ -1746,12 +1746,24 @@ fn scene3d_js_scenes_reach_the_gpu_store() {
 
     run(
         &mut r,
-        "globalThis.hc = RendrixScene.createScene('c', Rendrix3D.createBoxScene({ color: [1,0,0,1] }));
+        "globalThis.lit = Rendrix3D.createBoxScene({ color: [1,0,0,1] });
+         lit.lights = [
+           { kind: 'dir', dir: [1,0,0] },
+           { kind: 'dir', dir: [0,1,0] },
+           { kind: 'point', pos: [0,2,0], intensity: 2, range: 5 }
+         ];
+         lit.meshes[0].material.cull = 'back';
+         globalThis.hc = RendrixScene.createScene('c', lit);
          globalThis.hs = RendrixScene.createScene(document.getElementById('s'), Rendrix3D.createBoxScene({ color: [0,1,0,1] }));",
     );
     let ids = rendrix_gfx::scene3d::scene_ids();
     assert!(ids.contains(&(canvas_id as u64)), "canvas data-3d host must reach the GPU store: {ids:?}");
     assert!(ids.contains(&(host_id as u64)), "<rendrix-scene> host must reach the GPU store: {ids:?}");
+    assert_eq!(
+        rendrix_gfx::scene3d::scene_light_counts(canvas_id as u64),
+        (2, 1),
+        "multiple dir + point lights must survive the JS -> canonical JSON -> GPU bridge"
+    );
 
     // Updating the desc must refresh the GPU scene too, and removal must drop it.
     run(&mut r, "hc.setCamera({ fovY: 60 }); hs.remove();");
@@ -1759,4 +1771,19 @@ fn scene3d_js_scenes_reach_the_gpu_store() {
     assert!(ids.contains(&(canvas_id as u64)), "updated scene stays in the GPU store");
     assert!(!ids.contains(&(host_id as u64)), "removed scene leaves the GPU store");
     rendrix_gfx::scene3d::remove_scene(canvas_id as u64);
+}
+
+#[test]
+fn scene3d_set_texture_reaches_the_gpu_texture_store() {
+    let mut r = rt("<canvas id=c data-3d width=20 height=10></canvas>");
+    // A 2x2 RGBA checker passed as a Uint8Array through the public JS API. The prelude
+    // base64-encodes it and the native op stages it for the GPU renderer.
+    run(
+        &mut r,
+        "RendrixScene.setTexture(9, new Uint8Array([255,0,0,255, 0,0,255,255, 0,0,255,255, 255,0,0,255]), 2, 2);",
+    );
+    assert!(rendrix_gfx::scene3d::has_scene_texture(9), "staged texture reaches the GPU store");
+    run(&mut r, "RendrixScene.deleteTexture(9);");
+    // The staged entry is gone; the renderer may still hold its own uploaded copy.
+    assert!(!rendrix_gfx::scene3d::has_scene_texture(9));
 }

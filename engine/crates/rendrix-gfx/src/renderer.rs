@@ -246,6 +246,26 @@ struct DrawSlot {
 
 const MAX_POLY_POINTS: usize = 64;
 
+/// WebGL2 exposes no shader storage buffers and caps uniform bindings at 16 KiB.
+/// An `Inst` is 320 bytes, so 48 per chunk = 15,360 bytes (60 × the 256-byte
+/// dynamic-offset alignment). The native WebGPU path keeps its single storage
+/// buffer and one draw per batch; only the GL fallback pays the extra draws.
+const COMPAT_INST_CHUNK: u32 = 48;
+const COMPAT_INST_CHUNK_BYTES: u64 = (COMPAT_INST_CHUNK as usize * std::mem::size_of::<Inst>()) as u64;
+
+fn inst_buffer_size(cap: usize, webgl2: bool) -> u64 {
+    if webgl2 {
+        let chunks = cap.div_ceil(COMPAT_INST_CHUNK as usize) as u64;
+        chunks * COMPAT_INST_CHUNK_BYTES
+    } else {
+        (cap * std::mem::size_of::<Inst>()) as u64
+    }
+}
+
+fn inst_buffer_usage(webgl2: bool) -> wgpu::BufferUsages {
+    if webgl2 { wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST } else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST }
+}
+
 struct Composite {
     pipeline: wgpu::RenderPipeline,
     /// REPLACE-blend variant used for backdrop-filter layers: the shader resolves the
@@ -309,7 +329,7 @@ fn make_composite(device: &wgpu::Device, format: wgpu::TextureFormat) -> Composi
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             },
         ],
@@ -379,8 +399,8 @@ fn make_composite(device: &wgpu::Device, format: wgpu::TextureFormat) -> Composi
     });
     let poly_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("rendrix composite polygon"),
-        size: (MAX_POLY_POINTS * 8) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        size: (MAX_POLY_POINTS * 16) as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let u_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -422,17 +442,18 @@ fn text_maybe_visible(x: f32, y: f32, w: f32, clip: [f32; 4]) -> bool {
 // CSS layout rect. Lighting is Blinn-Phong with a single directional + ambient
 // (see scene3d.wgsl); transparency, shadows and textures are deferred.
 
-/// Interleaved 3D vertex: position + normal.
+/// Interleaved 3D vertex: position + normal + UV.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct V3 {
     pos: [f32; 3],
     nrm: [f32; 3],
+    uv: [f32; 2],
 }
 
 impl From<Vertex3> for V3 {
     fn from(v: Vertex3) -> Self {
-        V3 { pos: v.pos, nrm: v.normal }
+        V3 { pos: v.pos, nrm: v.normal, uv: v.uv }
     }
 }
 
@@ -515,6 +536,9 @@ pub struct Renderer {
     #[allow(dead_code)] // template buffer retained for renderer compatibility
     inst_buf: wgpu::Buffer,
     inst_cap: usize,
+    /// True when the device cannot use storage buffers (WebGL2). Instances are then
+    /// read from a uniform array in 48-instance chunks with one draw per chunk.
+    webgl2: bool,
     /// Number of instances drawn in the last frame (profiling).
     pub last_instances: usize,
     pub last_batches: usize,
@@ -532,6 +556,9 @@ pub struct Renderer {
     td_sphere: GpuMesh,
     /// Raw-triangle meshes keyed by (scene_id, mesh_index, scene_revision).
     td_tris: HashMap<(u64, usize, u64), GpuMesh>,
+    /// Dedicated material textures keyed by `textureId` (never use the 2D image atlas,
+    /// whose UV sub-rects would need a separate transform in the 3D shader).
+    td_textures: HashMap<u32, ImageTex>,
     depth: Option<(u32, u32, wgpu::Texture)>,
     /// Target size of the last `render` call (for standalone 3D compositing).
     last_size: (u32, u32),
@@ -568,10 +595,13 @@ impl Renderer {
     /// Exists for overflow-recovery tests; production keeps the default.
     pub fn with_atlas_size(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, atlas_size: u32) -> Renderer {
         let atlas_size = atlas_size.max(16);
+        // WebGL2 has no SSBOs; detect it from device limits so the same check works
+        // natively in tests (a downlevel-limits device reproduces the fallback path).
+        let webgl2 = device.limits().max_storage_buffers_per_shader_stage == 0;
         let comp = make_composite(&device, format);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rendrix shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(if webgl2 { include_str!("shader_compat.wgsl") } else { include_str!("shader.wgsl") }.into()),
         });
         let g_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rendrix globals"),
@@ -585,7 +615,15 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    ty: if webgl2 {
+                        wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: NonZeroU64::new(COMPAT_INST_CHUNK_BYTES),
+                        }
+                    } else {
+                        wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }
+                    },
                     count: None,
                 },
             ],
@@ -682,11 +720,11 @@ impl Renderer {
         let inst_cap = 1024;
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rendrix instances"),
-            size: (inst_cap * std::mem::size_of::<Inst>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            size: inst_buffer_size(inst_cap, webgl2),
+            usage: inst_buffer_usage(webgl2),
             mapped_at_creation: false,
         });
-        let globals_bind = Self::make_globals_bind(&device, &g_layout, &globals_buf, &inst_buf);
+        let globals_bind = Self::make_globals_bind(&device, &g_layout, &globals_buf, &inst_buf, webgl2);
         // ---- 3D forward pass --------------------------------------------------
         let td_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rendrix 3d shader"),
@@ -731,7 +769,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let td_bind = Renderer::make_td_bind(&device, &td_layout, &td_frame_buf, &td_mesh_buf, td_frame_slot_nz, td_mesh_slot_nz);
-        let td_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("rendrix 3d layout"), bind_group_layouts: &[&td_layout], push_constant_ranges: &[] });
+        let td_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("rendrix 3d layout"), bind_group_layouts: &[&td_layout, &tex_layout], push_constant_ranges: &[] });
         // Opaque uses REPLACE + depth writes; transparent uses source-alpha blending
         // with depth testing but no depth writes so overlapping translucent meshes stack.
         let make_td_pipeline = |transparent: bool, cull: Option<wgpu::Face>, label: &str| {
@@ -745,7 +783,7 @@ impl Renderer {
                     buffers: &[wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<V3>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                     }],
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -811,6 +849,7 @@ impl Renderer {
             next_image: 1,
             inst_buf,
             inst_cap,
+            webgl2,
             last_instances: 0,
             last_batches: 0,
             td_pipelines,
@@ -823,6 +862,7 @@ impl Renderer {
             td_plane,
             td_sphere,
             td_tris: HashMap::new(),
+            td_textures: HashMap::new(),
             depth: None,
             last_size: (1, 1),
             last_3d_meshes: 0,
@@ -837,13 +877,20 @@ impl Renderer {
         }
     }
 
-    fn make_globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals_buf: &wgpu::Buffer, inst_buf: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn make_globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals_buf: &wgpu::Buffer, inst_buf: &wgpu::Buffer, webgl2: bool) -> wgpu::BindGroup {
+        // A dynamic-offset binding must declare the exact chunk size: binding the
+        // whole buffer would leave no room to offset without running past its end.
+        let inst_res = if webgl2 {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: inst_buf, offset: 0, size: NonZeroU64::new(COMPAT_INST_CHUNK_BYTES) })
+        } else {
+            inst_buf.as_entire_binding()
+        };
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rendrix globals bind"),
             layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: inst_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: inst_res },
             ],
         })
     }
@@ -1033,6 +1080,38 @@ impl Renderer {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
         });
         self.images.insert(id, ImageTex { bind, texture, width, height });
+    }
+
+    /// Upload a material texture into a dedicated GPU texture (never the shared 2D atlas,
+    /// which would require a UV sub-rect transform in the 3D shader). Called with the
+    /// payloads staged by `scene3d_texture`.
+    pub fn upload_3d_texture(&mut self, id: u32, rgba: &[u8], width: u32, height: u32) {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rendrix 3d material texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&Default::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rendrix 3d texture bind"),
+            layout: &self.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.td_textures.insert(id, ImageTex { bind, texture, width, height });
     }
 
     pub fn image_size(&self, id: ImageId) -> Option<(u32, u32)> {
@@ -1339,13 +1418,13 @@ impl Renderer {
             slot.inst_cap = cap;
             slot.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rendrix instances"),
-                size: (slot.inst_cap * std::mem::size_of::<Inst>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                size: inst_buffer_size(slot.inst_cap, self.webgl2),
+                usage: inst_buffer_usage(self.webgl2),
                 mapped_at_creation: false,
             });
             // The globals bind group references the instance buffer, so it must
             // be recreated — once per regrow, not once per frame.
-            slot.globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &self.globals_buf, &slot.inst_buf);
+            slot.globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &self.globals_buf, &slot.inst_buf, self.webgl2);
         }
         if !insts.is_empty() {
             self.queue.write_buffer(&slot.inst_buf, 0, bytemuck::cast_slice(&insts));
@@ -1371,19 +1450,48 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &slot.globals_bind, &[]);
-            for b in &batches {
-                let bind = match b.tex {
-                    Tex::White => &self.white_bind,
-                    Tex::Atlas => &self.atlas.bind,
-                    Tex::ImageAtlas => &self.image_atlas.bind,
-                    Tex::Image(id) => match self.images.get(&id) {
-                        Some(i) => &i.bind,
-                        None => continue,
-                    },
-                };
-                pass.set_bind_group(1, bind, &[]);
-                pass.draw(0..4, b.start..b.end);
+            if self.webgl2 {
+                // The shader reads a fixed 48-instance uniform array selected by a
+                // dynamic offset. WebGL2 has no base-instance, so each chunk draws
+                // from instance 0 and the offset selects the slice instead.
+                for b in &batches {
+                    let bind = match b.tex {
+                        Tex::White => &self.white_bind,
+                        Tex::Atlas => &self.atlas.bind,
+                        Tex::ImageAtlas => &self.image_atlas.bind,
+                        Tex::Image(id) => match self.images.get(&id) {
+                            Some(i) => &i.bind,
+                            None => continue,
+                        },
+                    };
+                    pass.set_bind_group(1, bind, &[]);
+                    let first = b.start / COMPAT_INST_CHUNK;
+                    let last = b.end.saturating_sub(1) / COMPAT_INST_CHUNK;
+                    for c in first..=last {
+                        let start = b.start.max(c * COMPAT_INST_CHUNK);
+                        let end = b.end.min((c + 1) * COMPAT_INST_CHUNK);
+                        if start < end {
+                            let offset = (c as u64 * COMPAT_INST_CHUNK_BYTES) as u32;
+                            pass.set_bind_group(0, &slot.globals_bind, &[offset]);
+                            pass.draw(0..4, 0..(end - start));
+                        }
+                    }
+                }
+            } else {
+                pass.set_bind_group(0, &slot.globals_bind, &[]);
+                for b in &batches {
+                    let bind = match b.tex {
+                        Tex::White => &self.white_bind,
+                        Tex::Atlas => &self.atlas.bind,
+                        Tex::ImageAtlas => &self.image_atlas.bind,
+                        Tex::Image(id) => match self.images.get(&id) {
+                            Some(i) => &i.bind,
+                            None => continue,
+                        },
+                    };
+                    pass.set_bind_group(1, bind, &[]);
+                    pass.draw(0..4, b.start..b.end);
+                }
             }
         }
         // 3D viewports composite on top of the 2D frame in the same encoder, so
@@ -1479,8 +1587,8 @@ impl Renderer {
             });
             let poly_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rendrix composite slot polygon"),
-                size: (MAX_POLY_POINTS * 8) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                size: (MAX_POLY_POINTS * 16) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1508,8 +1616,8 @@ impl Renderer {
         // make the last chunk's instances win for both passes.
         let inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rendrix draw slot instances"),
-            size: (self.inst_cap * std::mem::size_of::<Inst>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            size: inst_buffer_size(self.inst_cap, self.webgl2),
+            usage: inst_buffer_usage(self.webgl2),
             mapped_at_creation: false,
         });
         let globals_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1518,7 +1626,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &globals_buf, &inst_buf);
+        let globals_bind = Self::make_globals_bind(&self.device, &self.g_layout, &globals_buf, &inst_buf, self.webgl2);
         let fs = self.td_frame_slot();
         let ms = self.td_mesh_slot();
         let td_frame_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1791,9 +1899,9 @@ impl Renderer {
         let slot = self.take_comp_slot();
         self.queue.write_buffer(&self.comp.slots[slot].u_buf, 0, bytemuck::bytes_of(&u));
         if !poly_px.is_empty() {
-            let mut data = vec![[0.0f32, 0.0f32]; MAX_POLY_POINTS];
+            let mut data = vec![[0.0f32, 0.0f32, 0.0f32, 0.0f32]; MAX_POLY_POINTS];
             for (d, p) in data.iter_mut().zip(poly_px.iter().take(MAX_POLY_POINTS)) {
-                *d = *p;
+                *d = [p[0], p[1], 0.0, 0.0];
             }
             self.queue.write_buffer(&self.comp.slots[slot].poly_buf, 0, bytemuck::cast_slice(&data));
         }
@@ -2137,6 +2245,10 @@ impl Renderer {
         draws: &[SceneDraw],
         size_px: (u32, u32),
     ) -> usize {
+        // Phase 0: drain staged material textures (empty on ordinary frames).
+        for (id, rgba, w, h) in crate::scene3d::take_scene_texture_uploads() {
+            self.upload_3d_texture(id, &rgba, w, h);
+        }
         // Phase 1 (needs `&mut`): upload any uncached raw-triangle meshes.
         for d in draws {
             let Some(scene) = cloned_scene(d.scene_id) else { continue };
@@ -2177,6 +2289,7 @@ impl Renderer {
             geom: TdGeom,
             transparent: bool,
             cull: FaceCull,
+            texture_id: u32,
             /// Squared distance from the camera to the mesh centre, for back-to-front sorting.
             depth: f32,
         }
@@ -2236,7 +2349,12 @@ impl Renderer {
                     normal_mat: nmat.to_cols_array_2d(),
                     base: mesh.material.base_color,
                     emissive: [mesh.material.emissive[0], mesh.material.emissive[1], mesh.material.emissive[2], 1.0],
-                    params: [mesh.material.metallic, mesh.material.roughness, 128.0 + (8.0 - 128.0) * mesh.material.roughness, 0.0],
+                    params: [
+                        mesh.material.metallic,
+                        mesh.material.roughness,
+                        128.0 + (8.0 - 128.0) * mesh.material.roughness,
+                        if mesh.material.texture_id.unwrap_or(0) != 0 { 1.0 } else { 0.0 },
+                    ],
                 };
                 let slot = meshes.len();
                 meshes.push(uni);
@@ -2258,6 +2376,7 @@ impl Renderer {
                     geom,
                     transparent: mesh.material.base_color[3] < 1.0,
                     cull: mesh.material.cull,
+                    texture_id: mesh.material.texture_id.unwrap_or(0),
                     depth: dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2],
                 });
             }
@@ -2336,6 +2455,8 @@ impl Renderer {
                 pass.set_pipeline(self.td_pipelines.get(pm.transparent, pm.cull));
                 let mesh_off = (pm.slot as u64) * ms;
                 pass.set_bind_group(0, &self.td_bind, &[frame_off as u32, mesh_off as u32]);
+                let tex_bind = self.td_textures.get(&pm.texture_id).map(|t| &t.bind).unwrap_or(&self.white_bind);
+                pass.set_bind_group(1, tex_bind, &[]);
                 pass.set_vertex_buffer(0, gpu.vbuf.slice(..));
                 pass.set_index_buffer(gpu.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..gpu.count, 0, 0..1);
@@ -2595,6 +2716,28 @@ mod tests {
         Some(r.render_to_rgba(list, &mut t, (w, h), 1.0))
     }
 
+    /// Same render on a device restricted to WebGL2 limits (no storage buffers).
+    /// This is the exact condition the browser fallback hits, reproducible natively.
+    fn render_webgl2(list: &DisplayList, w: u32, h: u32) -> Option<Vec<u8>> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::PRIMARY, ..Default::default() });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })).ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("rendrix webgl2-limits device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        }))
+        .ok()?;
+        let mut r = Renderer::new(device, queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        Some(r.render_to_rgba(list, &mut t, (w, h), 1.0))
+    }
+
     fn px(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * w + x) * 4) as usize;
         [img[i], img[i + 1], img[i + 2], img[i + 3]]
@@ -2602,6 +2745,22 @@ mod tests {
 
     fn rect(x: f32, y: f32, w: f32, h: f32, c: Color) -> Item {
         Item::Rect(RectItem { rect: [x, y, w, h], radii: [0.0; 4], fill: Fill::Solid(c), border: None })
+    }
+
+    #[test]
+    fn webgl2_limits_match_native_pixels() {
+        // 120 rects = three 48-instance chunks, so the fallback's chunk splitting
+        // and dynamic offsets are exercised, not just its shader compilation.
+        let mut l = DisplayList::new(128.0, 128.0, Color::WHITE);
+        for i in 0..120u32 {
+            let x = (i % 12) * 10;
+            let y = (i / 12) * 12;
+            let c = Color::from_u8((i * 2) as u8, 255 - (i * 2) as u8, (i * 3) as u8, 1.0);
+            l.push(rect(x as f32, y as f32, 8.0, 10.0, c));
+        }
+        let Some(native) = render(&l, 128, 128) else { eprintln!("no GPU adapter, skipping"); return };
+        let Some(compat) = render_webgl2(&l, 128, 128) else { eprintln!("no downlevel device, skipping"); return };
+        assert_eq!(native, compat, "chunked uniform instances must be pixel-identical to storage-buffer instances");
     }
 
     #[test]
@@ -3077,6 +3236,52 @@ mod tests {
         assert!(solid[0] > solid[1] + 40, "opaque box is clearly red: {solid:?}");
         assert!(blended[1] > solid[1] + 20, "white 2D frame shows through: {solid:?} -> {blended:?}");
         assert!(blended[2] > solid[2] + 20, "white 2D frame shows through: {solid:?} -> {blended:?}");
+    }
+
+    /// A material `textureId` must bind a dedicated GPU texture and sample it with the
+    /// primitive's UVs. The 2x2 checker gives one red and one blue quadrant on the plane.
+    #[test]
+    fn scene3d_material_texture_samples_with_uvs() {
+        use crate::scene3d;
+        let Some(ctx) = GpuContext::headless().ok() else { return };
+        let mut r = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut t = TextSystem::new();
+        let tex_id = 77u32;
+        let checker = vec![
+            255, 0, 0, 255, 0, 0, 255, 255, // row 0
+            0, 0, 255, 255, 255, 0, 0, 255, // row 1
+        ];
+        // Upload directly onto this renderer: the staged global queue is shared across
+        // test threads and would be drained by any other renderer's frame.
+        r.upload_3d_texture(tex_id, &checker, 2, 2);
+        let id = 0x3D00_0004u64;
+        scene3d::upsert_scene(
+            id,
+            r#"{"camera": {"position": [0, 0, 2], "lookAt": [0, 0, 0]},
+                "lights": [{"kind": "ambient", "color": [1,1,1], "intensity": 1}],
+                "meshes": [{"geo": {"kind": "plane"},
+                            "material": {"color": [1,1,1,1], "textureId": 77},
+                            "transform": {"scale": [3, 3, 1]}}]}"#,
+        )
+        .unwrap();
+        let mut l = DisplayList::new(64.0, 64.0, Color::WHITE);
+        l.push(Item::Scene3D(Scene3DItem { scene_id: id, rect: [0.0, 0.0, 64.0, 64.0] }));
+        let img = r.render_to_rgba(&l, &mut t, (64, 64), 1.0);
+        scene3d::remove_scene(id);
+        scene3d::remove_scene_texture(tex_id);
+        assert_eq!(r.last_3d_meshes, 1);
+        let (mut reddish, mut bluish) = (0u32, 0u32);
+        for y in 16..48u32 {
+            for x in 16..48u32 {
+                let p = px(&img, 64, x, y);
+                if p[0] as i32 > p[2] as i32 + 40 { reddish += 1; }
+                if p[2] as i32 > p[0] as i32 + 40 { bluish += 1; }
+            }
+        }
+        // Bilinear sampling between the red/blue texels yields magenta at the centre;
+        // both channels must be boosted well above the untextured white frame.
+        assert!(reddish > 50, "red checker quadrant visible: {reddish}");
+        assert!(bluish > 50, "blue checker quadrant visible: {bluish}");
     }
 
     #[test]

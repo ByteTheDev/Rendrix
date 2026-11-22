@@ -10,10 +10,29 @@
 
 const COARSE = () => matchMedia('(pointer: coarse)').matches;
 
+// Render-budget defaults. A 3x-DPI phone paints 9x the pixels of a 1x screen, and a large
+// high-DPI window can exceed 20M pixels/frame. Both are wasted work for most UIs; games get
+// the biggest win. Override with `mount(el, bundle, { maxDpr, maxPixels })` and adjust at
+// runtime with `controller.setQuality(...)`.
+const DEFAULT_MAX_DPR = 2;
+const DEFAULT_MAX_PIXELS = 8_000_000;
+
+export function budgetDpr(w, h, deviceDpr, maxDpr, maxPixels) {
+  let d = Math.min(deviceDpr || 1, Math.max(1, maxDpr));
+  const pixels = w * h * d * d;
+  // Never drop below 1x: downscaling below device pixels makes text soft even on 1x displays.
+  if (pixels > maxPixels) d = Math.max(1, d * Math.sqrt(maxPixels / pixels));
+  return d;
+}
+
 export async function mount(target, bundle, options = {}) {
   const json = typeof bundle === 'string' && !bundle.trim().startsWith('{') ? await (await fetch(bundle)).text() : (typeof bundle === 'string' ? bundle : JSON.stringify(bundle));
   const workerUrl = options.workerUrl || new URL('./rendrix-worker.js', import.meta.url);
   const events = new EventTarget();
+  const quality = {
+    maxDpr: Math.max(1, options.maxDpr ?? DEFAULT_MAX_DPR),
+    maxPixels: Math.max(1, options.maxPixels ?? DEFAULT_MAX_PIXELS),
+  };
 
   const host = document.createElement('div');
   host.style.cssText = 'position:relative;width:100%;height:100%;overflow:hidden;';
@@ -52,11 +71,17 @@ export async function mount(target, bundle, options = {}) {
   const cleanup = [];
   const on = (el, ev, fn, opts) => { el.addEventListener(ev, fn, opts); cleanup.push(() => el.removeEventListener(ev, fn, opts)); };
 
+  // getBoundingClientRect() forces layout. Cache it and refresh only when something can move
+  // the canvas, instead of on every pointermove (mice can fire 1000 events/second).
+  let rect = null;
+  const refreshRect = () => { rect = canvas.getBoundingClientRect(); };
   const sizeNow = () => {
-    const r = canvas.getBoundingClientRect();
-    return { w: Math.max(1, Math.round(r.width)), h: Math.max(1, Math.round(r.height)), dpr: window.devicePixelRatio || 1 };
+    if (!rect) refreshRect();
+    const w = Math.max(1, Math.round(rect.width));
+    const h = Math.max(1, Math.round(rect.height));
+    return { w, h, dpr: budgetDpr(w, h, window.devicePixelRatio || 1, quality.maxDpr, quality.maxPixels) };
   };
-  const pos = (e) => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  const pos = (e) => { if (!rect) refreshRect(); return [e.clientX - rect.left, e.clientY - rect.top]; };
 
   // ---- environment -------------------------------------------------------------------------
   const safeArea = () => {
@@ -72,11 +97,13 @@ export async function mount(target, bundle, options = {}) {
   const pushEnv = (extra = {}) => send({ t: 'env', safe: safeArea(), kb: keyboardHeight(), dark: matchMedia('(prefers-color-scheme: dark)').matches, touchPoints: navigator.maxTouchPoints || 0, ...extra });
   const pushSize = () => { const s = sizeNow(); send({ t: 'resize', ...s }); pushEnv(); };
 
-  const ro = new ResizeObserver(() => { if (ready) pushSize(); });
+  const refresh = () => { refreshRect(); if (ready) pushSize(); };
+  const ro = new ResizeObserver(refresh);
   ro.observe(canvas);
   cleanup.push(() => ro.disconnect());
-  on(window, 'resize', () => { if (ready) pushSize(); });
-  on(window, 'orientationchange', () => { if (ready) pushSize(); });
+  on(window, 'resize', refresh);
+  on(window, 'orientationchange', refresh);
+  on(window, 'scroll', refreshRect, true); // capture: any ancestor scroll moves the canvas
   if (window.visualViewport) { on(window.visualViewport, 'resize', () => ready && pushEnv()); on(window.visualViewport, 'scroll', () => ready && pushEnv()); }
   const mq = matchMedia('(prefers-color-scheme: dark)');
   on(mq, 'change', () => ready && pushEnv());
@@ -92,6 +119,7 @@ export async function mount(target, bundle, options = {}) {
 
   on(canvas, 'pointerdown', (e) => {
     canvas.setPointerCapture(e.pointerId);
+    refreshRect();
     const [x, y] = pos(e);
     if (e.pointerType === 'touch') {
       send({ t: 'touch', k: 'start', id: touchId(e.pointerId), x, y });
@@ -187,6 +215,10 @@ export async function mount(target, bundle, options = {}) {
   // ---- messages from the engine ----------------------------------------------------------------
   const evalWaiters = new Map();
   let evalSeq = 0;
+  // Lightweight, always-on frame telemetry so performance changes can be measured in a real
+  // browser rather than guessed. `frameMs` is an EMA of the interval between painted frames.
+  const stats = { frames: 0, fps: 0, frameMs: 0 };
+  let lastPaint = 0;
   const result = new Promise((resolve, reject) => {
     worker.addEventListener('message', (e) => {
       const m = e.data;
@@ -205,7 +237,17 @@ export async function mount(target, bundle, options = {}) {
         if (m.clipboard != null && navigator.clipboard) navigator.clipboard.writeText(m.clipboard).catch(() => {});
         if (m.external) for (const url of m.external) window.open(url, '_blank', 'noopener,noreferrer');
         if (m.quit) { events.dispatchEvent(new Event('quit')); }
-        if (m.painted) events.dispatchEvent(new Event('frame'));
+        if (m.painted) {
+          const now = performance.now();
+          if (lastPaint) {
+            const dt = now - lastPaint;
+            stats.frameMs = stats.frameMs ? stats.frameMs * 0.9 + dt * 0.1 : dt;
+            stats.fps = stats.frameMs > 0 ? 1000 / stats.frameMs : 0;
+          }
+          lastPaint = now;
+          stats.frames++;
+          events.dispatchEvent(new Event('frame'));
+        }
       } else if (m.t === 'console') {
         controller.logs.push([m.level, m.msg]);
         if (controller.logs.length > 500) controller.logs.shift();
@@ -228,8 +270,17 @@ export async function mount(target, bundle, options = {}) {
     adapter: '',
     /** Recent app console output as [level, message] pairs. */
     logs: [],
+    /** Live render telemetry: { frames, fps, frameMs } for painted frames. */
+    stats,
     /** Evaluate an expression inside the app; resolves to a string (objects are JSON). */
     eval(expr) { const id = ++evalSeq; return new Promise((res) => { evalWaiters.set(id, res); send({ t: 'eval', id, expr }); }); },
+    /** Change the render budget at runtime (useful for games trading sharpness for frame rate). */
+    setQuality(next = {}) {
+      if (next.maxDpr != null) quality.maxDpr = Math.max(1, next.maxDpr);
+      if (next.maxPixels != null) quality.maxPixels = Math.max(1, next.maxPixels);
+      if (ready) pushSize();
+      return { ...quality };
+    },
     destroy() {
       destroyed = true;
       for (const c of cleanup.splice(0)) c();

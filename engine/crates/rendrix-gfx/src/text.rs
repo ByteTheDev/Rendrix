@@ -65,7 +65,12 @@ struct ParaKey {
 
 /// Paragraph cache capacity. When full the least-recently-used entry is evicted
 /// (never a full `clear()`, so a shaping storm cannot drop the whole hot set).
-pub const PARA_CACHE_CAP: usize = 2048;
+///
+/// Sized to hold a full first-frame key set: a ~1000-item list shapes ~10k distinct
+/// `(content, width)` paragraphs during layout, so the old 2048 entry cap evicted
+/// most of them before paint/rAF lookups could hit. The cache grows only to what an
+/// app actually uses, so small apps still pay nothing.
+pub const PARA_CACHE_CAP: usize = 8192;
 /// Width quantisation step for the paragraph cache: widths falling in the same
 /// step share one shaping. Shaping always uses the step's floor, so a cached
 /// paragraph was wrapped at a width ≤ the requested one and can never overflow
@@ -370,6 +375,15 @@ impl TextSystem {
     }
 
     pub fn paragraph(&mut self, content: &InlineContent, width: Option<f32>) -> Rc<Paragraph> {
+        // `build()` ignores the width for nowrap/pre content (Wrap::None plus an
+        // unconstrained size), so every width yields the same paragraph. Normalize
+        // before keying so layout's min-content (Some(0)), max-content (None) and
+        // definite-width passes share one shaping instead of three.
+        let width = if matches!(content.container.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
+            None
+        } else {
+            width
+        };
         // When the text fits on one line and is left-aligned, the unconstrained layout is identical at
         // any wider width: share it instead of shaping again.
         if let Some(w) = width {
@@ -877,6 +891,29 @@ mod tests {
         assert_eq!(t.shape_count, n);
         t.measure(&c, Some(20.0));
         assert_eq!(t.shape_count, n + 1, "a width that forces wrapping needs its own layout");
+    }
+
+    #[test]
+    fn nowrap_widths_share_one_shaping() {
+        let mut t = TextSystem::new();
+        let mut s = ComputedStyle::default();
+        s.font_size = 16.0;
+        s.white_space = WhiteSpace::NoWrap;
+        let s = Arc::new(s);
+        let c = InlineContent::new(
+            vec![InlineRun { text: "nowrap text that would wrap if allowed".into(), style: s.clone(), node: 1, is_break: false }],
+            s,
+        );
+        let shapes = t.shape_count;
+        let reference = snapshot(&t.paragraph(&c, None));
+        // Layout asks for min-content (0), max-content (None) and a definite width;
+        // none of them can change a nowrap paragraph's geometry.
+        for w in [Some(0.0), Some(120.0), Some(600.0)] {
+            let p = t.paragraph(&c, w);
+            assert_eq!(snapshot(&p), reference, "nowrap geometry must not depend on width {w:?}");
+            assert_eq!(p.wrap, None, "nowrap paragraphs carry no wrapping constraint");
+        }
+        assert_eq!(t.shape_count, shapes + 1, "all widths share a single shaping");
     }
 
     #[test]

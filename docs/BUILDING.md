@@ -36,6 +36,26 @@ rendrix render     # headless page → PNG, PDF or a PNG frame sequence
 rendrix doctor     # Node, TypeScript, runtime, GPU adapter, project config
 ```
 
+### Cross-target packaging
+
+Packaging is target-driven, not host-driven:
+
+```sh
+rendrix package --target x86_64-unknown-linux-gnu --runtime ./runtimes/linux-x64/rendrix-runtime
+rendrix package --target aarch64-apple-darwin --runtime ./runtimes/darwin-arm64/rendrix-runtime
+```
+
+Supported target keys are `win32-x64`, `win32-arm64`, `darwin-x64`, `darwin-arm64`, `linux-x64` and
+`linux-arm64` (Rust triples and short aliases such as `macos-intel` also work). A cross-target build
+never picks up a local `engine/target` runtime, because that binary is host-only — pass `--runtime` or
+place binaries under `$RENDRIX_HOME/runtime/<platform>-<arch>/`.
+
+macOS produces `<name>.app/Contents/{MacOS,Resources,Info.plist,PkgInfo}` and a zipped `.app` for
+distribution; `--sign` signs the bundle and the notarization step submits the zip and staples the app.
+Linux produces a `.tar.gz` with `bin/`, a freedesktop `.desktop` entry and a hicolor icon. Pass a square
+`--icon <file>` (`.png` or `.icns`) to override the generated default icon on either platform. NSIS
+installers remain Windows-only.
+
 A project is `rendrix.json` (name, window size/title, permissions), an `index.html` (with `<link
 rel="stylesheet">` and `<script type="module" src="…ts|tsx">`), `src/**`, and any assets. `tsconfig.json`
 selects `"jsx": "react-jsx"` and `"jsxImportSource": "rendrix"`.

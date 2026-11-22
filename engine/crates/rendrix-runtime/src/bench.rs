@@ -71,6 +71,8 @@ struct StartupBreakdown {
     first_paint_ms: f64,
     first_gpu_submit_ms: f64,
     first_frame_shapes: usize,
+    first_cache_hits: usize,
+    first_cache_len: usize,
 }
 
 impl StartupBreakdown {
@@ -85,6 +87,7 @@ impl StartupBreakdown {
         println!("    first box build        {:8.2} ms", self.first_box_build_ms);
         println!("    first Taffy layout     {:8.2} ms", self.first_taffy_ms);
         println!("    first text shaping     {:8.2} ms  ({} paragraphs)", self.first_shape_ms, self.first_frame_shapes);
+        println!("    text cache on frame 1  {:8} hits, {} entries", self.first_cache_hits, self.first_cache_len);
         println!("    first paint (display)  {:8.2} ms", self.first_paint_ms);
         println!("  first GPU submit         {:8.2} ms  (render + device poll)", self.first_gpu_submit_ms);
         println!("  (text shaping overlaps layout + display paint; do not sum the indented rows)");
@@ -102,6 +105,8 @@ pub fn run(items: usize, iterations: usize) -> Result<(), String> {
     // the first GPU submit of the freshly built display list. These feed only the breakdown below.
     let fs = h.session.engine.borrow().stats.clone();
     let shapes_first = h.session.engine.borrow().text_system().shape_count;
+    let cache_first = h.session.engine.borrow().text_system().cache_hits;
+    let cache_len_first = h.session.engine.borrow().text_system().cache_len();
     let gpu_first = h.render_timed();
     h.settle(Duration::from_secs(1));
     let nodes = h.session.engine.borrow().doc.node_count();
@@ -125,6 +130,8 @@ pub fn run(items: usize, iterations: usize) -> Result<(), String> {
         first_paint_ms: fs.first_paint_micros as f64 / 1000.0,
         first_gpu_submit_ms: gpu_first.as_secs_f64() * 1000.0,
         first_frame_shapes: shapes_first,
+        first_cache_hits: cache_first,
+        first_cache_len: cache_len_first,
     }
     .print();
 

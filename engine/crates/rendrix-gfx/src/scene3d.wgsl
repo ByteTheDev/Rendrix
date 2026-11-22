@@ -36,19 +36,23 @@ struct MeshU {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<uniform> mesh: MeshU;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var samp: sampler;
 
 struct VSOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
 };
 
 @vertex
-fn vs_main(@location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>) -> VSOut {
+fn vs_main(@location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>) -> VSOut {
     let world = mesh.model * vec4<f32>(pos, 1.0);
     var out: VSOut;
     out.world = world.xyz;
     out.normal = normalize((mesh.normal_mat * vec4<f32>(nrm, 0.0)).xyz);
+    out.uv = uv;
     out.clip = frame.view_proj * world;
     return out;
 }
@@ -95,5 +99,13 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         lit = lit + lc * (albedo * max(dot(n, l), 0.0) + f0 * specular(n, l, v, shin, rough));
     }
 
-    return vec4<f32>(lit + mesh.emissive.rgb, mesh.base.a);
+    var col = lit + mesh.emissive.rgb;
+    var alpha = mesh.base.a;
+    // params.w carries the "has texture" flag; the Rust side binds the right texture.
+    if (mesh.params.w > 0.5) {
+        let t = textureSample(tex, samp, in.uv);
+        col = col * t.rgb;
+        alpha = alpha * t.a;
+    }
+    return vec4<f32>(col, alpha);
 }
