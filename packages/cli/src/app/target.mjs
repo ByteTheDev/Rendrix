@@ -7,6 +7,7 @@ import { BuildError } from './build.mjs';
 
 const TARGETS = new Map([
   ['win32-x64', { platform: 'win32', arch: 'x64' }],
+  ['win32-x86', { platform: 'win32', arch: 'x86' }],
   ['win32-arm64', { platform: 'win32', arch: 'arm64' }],
   ['darwin-x64', { platform: 'darwin', arch: 'x64' }],
   ['darwin-arm64', { platform: 'darwin', arch: 'arm64' }],
@@ -21,6 +22,14 @@ const ALIASES = new Map([
   ['windows', 'win32-x64'], ['win', 'win32-x64'], ['win32', 'win32-x64'],
   ['x86_64-pc-windows-msvc', 'win32-x64'], ['x86_64-pc-windows-gnu', 'win32-x64'],
   ['x86_64-windows', 'win32-x64'], ['win32-x86_64', 'win32-x64'],
+  // 32-bit x86 Windows. `x86_64`/`x86-64` are 64-bit and intentionally map to win32-x64 above.
+  ['win32-x86', 'win32-x86'], ['win32-ia32', 'win32-x86'],
+  ['x86', 'win32-x86'], ['ia32', 'win32-x86'],
+  ['i386', 'win32-x86'], ['i486', 'win32-x86'], ['i586', 'win32-x86'], ['i686', 'win32-x86'],
+  ['i386-pc-windows-msvc', 'win32-x86'], ['i686-pc-windows-msvc', 'win32-x86'],
+  ['i686-pc-windows-gnu', 'win32-x86'], ['i686-windows', 'win32-x86'],
+  ['x86-pc-windows-msvc', 'win32-x86'], ['windows-x86', 'win32-x86'],
+  ['windows-ia32', 'win32-x86'], ['win-x86', 'win32-x86'],
   ['aarch64-pc-windows-msvc', 'win32-arm64'], ['arm64-pc-windows-msvc', 'win32-arm64'],
   ['aarch64-windows', 'win32-arm64'], ['win32-aarch64', 'win32-arm64'],
   ['macos', 'darwin-arm64'], ['darwin', 'darwin-arm64'], ['mac', 'darwin-arm64'],
@@ -36,7 +45,11 @@ const ALIASES = new Map([
 ]);
 
 export function currentTarget() {
-  return fromKey(`${process.platform}-${process.arch}`) || {
+  // Node reports 32-bit x86 as `ia32`; the distribution key/arch field uses `x86`.
+  const arch = process.platform === 'win32' && (process.arch === 'ia32' || process.arch === 'x86')
+    ? 'x86'
+    : process.arch;
+  return fromKey(`${process.platform}-${arch}`) || {
     platform: process.platform, arch: process.arch,
     key: `${process.platform}-${process.arch}`, exe: process.platform === 'win32' ? '.exe' : '',
   };

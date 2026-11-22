@@ -31,6 +31,11 @@ rfd = "0.18"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 
+# rquickjs-sys 0.14 ships pregenerated QuickJS bindings for x64 and ARM64 Windows but not for
+# i686-pc-windows-msvc. Generate them at build time for 32-bit x86 instead (requires libclang).
+[target.'cfg(all(target_arch = "x86", target_os = "windows"))'.dependencies]
+rquickjs = { workspace = true, features = ["bindgen"] }
+
 [dev-dependencies]
 criterion.workspace = true
 

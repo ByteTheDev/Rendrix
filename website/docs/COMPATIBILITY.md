@@ -9,6 +9,11 @@ implemented (❌). Anything not listed is not supported. Tests live next to the 
 Verified platform: **Windows 11, NVIDIA GeForce RTX 3060, Vulkan** (windowed at 125 % DPI and headless).
 macOS and Linux share the same code (winit, wgpu, arboard) but have **not been built or run**.
 
+Architecture note: the verified Windows platform above is **x64**. Windows **ARM64** (`aarch64-pc-windows-msvc`,
+key `win32-arm64`) and **x86 / 32-bit** (`i686-pc-windows-msvc` / `i686-pc-windows-gnu`, aliases `x86` / `ia32`,
+key `win32-x86`) are supported packaging targets compile-checked in CI, but neither has been run on hardware
+in this environment — treat them as packaged/compile-checked, not hardware-verified.
+
 ## JavaScript and modules
 
 | Feature | Status | Notes |
@@ -116,10 +121,10 @@ subset only — no browser parity is claimed, and it is not the full web-platfor
 
 | Capability | Status |
 |---|---|
-| Native window (winit), DPI scaling, resize, title, close | ✅ Windows (verified); macOS/Linux ❓ untested |
-| Mouse, keyboard, wheel, text input, IME commit | ✅ Windows (IME composition itself untested) |
+| Native window (winit), DPI scaling, resize, title, close | ✅ Windows x64 (verified); Windows ARM64/x86, macOS/Linux ❓ untested on hardware |
+| Mouse, keyboard, wheel, text input, IME commit | ✅ Windows x64 (IME composition itself untested) |
 | System clipboard | ✅ via `arboard` (text) |
-| Single standalone executable (`rendrix package`) | ✅ Windows (13.8 MB, no external runtime); macOS `.app` bundle and Linux binary layouts wired in the CLI (built, not run here) |
+| Single standalone executable (`rendrix package`) | ✅ Windows x64 (13.8 MB, no external runtime); Windows ARM64/x86 packages plus macOS `.app` bundle and Linux binary layouts wired in the CLI (compile-checked in CI, not run here) |
 | File dialogs, multi-window, tray, global shortcuts, auto-update, accessibility tree | 🟡/❌ | Dialogs, multi-window, the update client and the accessibility bridge are implemented (rows below); tray and global shortcuts remain ❌ |
 | Native file dialogs | ✅ | `rendrix.dialog.showOpenDialog({ title, filters: [{ name, extensions }], multiple, properties: ['openDirectory'] })` and `showSaveDialog({ title, defaultPath, filters })` → `Promise<string[] | null>`; OS UI runs on a worker thread (never blocks the frame loop); `Headless::set_dialog_mock` / `host.set_dialog_mock` for tests |
 | External links | ✅ | `rendrix.shell.openExternal(url)` — `http(s)`/`mailto:` only, fire-and-forget |

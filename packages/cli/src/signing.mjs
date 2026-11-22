@@ -65,8 +65,20 @@ export function signtoolRoots() {
   return roots;
 }
 
+// Normalize the many names for "32-bit x86" onto the Windows SDK's `x86`
+// signtool folder. Node reports this host as `ia32`, while target resolution
+// and Rust toolchains call it `x86`/`i386`/`i686`. Unknown values fall back to
+// `x64`, matching the historical default in signtoolCandidates().
+export function normalizeSignArch(arch) {
+  const value = String(arch || '').trim().toLowerCase();
+  if (value === 'ia32' || value === 'x86' || value === 'i386' || value === 'i486' || value === 'i586' || value === 'i686') return 'x86';
+  if (value === 'arm64' || value === 'aarch64') return 'arm64';
+  return 'x64';
+}
+
 export function signtoolCandidates(roots, arch = process.arch) {
-  const order = arch === 'ia32' ? ['x86', 'x64', 'arm64'] : arch === 'arm64' ? ['arm64', 'x64', 'x86'] : ['x64', 'x86', 'arm64'];
+  const normalized = normalizeSignArch(arch);
+  const order = normalized === 'x86' ? ['x86', 'x64', 'arm64'] : normalized === 'arm64' ? ['arm64', 'x64', 'x86'] : ['x64', 'x86', 'arm64'];
   const candidates = [];
   const add = dir => { for (const a of order) candidates.push(path.join(dir, a, 'signtool.exe')); };
   for (const root of roots) {
@@ -88,6 +100,11 @@ export function findSigntool() {
     const probe = spawnSync('signtool', ['/?'], { stdio: 'ignore', windowsHide: true });
     if (probe.status === 0 || probe.status === 1) return 'signtool';
   } catch { /* not on PATH */ }
+  // RENDRIX_SIGNTOOL_ARCH selects signtool by *target* architecture instead of the host,
+  // which matters when cross-packaging (e.g. building win32-x86 from an x64 host):
+  //   RENDRIX_SIGNTOOL_ARCH=x86    -> prefer the SDK's x86 signtool (also ia32/i686)
+  //   RENDRIX_SIGNTOOL_ARCH=x64    -> prefer the SDK's x64 signtool
+  //   RENDRIX_SIGNTOOL_ARCH=arm64  -> prefer the SDK's arm64 signtool
   const arch = process.env.RENDRIX_SIGNTOOL_ARCH || process.arch;
   return signtoolCandidates(signtoolRoots(), arch).find(p => fs.existsSync(p)) || null;
 }

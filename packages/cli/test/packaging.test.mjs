@@ -11,6 +11,24 @@ import { splitCommand, signtoolRoots, signtoolCandidates } from '../src/signing.
 
 const cleanup = dir => rm(dir, { recursive: true, force: true });
 
+// Temporarily override host platform/arch so host-dependent logic can be exercised in isolation.
+// Both properties are configurable in Node; the original descriptors are always restored.
+function withHost(platform, arch, fn) {
+  const platformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
+  const archDesc = Object.getOwnPropertyDescriptor(process, 'arch');
+  const define = (name, value) => Object.defineProperty(process, name, {
+    value, configurable: true, enumerable: true, writable: false,
+  });
+  try {
+    define('platform', platform);
+    define('arch', arch);
+    return fn();
+  } finally {
+    Object.defineProperty(process, 'platform', platformDesc);
+    Object.defineProperty(process, 'arch', archDesc);
+  }
+}
+
 test('resolveTarget accepts distribution keys, Rust triples and short aliases', () => {
   assert.deepEqual(resolveTarget('darwin-arm64'), { platform: 'darwin', arch: 'arm64', key: 'darwin-arm64', exe: '' });
   assert.deepEqual(resolveTarget('aarch64-apple-darwin'), resolveTarget('macos'));
@@ -18,7 +36,21 @@ test('resolveTarget accepts distribution keys, Rust triples and short aliases', 
   assert.deepEqual(resolveTarget('X86_64-UNKNOWN-LINUX-GNU'), resolveTarget('linux-x64'));
   assert.deepEqual(resolveTarget(undefined), currentTarget());
   assert.throws(() => resolveTarget('plan9-arm64'), /unknown target.*plan9-arm64/);
-  assert.equal(supportedTargets().length, 6);
+  assert.equal(supportedTargets().length, 7);
+  assert.ok(supportedTargets().includes('win32-x86'));
+});
+
+test('resolveTarget recognizes 32-bit x86 Windows names without confusing x86_64', () => {
+  const expected = { platform: 'win32', arch: 'x86', key: 'win32-x86', exe: '.exe' };
+  for (const alias of [
+    'win32-x86', 'win32-ia32', 'ia32', 'x86', 'i386', 'i486', 'i586', 'i686',
+    'i386-pc-windows-msvc', 'i686-pc-windows-msvc', 'i686-pc-windows-gnu',
+    'i686-windows', 'x86-pc-windows-msvc', 'windows-x86', 'windows-ia32', 'win-x86',
+  ]) {
+    assert.deepEqual(resolveTarget(alias), expected, `alias '${alias}'`);
+  }
+  assert.equal(resolveTarget('x86_64-pc-windows-msvc').key, 'win32-x64', 'x86_64 stays 64-bit');
+  assert.equal(resolveTarget('win32-x86_64').key, 'win32-x64', 'win32-x86_64 stays 64-bit');
 });
 
 test('cross-target detection compares target to the host', () => {
@@ -26,6 +58,26 @@ test('cross-target detection compares target to the host', () => {
   assert.equal(isCrossTarget(resolveTarget(host.key)), false);
   const other = supportedTargets().find(k => k !== host.key);
   assert.equal(isCrossTarget(resolveTarget(other)), true);
+});
+
+test('currentTarget maps a 32-bit x86 Windows host to win32-x86', () => {
+  const expected = { platform: 'win32', arch: 'x86', key: 'win32-x86', exe: '.exe' };
+  withHost('win32', 'ia32', () => assert.deepEqual(currentTarget(), expected));
+  withHost('win32', 'x86', () => assert.deepEqual(currentTarget(), expected));
+  // Non-Windows hosts keep the existing fallback behavior unchanged.
+  withHost('linux', 'ia32', () => {
+    assert.deepEqual(currentTarget(), { platform: 'linux', arch: 'ia32', key: 'linux-ia32', exe: '' });
+  });
+});
+
+test('isCrossTarget treats win32-x86 as distinct from other Windows targets', () => {
+  for (const hostArch of ['ia32', 'x86']) {
+    withHost('win32', hostArch, () => {
+      assert.equal(isCrossTarget(resolveTarget('win32-x86')), false, `host arch ${hostArch}`);
+      assert.equal(isCrossTarget(resolveTarget('win32-x64')), true, `host arch ${hostArch}`);
+      assert.equal(isCrossTarget(resolveTarget('win32-arm64')), true, `host arch ${hostArch}`);
+    });
+  }
 });
 
 test('splitCommand tokenizes quotes without a shell', () => {
@@ -65,7 +117,7 @@ test('crc32, zip and tar writers produce the expected framing', () => {
   assert.equal(zip.subarray(30, 32).toString(), 'a/', 'UTF-8 POSIX name');
   assert.ok(zip.subarray(zip.length - 22, zip.length - 18).equals(Buffer.from([0x50, 0x4b, 0x05, 0x06])), 'EOCD');
   const h = tarHeader('bin/app', 5, 0o755);
-  assert.equal(h.subarray(257, 263).toString(), 'ustar\0' + '00');
+  assert.equal(h.subarray(257, 265).toString(), 'ustar\0' + '00');
   assert.equal(h[156], 0x30, 'regular file typeflag');
   const tar = tarGz([{ name: 'bin/app', data: 'hello' }]);
   assert.equal(tar[0], 0x1f, 'gzip magic');
@@ -102,6 +154,25 @@ test('packExecutable writes a re-packable trailer for a target', async () => {
     bytes = await readFile(out);
     assert.ok(bytes.subarray(0, 12).equals(Buffer.from('fake-runtime')), 'old trailer removed');
     assert.ok(bytes.toString('utf8').includes('"two"'));
+  } finally { await cleanup(dir); }
+});
+
+test('packExecutable writes a re-packable trailer for win32-x86', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'rendrix-pack-x86-'));
+  try {
+    const runtime = path.join(dir, 'rendrix-runtime.exe');
+    await writeFile(runtime, Buffer.from('fake-x86-runtime'));
+    const out = path.join(dir, 'app.exe');
+    const bundle = { format: 'rendrix-app/1', name: 'x86-app' };
+    await packExecutable(runtime, bundle, out, resolveTarget('win32-x86'));
+    let bytes = await readFile(out);
+    assert.ok(bytes.subarray(bytes.length - 8).equals(MAGIC));
+    assert.equal(bytes.readBigUInt64LE(bytes.length - 16), BigInt(JSON.stringify(bundle).length));
+    // Re-pack via a Rust-triple alias to prove the trailer is removable and stays win32.
+    await packExecutable(out, { format: 'rendrix-app/1', name: 'x86-app-2' }, out, resolveTarget('i686-pc-windows-msvc'));
+    bytes = await readFile(out);
+    assert.ok(bytes.subarray(0, 16).equals(Buffer.from('fake-x86-runtime')), 'old trailer removed');
+    assert.ok(bytes.toString('utf8').includes('"x86-app-2"'));
   } finally { await cleanup(dir); }
 });
 

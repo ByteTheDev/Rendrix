@@ -14,6 +14,9 @@ and runtime. See `docs/ENGINE_ASSESSMENT.md`.
   transitions/animations, timers/`requestAnimationFrame`, images (see `docs/COMPATIBILITY.md`).
 - New CLI: `rendrix init | dev | build | run | check | package | doctor` with TypeScript type-checking, TSX
   (`rendrix/jsx-runtime`), `node_modules` ESM resolution and `.rdxapp` / standalone executable output.
+- Multi-architecture Windows packaging: `--target win32-x86` (32-bit, `i686-pc-windows-msvc` /
+  `i686-pc-windows-gnu`, aliases `x86` / `ia32`) joins `win32-x64` and `win32-arm64`; x64 is hardware-verified,
+  the other two are compile-checked in CI but not run here.
 - `examples/app-counter` and a scripted end-to-end test (`npm run e2e`); `npm run bench`.
 - Offscreen compositing layers: real `backdrop-filter`, true Gaussian `filter: blur()` and per-pixel
   `clip-path: polygon()` (ordinary frames keep the single-draw-call path).

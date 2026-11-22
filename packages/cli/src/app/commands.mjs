@@ -141,7 +141,7 @@ export async function pack(dir, opts = {}) {
     const scriptPath = path.join(path.dirname(out), `${project.name}.nsi`);
     const setupOut = path.join(path.dirname(out), `${project.name}-setup-${version}.exe`);
     info(`building NSIS installer → ${path.relative(process.cwd(), setupOut)}`);
-    await buildNsis({ name: project.name, version, executable: out, output: setupOut, publishUrl: opts.publishUrl || '', certificateSubjectName: process.env.RENDRIX_CERT_SUBJECT || '' }, scriptPath);
+    await buildNsis({ name: project.name, version, executable: out, output: setupOut, publishUrl: opts.publishUrl || '', certificateSubjectName: process.env.RENDRIX_CERT_SUBJECT || '', arch: target.arch }, scriptPath);
     installer = setupOut;
     artifacts.push(installer);
   }
