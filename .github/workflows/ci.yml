@@ -21,8 +21,14 @@ jobs:
       - name: Linux system libraries (windowing, clipboard, software Vulkan)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libxcb1-dev mesa-vulkan-drivers libudev-dev
+      # The GPU-heavy gfx suite creates a fresh wgpu instance/device per test. On Linux's
+      # headless software drivers (lavapipe/X11) concurrent device creation intermittently
+      # segfaults the test binary, so run that package's tests serially. It is a separate
+      # process from the rest of the workspace, which stays parallel.
       - name: Rust tests (GPU tests skip themselves when no adapter exists)
-        run: cargo test --workspace --manifest-path engine/Cargo.toml
+        run: |
+          cargo test --workspace --exclude rendrix-gfx --manifest-path engine/Cargo.toml
+          cargo test -p rendrix-gfx --manifest-path engine/Cargo.toml -- --test-threads=1
       - name: Build the release runtime
         run: cargo build --release -p rendrix-runtime --manifest-path engine/Cargo.toml
       - name: CLI tests (uses the runtime built above)

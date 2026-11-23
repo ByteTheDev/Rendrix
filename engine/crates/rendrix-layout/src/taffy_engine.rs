@@ -193,10 +193,6 @@ impl TaffyEngine {
             LayoutKind::Text(c) => Some(Ctx::Text(c.clone())),
             LayoutKind::Replaced { width, height } => Some(Ctx::Replaced(*width, *height)),
         };
-        let (changed_style, changed_kind) = match self.nodes.get(&n.id) {
-            Some(c) => (c.style != style, c.kind_sig != kind_sig),
-            None => (true, true),
-        };
         // A dirty parent only forces its children through the full path when the parent's
         // grid-template-areas changed: `parent_areas` is the one parent-derived input to a
         // child's `to_taffy` conversion (a named `grid-area` resolves against it), and the
