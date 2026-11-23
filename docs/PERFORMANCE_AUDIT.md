@@ -231,7 +231,8 @@ and the new breakdown rows attribute them exactly).
 
 - First frame was ~85% text shaping: 416.0 ms total, of which 354.4 ms shaped 4,017
   paragraphs (~2 per unique content: min-content at width 0 + max-content unconstrained).
-  Taffy's own solve was ~27 ms; restyle ~30 ms; paint and first GPU submit ≤5 ms.
+  Taffy's own solve was ~29 ms (383.4 layout minus the shaping inside it); restyle ~30 ms;
+  paint and first GPU submit ≤5 ms.
 - A probe built each paragraph twice — fresh full shape vs clone-of-shaped-buffer + re-wrap —
   and compared full glyph geometry: **bit-for-bit identical** (widths, line counts, glyph
   positions, metadata), with the rewrap at ~2–25 µs vs ~12–240 µs per full shape.
