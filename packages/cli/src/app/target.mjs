@@ -12,7 +12,10 @@ const TARGETS = new Map([
   ['darwin-x64', { platform: 'darwin', arch: 'x64' }],
   ['darwin-arm64', { platform: 'darwin', arch: 'arm64' }],
   ['linux-x64', { platform: 'linux', arch: 'x64' }],
+  ['linux-x86', { platform: 'linux', arch: 'x86' }],
   ['linux-arm64', { platform: 'linux', arch: 'arm64' }],
+  ['linux-armv7', { platform: 'linux', arch: 'armv7' }],
+  ['linux-riscv64', { platform: 'linux', arch: 'riscv64' }],
 ]);
 
 // Rust triples and short aliases → the distribution key above. `macos` is accepted as an
@@ -42,13 +45,28 @@ const ALIASES = new Map([
   ['x86_64-unknown-linux-musl', 'linux-x64'], ['x86_64-linux', 'linux-x64'],
   ['aarch64-unknown-linux-gnu', 'linux-arm64'], ['aarch64-unknown-linux-musl', 'linux-arm64'],
   ['arm64-unknown-linux-gnu', 'linux-arm64'], ['aarch64-linux', 'linux-arm64'],
+  // 32-bit x86 Linux. The bare `i386`/`i486`/`i586`/`i686` names stay Windows aliases (the
+  // win32-x86 block above claimed them first), so the Linux key is reached through its Rust
+  // triples or an explicit `linux-x86`-family name.
+  ['linux-x86', 'linux-x86'], ['linux-ia32', 'linux-x86'],
+  ['i686-unknown-linux-gnu', 'linux-x86'], ['i686-unknown-linux-musl', 'linux-x86'],
+  ['i686-linux', 'linux-x86'], ['x86-linux', 'linux-x86'],
+  // 32-bit ARM Linux (Raspberry Pi armhf). Node reports this host arch as `arm`.
+  ['linux-armv7', 'linux-armv7'], ['armv7', 'linux-armv7'], ['armv7l', 'linux-armv7'],
+  ['armhf', 'linux-armv7'], ['arm-linux', 'linux-armv7'],
+  ['armv7-unknown-linux-gnueabihf', 'linux-armv7'], ['armv7-unknown-linux-musleabihf', 'linux-armv7'],
+  // 64-bit RISC-V Linux. Both the `riscv64gc-*` and the historical `riscv64-*` triple resolve.
+  ['linux-riscv64', 'linux-riscv64'], ['riscv64', 'linux-riscv64'],
+  ['riscv64gc', 'linux-riscv64'], ['riscv64-linux', 'linux-riscv64'],
+  ['riscv64-unknown-linux-gnu', 'linux-riscv64'], ['riscv64gc-unknown-linux-gnu', 'linux-riscv64'],
 ]);
 
 export function currentTarget() {
-  // Node reports 32-bit x86 as `ia32`; the distribution key/arch field uses `x86`.
-  const arch = process.platform === 'win32' && (process.arch === 'ia32' || process.arch === 'x86')
-    ? 'x86'
-    : process.arch;
+  // Node reports 32-bit x86 hosts as `ia32` and 32-bit ARM hosts as `arm`; the distribution
+  // key/arch field uses `x86` / `armv7`.
+  let arch = process.arch;
+  if (process.platform === 'win32' && (arch === 'ia32' || arch === 'x86')) arch = 'x86';
+  else if (process.platform === 'linux' && arch === 'arm') arch = 'armv7';
   return fromKey(`${process.platform}-${arch}`) || {
     platform: process.platform, arch: process.arch,
     key: `${process.platform}-${process.arch}`, exe: process.platform === 'win32' ? '.exe' : '',

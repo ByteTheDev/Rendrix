@@ -50,8 +50,10 @@ npm run wpt                           # curated CSS layout conformance subset
 Create your own: `rendrix init my-app && cd my-app && rendrix dev`. Ship it: `rendrix package` produces one
 standalone executable (≈13.8 MB on Windows) that needs no Node, Bun or browser. Packaging is target-driven:
 `rendrix package --target win32-x86` (also `i686-pc-windows-msvc` / `ia32`) cross-packages 32-bit Windows
-alongside `win32-x64` and `win32-arm64`; x64 is the only architecture verified on hardware here. Headless
-rendering to PNG, PDF or a PNG frame sequence: `rendrix render page.html -o out.png`.
+alongside `win32-x64` and `win32-arm64`; Linux covers `linux-x64` / `linux-arm64` plus the 32-bit
+`linux-x86` (`i686-unknown-linux-gnu`), `linux-armv7` (`armv7-unknown-linux-gnueabihf`, the Raspberry Pi
+32-bit target) and `linux-riscv64` (`riscv64gc-unknown-linux-gnu`) keys; x64 is the only architecture
+verified on hardware here. Headless rendering to PNG, PDF or a PNG frame sequence: `rendrix render page.html -o out.png`.
 
 CLI: `init`, `dev`, `build`, `run`, `check`, `package`, `render`, `doctor`. Details in
 [docs/BUILDING.md](docs/BUILDING.md).

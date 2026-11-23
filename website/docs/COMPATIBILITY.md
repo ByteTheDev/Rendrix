@@ -14,6 +14,12 @@ key `win32-arm64`) and **x86 / 32-bit** (`i686-pc-windows-msvc` / `i686-pc-windo
 key `win32-x86`) are supported packaging targets compile-checked in CI, but neither has been run on hardware
 in this environment — treat them as packaged/compile-checked, not hardware-verified.
 
+The same applies to the non-x64/arm64 Linux keys: `linux-x86` (`i686-unknown-linux-gnu`), `linux-armv7`
+(`armv7-unknown-linux-gnueabihf`, aliases `armv7` / `armhf`, the Raspberry Pi 32-bit target) and
+`linux-riscv64` (`riscv64gc-unknown-linux-gnu`, alias `riscv64`) are **packaging targets** — the CLI resolves
+and cross-packages them (target resolution is test-covered), and CI compile-checks the runtime for each
+triple, but no Linux build of any architecture has been built or run on hardware in this environment.
+
 ## JavaScript and modules
 
 | Feature | Status | Notes |

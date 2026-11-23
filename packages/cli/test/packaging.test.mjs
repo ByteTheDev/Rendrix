@@ -36,8 +36,11 @@ test('resolveTarget accepts distribution keys, Rust triples and short aliases', 
   assert.deepEqual(resolveTarget('X86_64-UNKNOWN-LINUX-GNU'), resolveTarget('linux-x64'));
   assert.deepEqual(resolveTarget(undefined), currentTarget());
   assert.throws(() => resolveTarget('plan9-arm64'), /unknown target.*plan9-arm64/);
-  assert.equal(supportedTargets().length, 7);
+  assert.equal(supportedTargets().length, 10);
   assert.ok(supportedTargets().includes('win32-x86'));
+  assert.ok(supportedTargets().includes('linux-x86'));
+  assert.ok(supportedTargets().includes('linux-armv7'));
+  assert.ok(supportedTargets().includes('linux-riscv64'));
 });
 
 test('resolveTarget recognizes 32-bit x86 Windows names without confusing x86_64', () => {
@@ -51,6 +54,37 @@ test('resolveTarget recognizes 32-bit x86 Windows names without confusing x86_64
   }
   assert.equal(resolveTarget('x86_64-pc-windows-msvc').key, 'win32-x64', 'x86_64 stays 64-bit');
   assert.equal(resolveTarget('win32-x86_64').key, 'win32-x64', 'win32-x86_64 stays 64-bit');
+});
+
+test('resolveTarget recognizes 32-bit and RISC-V Linux names without touching the x86_64/arm64 keys', () => {
+  const x86 = { platform: 'linux', arch: 'x86', key: 'linux-x86', exe: '' };
+  for (const alias of [
+    'linux-x86', 'linux-ia32', 'i686-unknown-linux-gnu', 'i686-unknown-linux-musl',
+    'i686-linux', 'x86-linux',
+  ]) {
+    assert.deepEqual(resolveTarget(alias), x86, `alias '${alias}'`);
+  }
+  // The bare i*N6 names belong to win32-x86 (claimed there first); only the Linux triples
+  // and `linux-*` forms reach linux-x86.
+  assert.equal(resolveTarget('i686').key, 'win32-x86', 'bare i686 stays a Windows alias');
+  assert.equal(resolveTarget('x86_64-unknown-linux-gnu').key, 'linux-x64', 'x86_64 Linux stays 64-bit');
+
+  const armv7 = { platform: 'linux', arch: 'armv7', key: 'linux-armv7', exe: '' };
+  for (const alias of [
+    'linux-armv7', 'armv7', 'armv7l', 'armhf', 'arm-linux',
+    'armv7-unknown-linux-gnueabihf', 'armv7-unknown-linux-musleabihf',
+  ]) {
+    assert.deepEqual(resolveTarget(alias), armv7, `alias '${alias}'`);
+  }
+  assert.equal(resolveTarget('aarch64-unknown-linux-gnu').key, 'linux-arm64', '64-bit ARM Linux is unchanged');
+
+  const riscv64 = { platform: 'linux', arch: 'riscv64', key: 'linux-riscv64', exe: '' };
+  for (const alias of [
+    'linux-riscv64', 'riscv64', 'riscv64gc', 'riscv64-linux',
+    'riscv64-unknown-linux-gnu', 'riscv64gc-unknown-linux-gnu',
+  ]) {
+    assert.deepEqual(resolveTarget(alias), riscv64, `alias '${alias}'`);
+  }
 });
 
 test('cross-target detection compares target to the host', () => {
@@ -70,6 +104,14 @@ test('currentTarget maps a 32-bit x86 Windows host to win32-x86', () => {
   });
 });
 
+test('currentTarget maps a 32-bit ARM Linux host to linux-armv7', () => {
+  const expected = { platform: 'linux', arch: 'armv7', key: 'linux-armv7', exe: '' };
+  // Node reports 32-bit ARM hosts as `arm`; the distribution key uses `armv7`.
+  withHost('linux', 'arm', () => assert.deepEqual(currentTarget(), expected));
+  // 64-bit ARM hosts are unaffected.
+  withHost('linux', 'arm64', () => assert.equal(currentTarget().key, 'linux-arm64'));
+});
+
 test('isCrossTarget treats win32-x86 as distinct from other Windows targets', () => {
   for (const hostArch of ['ia32', 'x86']) {
     withHost('win32', hostArch, () => {
@@ -78,6 +120,15 @@ test('isCrossTarget treats win32-x86 as distinct from other Windows targets', ()
       assert.equal(isCrossTarget(resolveTarget('win32-arm64')), true, `host arch ${hostArch}`);
     });
   }
+});
+
+test('isCrossTarget treats linux-armv7 as distinct from other Linux targets', () => {
+  withHost('linux', 'arm', () => {
+    assert.equal(isCrossTarget(resolveTarget('linux-armv7')), false);
+    assert.equal(isCrossTarget(resolveTarget('linux-x64')), true);
+    assert.equal(isCrossTarget(resolveTarget('linux-x86')), true);
+    assert.equal(isCrossTarget(resolveTarget('linux-riscv64')), true);
+  });
 });
 
 test('splitCommand tokenizes quotes without a shell', () => {

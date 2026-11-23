@@ -46,18 +46,40 @@ Packaging is target-driven, not host-driven:
 rendrix package --target x86_64-unknown-linux-gnu --runtime ./runtimes/linux-x64/rendrix-runtime
 rendrix package --target aarch64-apple-darwin --runtime ./runtimes/darwin-arm64/rendrix-runtime
 rendrix package --target i686-pc-windows-msvc --runtime ./runtimes/win32-x86/rendrix-runtime.exe  # 32-bit Windows
+rendrix package --target armv7-unknown-linux-gnueabihf --runtime ./runtimes/linux-armv7/rendrix-runtime  # Raspberry Pi (32-bit)
 ```
 
 Supported target keys are `win32-x64`, `win32-arm64`, `win32-x86`, `darwin-x64`, `darwin-arm64`,
-`linux-x64` and `linux-arm64` (Rust triples and short aliases such as `macos-intel` also work). Windows
-x86 is the 32-bit target: `i686-pc-windows-msvc` / `i686-pc-windows-gnu` (aliases `x86` / `ia32`) map to
-the `win32-x86` key, alongside `win32-x64` and `win32-arm64`. A cross-target build never picks up a local
-`engine/target` runtime, because that binary is host-only — pass `--runtime` or place binaries under
+`linux-x64`, `linux-x86`, `linux-arm64`, `linux-armv7` and `linux-riscv64` (Rust triples and short
+aliases such as `macos-intel` also work). Windows x86 is the 32-bit target:
+`i686-pc-windows-msvc` / `i686-pc-windows-gnu` (aliases `x86` / `ia32`) map to the `win32-x86` key,
+alongside `win32-x64` and `win32-arm64`. Linux adds three packaging targets beyond x64/arm64: 32-bit
+x86 (`i686-unknown-linux-gnu`), 32-bit ARM (`armv7-unknown-linux-gnueabihf`, aliases `armv7` /
+`armhf`, the Raspberry Pi 32-bit target) and 64-bit RISC-V (`riscv64gc-unknown-linux-gnu`, alias
+`riscv64`); Node on a 32-bit ARM Linux host reports arch `arm`, which the CLI detects as
+`linux-armv7`. A cross-target build never picks up a local `engine/target` runtime, because that
+binary is host-only — pass `--runtime` or place binaries under
 `$RENDRIX_HOME/runtime/<platform>-<arch>/`.
 
 Building the engine for `i686-pc-windows-msvc` needs **libclang (LLVM)** on the build machine: `rquickjs-sys`
 ships no pregenerated bindings for that triple, so the `bindgen` feature is enabled automatically for 32-bit
 Windows. Set `LIBCLANG_PATH` if libclang is not on the default search path.
+
+Cross-compiling the engine for the extra Linux architectures needs the matching cross C toolchain, because
+`rquickjs` (QuickJS) and `ring` compile C code for the target; `rquickjs-sys` 0.14 does ship pregenerated
+bindings for all three triples, so no libclang step is involved. On Debian/Ubuntu:
+
+```sh
+sudo apt-get install gcc-arm-linux-gnueabihf libudev-dev  # or gcc-i686-linux-gnu / gcc-riscv64-linux-gnu
+export CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc
+export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+export PKG_CONFIG_ALLOW_CROSS=1                          # gilrs' libudev-sys build script probes pkg-config
+cargo check --target armv7-unknown-linux-gnueabihf -p rendrix-runtime --manifest-path engine/Cargo.toml
+```
+
+`cargo check` runs build scripts but never links, so the host's pkg-config metadata satisfies libudev.
+On a Windows or macOS host there is no practical way to install the Linux cross C compilers, so those
+checks are owned by the `linux-cross-compile` CI job (`.github/workflows/ci.yml`).
 
 macOS produces `<name>.app/Contents/{MacOS,Resources,Info.plist,PkgInfo}` and a zipped `.app` for
 distribution; `--sign` signs the bundle and the notarization step submits the zip and staples the app.

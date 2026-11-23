@@ -17,6 +17,11 @@ and runtime. See `docs/ENGINE_ASSESSMENT.md`.
 - Multi-architecture Windows packaging: `--target win32-x86` (32-bit, `i686-pc-windows-msvc` /
   `i686-pc-windows-gnu`, aliases `x86` / `ia32`) joins `win32-x64` and `win32-arm64`; x64 is hardware-verified,
   the other two are compile-checked in CI but not run here.
+- Multi-architecture Linux packaging: `--target linux-x86` (`i686-unknown-linux-gnu`), `linux-armv7`
+  (`armv7-unknown-linux-gnueabihf`, aliases `armv7` / `armhf`, the Raspberry Pi 32-bit target; 32-bit ARM
+  hosts, which Node reports as arch `arm`, auto-detect to it) and `linux-riscv64`
+  (`riscv64gc-unknown-linux-gnu`, alias `riscv64`) join `linux-x64` / `linux-arm64`; all three are
+  compile-checked in CI only, not run on hardware here.
 - `examples/app-counter` and a scripted end-to-end test (`npm run e2e`); `npm run bench`.
 - Offscreen compositing layers: real `backdrop-filter`, true Gaussian `filter: blur()` and per-pixel
   `clip-path: polygon()` (ordinary frames keep the single-draw-call path).

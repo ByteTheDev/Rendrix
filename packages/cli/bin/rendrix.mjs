@@ -27,8 +27,11 @@ Usage:
 
 Options (any command that takes [dir] defaults to the current directory):
   --target TRIPLE                                    package for another OS/arch (e.g. aarch64-apple-darwin,
-                                                     x86_64-unknown-linux-gnu, i686-pc-windows-msvc / win32-x86
-                                                     for 32-bit Windows); needs --runtime or RENDRIX_HOME
+                                                     x86_64-unknown-linux-gnu, i686-pc-windows-msvc / win32-x86,
+                                                     i686-unknown-linux-gnu / linux-x86,
+                                                     armv7-unknown-linux-gnueabihf / linux-armv7,
+                                                     riscv64gc-unknown-linux-gnu / linux-riscv64);
+                                                     needs --runtime or RENDRIX_HOME
   --icon FILE                                        square .png or .icns used for the macOS/Linux app icon
   --headless / --screenshot <png> / --script <json>   passed through to the runtime by \`run\`
 `;
