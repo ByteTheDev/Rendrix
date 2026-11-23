@@ -9,6 +9,7 @@ use rendrix_css::{FontStyle, TextAlign, TextTransform, WhiteSpace, WordBreak};
 use rendrix_layout::{InlineContent, TextMeasurer};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct GlyphInfo {
     pub glyph: cosmic_text::LayoutGlyph,
@@ -77,6 +78,23 @@ pub const PARA_CACHE_CAP: usize = 8192;
 /// it (at most it keeps one extra break near a bucket boundary).
 pub const PARA_CACHE_QUANT: f32 = 0.5;
 
+/// Minimum number of not-yet-shaped contents before [`TextSystem::prewarm_parallel`]
+/// spawns worker threads. Below this, on-demand shaping beats thread-pool overhead.
+pub const PREWARM_PARALLEL_MIN: usize = 16;
+
+/// Compile-time proof that the prewarm pipeline can cross threads: the font database,
+/// built paragraphs and inline contents are plain data (`Arc` contents are shared, not
+/// owned by the workers). `FontSystem` itself is intentionally absent — it holds a
+/// `Box<dyn Fallback>` and stays on its owning thread.
+#[allow(dead_code)]
+fn assert_prewarm_types_are_send() {
+    fn is_send<T: Send>() {}
+    is_send::<fontdb::Database>();
+    is_send::<Paragraph>();
+    is_send::<HashSet<String>>();
+    is_send::<Arc<InlineContent>>();
+}
+
 /// Quantise a layout width down to the cache grid. Non-finite/negative widths
 /// (should not happen) map to zero instead of producing garbage keys.
 fn quantize_width(w: f32) -> f32 {
@@ -97,20 +115,57 @@ struct CacheEntry {
     last_used: u64,
 }
 
+/// Clone source for a content: the first fully shaped paragraph built for it. Every later
+/// width variant (min-content, max-content, definite) re-wraps a clone of its `Buffer`
+/// instead of re-running rustybuzz, which cosmic-text makes safe because `BufferLine`
+/// clones carry the cached `ShapeLine` and `set_size` only re-runs the (cheap) wrapping.
+struct TemplateEntry {
+    para: Rc<Paragraph>,
+    last_used: u64,
+}
+
+/// What the font-DB loader thread sends back to the owning `TextSystem`.
+struct FontDbLoad {
+    cache_hit: bool,
+    locale: String,
+    db: fontdb::Database,
+    /// Loader-side duration, so the reported figure is the load itself, not the
+    /// main-thread wait for it.
+    elapsed_nanos: u64,
+}
+
+/// Font-DB loading state. `new()` (native) starts the load on a background thread so it
+/// overlaps DOM parse + JS evaluation on the startup path; `ensure_loaded` joins it before
+/// the first font use. Nothing outside `TextSystem` can observe the difference.
+enum FontState {
+    Loading(std::sync::mpsc::Receiver<FontDbLoad>),
+    Loaded,
+}
+
 pub struct TextSystem {
-    pub fonts: FontSystem,
+    /// Private: every consumer goes through `ensure_loaded` so the background DB load
+    /// cannot be bypassed. Same-crate tests use the `fonts()` accessor.
+    fonts: FontSystem,
+    font_state: FontState,
     swash: SwashCache,
     cache: HashMap<ParaKey, CacheEntry>,
+    /// One fully shaped paragraph per content key (the rewrap clone source).
+    templates: HashMap<u64, TemplateEntry>,
     clock: u64,
     installed: HashSet<String>,
     /// Stats for tests/profiling.
+    /// Full rustybuzz shapes (one per content; later widths re-wrap instead).
     pub shape_count: usize,
+    /// Paragraph builds served by cloning a template and re-wrapping (no rustybuzz).
+    pub rewrap_count: usize,
     /// Paragraph-cache lookups served without shaping.
     pub cache_hits: usize,
-    /// Cumulative nanoseconds spent inside [`TextSystem::build`] (the actual cosmic-text shaping).
-    /// Additive and monotonic; `rendrix-core` snapshots it per frame to attribute startup/first-frame
-    /// cost to text shaping without changing how paragraphs are cached or measured.
+    /// Cumulative nanoseconds spent in full rustybuzz shaping ([`TextSystem::build`]'s
+    /// expensive path). Additive and monotonic; `rendrix-core` snapshots it per frame to
+    /// attribute startup/first-frame cost to text shaping.
     pub shape_nanos: u64,
+    /// Cumulative nanoseconds spent in template clone + re-wrap builds.
+    pub rewrap_nanos: u64,
 }
 
 // Phase timers for the startup breakdown in `rendrix-runtime bench`. They live here because the
@@ -137,6 +192,138 @@ impl Default for TextSystem {
     }
 }
 
+/// Exact replica of what `FontSystem::new()` does to the database on a cache miss, minus
+/// the parts that need the `FontSystem` itself: scan system fonts, then install the same
+/// generic-family defaults cosmic-text configures (and that `load_font_db_cache` mirrors
+/// on the way back in). Building the `Database` off the main thread and the `FontSystem`
+/// on it is bit-for-bit what `FontSystem::new()` would have produced.
+fn scan_font_db() -> fontdb::Database {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    db.set_monospace_family("Noto Sans Mono");
+    db.set_sans_serif_family("Open Sans");
+    db.set_serif_family("DejaVu Serif");
+    db
+}
+
+/// Cache hit or full scan, in either case producing the same database `FontSystem::new()`
+/// would have. Runs on the loader thread; the result is plain data and crosses back safely.
+fn load_font_db(locale: &str) -> FontDbLoad {
+    let start = std::time::Instant::now();
+    if let Some(db) = load_font_db_cache(locale) {
+        return FontDbLoad { cache_hit: true, locale: locale.to_string(), db, elapsed_nanos: start.elapsed().as_nanos() as u64 };
+    }
+    let db = scan_font_db();
+    save_font_db_cache(locale, &db);
+    FontDbLoad { cache_hit: false, locale: locale.to_string(), db, elapsed_nanos: start.elapsed().as_nanos() as u64 }
+}
+
+fn build_installed(fonts: &FontSystem) -> HashSet<String> {
+    fonts
+        .db()
+        .faces()
+        .flat_map(|f| f.families.iter().map(|(n, _)| n.to_lowercase()).collect::<Vec<_>>())
+        .collect()
+}
+
+impl TextSystem {
+    /// Web: browsers expose no system fonts to a worker, so ship a default family (Inter, SIL OFL,
+    /// see `fonts/OFL.txt`) and map every generic family to it. Apps add their own with `@font-face`.
+    /// Synchronous: workers have no thread spawn, and the embedded DB is already in memory.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new() -> Self {
+        let start = std::time::Instant::now();
+        let mut db = fontdb::Database::new();
+        db.load_font_data(include_bytes!("../fonts/Inter_400Regular.ttf").to_vec());
+        db.load_font_data(include_bytes!("../fonts/Inter_700Bold.ttf").to_vec());
+        db.set_sans_serif_family("Inter");
+        db.set_serif_family("Inter");
+        db.set_monospace_family("Inter");
+        db.set_cursive_family("Inter");
+        db.set_fantasy_family("Inter");
+        FONT_DB_CACHE_HIT.with(|c| c.set(false));
+        FONT_DB_LOAD_NANOS.with(|c| c.set(start.elapsed().as_nanos() as u64));
+        let fonts = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        let installed = build_installed(&fonts);
+        TextSystem { fonts, font_state: FontState::Loaded, swash: SwashCache::new(), cache: HashMap::new(), templates: HashMap::new(), clock: 0, installed, shape_count: 0, rewrap_count: 0, cache_hits: 0, shape_nanos: 0, rewrap_nanos: 0 }
+    }
+
+    /// Native: the font database loads on a background thread (disk cache hit or full
+    /// system scan), overlapping DOM parse + JS evaluation on the startup path; the first
+    /// font use joins it. A cache miss still pays the full scan once and populates the
+    /// cache, exactly as before — the scan just happens while the rest of startup runs.
+    /// `fontdb::Database` is plain data and crosses threads; `FontSystem` itself is not
+    /// `Send`, so it is (re)built on the owning thread from the loaded database.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new() -> Self {
+        let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("rendrix-fontdb".into())
+            .spawn(move || {
+                let load = load_font_db(&locale);
+                // A dropped receiver just means the TextSystem went away; the load is moot.
+                let _ = tx.send(load);
+            })
+            .expect("font DB loader thread");
+        // A placeholder font system: cheap to build (empty database), replaced by
+        // `ensure_loaded` before anything can consume it.
+        let fonts = FontSystem::new_with_locale_and_db(sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string()), fontdb::Database::new());
+        TextSystem { fonts, font_state: FontState::Loading(rx), swash: SwashCache::new(), cache: HashMap::new(), templates: HashMap::new(), clock: 0, installed: HashSet::new(), shape_count: 0, rewrap_count: 0, cache_hits: 0, shape_nanos: 0, rewrap_nanos: 0 }
+    }
+
+    /// Block until the background font-DB load (if any) finished and install the result.
+    /// Idempotent; every `fonts`/`installed` consumer calls it first.
+    fn ensure_loaded(&mut self) {
+        let state = std::mem::replace(&mut self.font_state, FontState::Loaded);
+        let FontState::Loading(rx) = state else { return };
+        let load = match rx.recv() {
+            Ok(load) => load,
+            Err(_) => {
+                // The loader thread died (never expected). Fall back to a synchronous
+                // load so a font-DB failure can never take the engine down.
+                let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+                load_font_db(&locale)
+            }
+        };
+        self.fonts = FontSystem::new_with_locale_and_db(load.locale, load.db);
+        self.installed = build_installed(&self.fonts);
+        FONT_DB_LOAD_NANOS.with(|c| c.set(load.elapsed_nanos));
+        FONT_DB_CACHE_HIT.with(|c| c.set(load.cache_hit));
+    }
+
+    /// Font access for same-crate tests/tools; loads the DB first.
+    pub fn fonts(&mut self) -> &mut FontSystem {
+        self.ensure_loaded();
+        &mut self.fonts
+    }
+
+    /// Number of paragraphs currently cached.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Hit rate over `paragraph()` lookups (`hits / (hits + shapes + rewraps)`).
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.shape_count + self.rewrap_count;
+        if total == 0 {
+            1.0
+        } else {
+            self.cache_hits as f64 / total as f64
+        }
+    }
+
+    /// Register an application font (TTF/OTF bytes).
+    pub fn load_font(&mut self, data: Vec<u8>) {
+        self.ensure_loaded();
+        self.fonts.db_mut().load_font_data(data);
+        self.installed = build_installed(&self.fonts);
+        self.cache.clear();
+        // New binary fonts can change every glyph: old templates are stale.
+        self.templates.clear();
+    }
+}
+
 fn transform_text(s: &str, t: TextTransform) -> String {
     match t {
         TextTransform::None => s.to_string(),
@@ -159,201 +346,199 @@ fn transform_text(s: &str, t: TextTransform) -> String {
     }
 }
 
+/// The concatenated (transformed) text of a content. Deterministic in `content`, so the
+/// full-shape and rewrap paths derive the identical string.
+fn content_text(content: &InlineContent) -> String {
+    content
+        .runs
+        .iter()
+        .map(|r| if r.is_break { "\n".to_string() } else { transform_text(&r.text, r.style.text_transform) })
+        .collect()
+}
+
+/// Map a CSS font-family list onto a cosmic-text family, given the set of family names
+/// installed in the font DB. Free-standing so worker threads (no `TextSystem`) resolve
+/// families identically to the owning thread.
+fn resolve_family_with<'a>(installed: &HashSet<String>, list: &'a [String]) -> Family<'a> {
+    for name in list {
+        match name.to_ascii_lowercase().as_str() {
+            "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => return Family::SansSerif,
+            "serif" | "ui-serif" => return Family::Serif,
+            "monospace" | "ui-monospace" => return Family::Monospace,
+            "cursive" => return Family::Cursive,
+            "fantasy" => return Family::Fantasy,
+            other => {
+                if installed.contains(other) {
+                    return Family::Name(name.as_str());
+                }
+            }
+        }
+    }
+    Family::SansSerif
+}
+
+/// Wrap mode a content shapes with (from `white-space` / `word-break`).
+fn content_wrap(content: &InlineContent) -> (bool, Wrap) {
+    let c = &content.container;
+    let nowrap = matches!(c.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre);
+    // `word-break` selects how cosmic-text may break within a word:
+    //   normal    -> word boundaries, falling back to glyph breaks (CJK, long words)
+    //   break-all -> any glyph may start a line, even for Latin scripts
+    //   keep-all  -> never break inside a word (CJK runs stay intact)
+    let wrap = if nowrap {
+        Wrap::None
+    } else {
+        match c.word_break {
+            WordBreak::BreakAll => Wrap::Glyph,
+            WordBreak::KeepAll => Wrap::Word,
+            WordBreak::Normal => Wrap::WordOrGlyph,
+        }
+    };
+    (nowrap, wrap)
+}
+
+/// Full rustybuzz shape of `content` at `width`. The expensive path, taken once per
+/// content; the result doubles as the rewrap template for every other width.
+fn shape_paragraph(fonts: &mut FontSystem, installed: &HashSet<String>, content: &InlineContent, width: Option<f32>) -> Paragraph {
+    let c = &content.container;
+    let metrics = Metrics::new(c.font_size.max(1.0), c.line_height.resolve(c.font_size).max(1.0));
+    let mut buffer = Buffer::new(fonts, metrics);
+    let (nowrap, wrap) = content_wrap(content);
+    buffer.set_wrap(fonts, wrap);
+    buffer.set_size(fonts, if nowrap { None } else { width }, None);
+
+    // Keep owned strings alive for the span borrow.
+    let texts: Vec<String> = content
+        .runs
+        .iter()
+        .map(|r| if r.is_break { "\n".to_string() } else { transform_text(&r.text, r.style.text_transform) })
+        .collect();
+    let families: Vec<Family> = content.runs.iter().map(|r| resolve_family_with(installed, &r.style.font_family)).collect();
+    let spans: Vec<(&str, Attrs)> = content
+        .runs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let s = &r.style;
+            let mut a = Attrs::new()
+                .family(families[i])
+                .weight(Weight(s.font_weight))
+                .style(match s.font_style {
+                    FontStyle::Normal => Style::Normal,
+                    FontStyle::Italic => Style::Italic,
+                    FontStyle::Oblique => Style::Oblique,
+                })
+                .metadata(i)
+                .metrics(Metrics::new(s.font_size.max(1.0), s.line_height.resolve(s.font_size).max(1.0)));
+            if s.letter_spacing != 0.0 {
+                a = a.letter_spacing(s.letter_spacing / s.font_size.max(1.0));
+            }
+            (texts[i].as_str(), a)
+        })
+        .collect();
+    let align = match c.text_align {
+        TextAlign::Left | TextAlign::Start => Align::Left,
+        TextAlign::Right | TextAlign::End => Align::Right,
+        TextAlign::Center => Align::Center,
+        TextAlign::Justify => Align::Justified,
+    };
+    let default_attrs = Attrs::new();
+    buffer.set_rich_text(fonts, spans, &default_attrs, Shaping::Advanced, Some(align));
+    buffer.shape_until_scroll(fonts, false);
+    finish_paragraph(buffer, &texts.concat(), width)
+}
+
+/// Re-wrap an already-shaped template buffer at another width. The clone carries the
+/// cached `ShapeLine` (the rustybuzz output), so `set_size` re-runs only cosmic-text's
+/// wrapping over the same glyphs — producing exactly what `shape_paragraph` would.
+fn rewrap_paragraph(template: &Buffer, fonts: &mut FontSystem, content: &InlineContent, width: Option<f32>) -> Paragraph {
+    let mut buffer = template.clone();
+    let (nowrap, _wrap) = content_wrap(content);
+    // `set_size` triggers relayout + shaping (a no-op over the cached `ShapeLine`).
+    buffer.set_size(fonts, if nowrap { None } else { width }, None);
+    buffer.shape_until_scroll(fonts, false);
+    finish_paragraph(buffer, &content_text(content), width)
+}
+
+/// Shared post-processing: walk the laid-out buffer into the engine's paragraph
+/// representation. Identical for the full-shape and rewrap paths, which is what makes
+/// the two measurement-identical.
+fn finish_paragraph(buffer: Buffer, text: &str, width: Option<f32>) -> Paragraph {
+    let mut line_starts = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let mut glyphs = Vec::new();
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut max_w = 0.0f32;
+    let mut height = 0.0f32;
+    let mut line_count = 0usize;
+    for run in buffer.layout_runs() {
+        line_count += 1;
+        max_w = max_w.max(run.line_w);
+        height = height.max(run.line_top + run.line_height);
+        let mut cur: Option<Segment> = None;
+        for g in run.glyphs {
+            let seg_run = g.metadata;
+            match &mut cur {
+                Some(s) if s.run == seg_run => {
+                    s.w = (g.x + g.w) - s.x;
+                }
+                _ => {
+                    if let Some(s) = cur.take() {
+                        segments.push(s);
+                    }
+                    cur = Some(Segment { run: seg_run, x: g.x, w: g.w, line_y: run.line_y, line_top: run.line_top, line_height: run.line_height });
+                }
+            }
+            glyphs.push(GlyphInfo { glyph: g.clone(), line_y: run.line_y, run: seg_run });
+        }
+        if let Some(s) = cur.take() {
+            segments.push(s);
+        }
+    }
+    // Empty content has no height; an explicit trailing newline still occupies a line.
+    Paragraph { width: max_w, height, line_count, glyphs, segments, text: text.to_string(), buffer, line_starts, wrap: width }
+}
+
 impl TextSystem {
-    /// Web: browsers expose no system fonts to a worker, so ship a default family (Inter, SIL OFL,
-    /// see `fonts/OFL.txt`) and map every generic family to it. Apps add their own with `@font-face`.
-    #[cfg(target_arch = "wasm32")]
-    pub fn new() -> Self {
-        let start = std::time::Instant::now();
-        let mut db = fontdb::Database::new();
-        db.load_font_data(include_bytes!("../fonts/Inter_400Regular.ttf").to_vec());
-        db.load_font_data(include_bytes!("../fonts/Inter_700Bold.ttf").to_vec());
-        db.set_sans_serif_family("Inter");
-        db.set_serif_family("Inter");
-        db.set_monospace_family("Inter");
-        db.set_cursive_family("Inter");
-        db.set_fantasy_family("Inter");
-        FONT_DB_CACHE_HIT.with(|c| c.set(false));
-        FONT_DB_LOAD_NANOS.with(|c| c.set(start.elapsed().as_nanos() as u64));
-        Self::from_font_system(FontSystem::new_with_locale_and_db("en-US".to_string(), db))
-    }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn new() -> Self {
-        // Cold-start fast path (R1.3): rebuilding the font DB from the on-disk
-        // metadata cache skips re-scanning + re-parsing every system font
-        // (~0.75s). A miss pays the full scan once and populates the cache.
-        let start = std::time::Instant::now();
-        let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
-        let fonts = if let Some(db) = load_font_db_cache(&locale) {
-            FONT_DB_CACHE_HIT.with(|c| c.set(true));
-            FontSystem::new_with_locale_and_db(locale, db)
-        } else {
-            FONT_DB_CACHE_HIT.with(|c| c.set(false));
-            let fonts = FontSystem::new();
-            let locale = fonts.locale().to_string();
-            save_font_db_cache(&locale, fonts.db());
-            fonts
-        };
-        FONT_DB_LOAD_NANOS.with(|c| c.set(start.elapsed().as_nanos() as u64));
-        Self::from_font_system(fonts)
-    }
-
-    fn from_font_system(fonts: FontSystem) -> Self {
-        let installed = fonts
-            .db()
-            .faces()
-            .flat_map(|f| f.families.iter().map(|(n, _)| n.to_lowercase()).collect::<Vec<_>>())
-            .collect();
-        TextSystem { fonts, swash: SwashCache::new(), cache: HashMap::new(), clock: 0, installed, shape_count: 0, cache_hits: 0, shape_nanos: 0 }
-    }
-
-    /// Number of paragraphs currently cached.
-    pub fn cache_len(&self) -> usize {
-        self.cache.len()
-    }
-
-    /// Hit rate over `paragraph()` lookups (`hits / (hits + shapes)`).
-    pub fn hit_rate(&self) -> f64 {
-        let total = self.cache_hits + self.shape_count;
-        if total == 0 {
-            1.0
-        } else {
-            self.cache_hits as f64 / total as f64
+    /// Build the paragraph for `(content, width)`, full-shaping at most once per content.
+    ///
+    /// The first build for a content runs the real rustybuzz pipeline and registers the
+    /// result as that content's *template*. Every later width for the same content clones
+    /// the template's [`Buffer`] and re-wraps it: cosmic-text keeps the shaped
+    /// `ShapeLine` inside a cloned `BufferLine`, and `set_size` only invalidates the
+    /// (cheap) wrapping, so the rewrap is bit-for-bit what a fresh full shape would have
+    /// produced — pinned by the `rewrap_is_measurement_identical` test — at a fraction of
+    /// the cost. `shape_count` counts full shapes; `rewrap_count` counts clone+rewraps.
+    fn build(&mut self, content: &InlineContent, width: Option<f32>) -> Rc<Paragraph> {
+        self.ensure_loaded();
+        let key = content.key();
+        if let Some(t) = self.templates.get_mut(&key) {
+            self.clock = self.clock.wrapping_add(1);
+            t.last_used = self.clock;
+            let t0 = std::time::Instant::now();
+            let para = Rc::new(rewrap_paragraph(&t.para.buffer, &mut self.fonts, content, width));
+            self.rewrap_count += 1;
+            self.rewrap_nanos += t0.elapsed().as_nanos() as u64;
+            return para;
         }
-    }
-
-    /// Register an application font (TTF/OTF bytes).
-    pub fn load_font(&mut self, data: Vec<u8>) {
-        self.fonts.db_mut().load_font_data(data);
-        self.installed = self
-            .fonts
-            .db()
-            .faces()
-            .flat_map(|f| f.families.iter().map(|(n, _)| n.to_lowercase()).collect::<Vec<_>>())
-            .collect();
-        self.cache.clear();
-    }
-
-    fn resolve_family<'a>(&self, list: &'a [String]) -> Family<'a> {
-        for name in list {
-            match name.to_ascii_lowercase().as_str() {
-                "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => return Family::SansSerif,
-                "serif" | "ui-serif" => return Family::Serif,
-                "monospace" | "ui-monospace" => return Family::Monospace,
-                "cursive" => return Family::Cursive,
-                "fantasy" => return Family::Fantasy,
-                other => {
-                    if self.installed.contains(other) {
-                        return Family::Name(name.as_str());
-                    }
-                }
-            }
-        }
-        Family::SansSerif
-    }
-
-    fn build(&mut self, content: &InlineContent, width: Option<f32>) -> Paragraph {
-        let shape_start = std::time::Instant::now();
+        let t0 = std::time::Instant::now();
+        let para = Rc::new(shape_paragraph(&mut self.fonts, &self.installed, content, width));
         self.shape_count += 1;
-        let c = &content.container;
-        let metrics = Metrics::new(c.font_size.max(1.0), c.line_height.resolve(c.font_size).max(1.0));
-        let mut buffer = Buffer::new(&mut self.fonts, metrics);
-        let nowrap = matches!(c.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre);
-        // `word-break` selects how cosmic-text may break within a word:
-        //   normal    -> word boundaries, falling back to glyph breaks (CJK, long words)
-        //   break-all -> any glyph may start a line, even for Latin scripts
-        //   keep-all  -> never break inside a word (CJK runs stay intact)
-        let wrap = if nowrap {
-            Wrap::None
-        } else {
-            match c.word_break {
-                WordBreak::BreakAll => Wrap::Glyph,
-                WordBreak::KeepAll => Wrap::Word,
-                WordBreak::Normal => Wrap::WordOrGlyph,
-            }
-        };
-        buffer.set_wrap(&mut self.fonts, wrap);
-        buffer.set_size(&mut self.fonts, if nowrap { None } else { width }, None);
-
-        // Keep owned strings alive for the span borrow.
-        let texts: Vec<String> = content
-            .runs
-            .iter()
-            .map(|r| if r.is_break { "\n".to_string() } else { transform_text(&r.text, r.style.text_transform) })
-            .collect();
-        let families: Vec<Family> = content.runs.iter().map(|r| self.resolve_family(&r.style.font_family)).collect();
-        let spans: Vec<(&str, Attrs)> = content
-            .runs
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let s = &r.style;
-                let mut a = Attrs::new()
-                    .family(families[i])
-                    .weight(Weight(s.font_weight))
-                    .style(match s.font_style {
-                        FontStyle::Normal => Style::Normal,
-                        FontStyle::Italic => Style::Italic,
-                        FontStyle::Oblique => Style::Oblique,
-                    })
-                    .metadata(i)
-                    .metrics(Metrics::new(s.font_size.max(1.0), s.line_height.resolve(s.font_size).max(1.0)));
-                if s.letter_spacing != 0.0 {
-                    a = a.letter_spacing(s.letter_spacing / s.font_size.max(1.0));
-                }
-                (texts[i].as_str(), a)
-            })
-            .collect();
-        let align = match c.text_align {
-            TextAlign::Left | TextAlign::Start => Align::Left,
-            TextAlign::Right | TextAlign::End => Align::Right,
-            TextAlign::Center => Align::Center,
-            TextAlign::Justify => Align::Justified,
-        };
-        let default_attrs = Attrs::new();
-        buffer.set_rich_text(&mut self.fonts, spans, &default_attrs, Shaping::Advanced, Some(align));
-        buffer.shape_until_scroll(&mut self.fonts, false);
-
-        let text: String = texts.concat();
-        let mut line_starts = vec![0usize];
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                line_starts.push(i + 1);
+        self.shape_nanos += t0.elapsed().as_nanos() as u64;
+        // LRU-bounded: same cap as the paragraph cache, so the template set (which pins
+        // its paragraphs' shaped buffers) can never grow unbounded.
+        if self.templates.len() >= PARA_CACHE_CAP {
+            if let Some(victim) = self.templates.iter().min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k) {
+                self.templates.remove(&victim);
             }
         }
-        let mut glyphs = Vec::new();
-        let mut segments: Vec<Segment> = Vec::new();
-        let mut max_w = 0.0f32;
-        let mut height = 0.0f32;
-        let mut line_count = 0usize;
-        for run in buffer.layout_runs() {
-            line_count += 1;
-            max_w = max_w.max(run.line_w);
-            height = height.max(run.line_top + run.line_height);
-            let mut cur: Option<Segment> = None;
-            for g in run.glyphs {
-                let seg_run = g.metadata;
-                match &mut cur {
-                    Some(s) if s.run == seg_run => {
-                        s.w = (g.x + g.w) - s.x;
-                    }
-                    _ => {
-                        if let Some(s) = cur.take() {
-                            segments.push(s);
-                        }
-                        cur = Some(Segment { run: seg_run, x: g.x, w: g.w, line_y: run.line_y, line_top: run.line_top, line_height: run.line_height });
-                    }
-                }
-                glyphs.push(GlyphInfo { glyph: g.clone(), line_y: run.line_y, run: seg_run });
-            }
-            if let Some(s) = cur.take() {
-                segments.push(s);
-            }
-        }
-        // Empty content has no height; an explicit trailing newline still occupies a line.
-        let para = Paragraph { width: max_w, height, line_count, glyphs, segments, text, buffer, line_starts, wrap: width };
-        self.shape_nanos += shape_start.elapsed().as_nanos() as u64;
+        self.clock = self.clock.wrapping_add(1);
+        self.templates.insert(key, TemplateEntry { para: para.clone(), last_used: self.clock });
         para
     }
 
@@ -372,6 +557,134 @@ impl TextSystem {
         for (content, width) in items {
             let _ = self.paragraph(content, width);
         }
+    }
+
+    /// First-frame shaping across worker threads.
+    ///
+    /// [`prewarm`](Self::prewarm) is the general opt-in lever; this is the cold-start
+    /// specialisation. A first frame measures every text block at min-content *and*
+    /// max-content before painting, so for a large initial DOM almost all of its shaping
+    /// is knowable the moment the box tree exists. The contents are chunked across
+    /// short-lived worker threads, each with its own `FontSystem` built from a clone of
+    /// this system's font database (deterministic: same DB, same cosmic-text, same
+    /// glyphs). Each worker full-shapes its contents once (unconstrained width, which
+    /// doubles as the rewrap template) and re-wraps the min-content variant from it.
+    /// Results are inserted through the same cache the on-demand path uses, keyed exactly
+    /// as [`paragraph`](Self::paragraph) would key them, so the first frame's layout
+    /// lookups hit instead of shaping. Below [`PREWARM_PARALLEL_MIN`] fresh contents the
+    /// call is a no-op: on-demand shaping is cheaper than a thread pool for small apps.
+    ///
+    /// Workers that fail (panic, OOM) are simply skipped: their contents shape on demand,
+    /// so a prewarm failure can only cost time, never correctness.
+    pub fn prewarm_parallel(&mut self, contents: &[Arc<InlineContent>]) {
+        if contents.is_empty() {
+            return;
+        }
+        // Dedup by content key; skip anything already shaped (its template exists).
+        let mut seen = std::collections::HashSet::new();
+        let fresh: Vec<Arc<InlineContent>> = contents
+            .iter()
+            .filter(|c| seen.insert(c.key()) && !self.templates.contains_key(&c.key()))
+            .cloned()
+            .collect();
+        if fresh.len() < PREWARM_PARALLEL_MIN {
+            return;
+        }
+        self.prewarm_parallel_impl(&fresh);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prewarm_parallel_impl(&mut self, fresh: &[Arc<InlineContent>]) {
+        self.ensure_loaded();
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8).min(fresh.len());
+        let locale = self.fonts.locale().to_string();
+        let db = self.fonts.db().clone();
+        let installed = self.installed.clone();
+        let chunk = (fresh.len() + threads - 1) / threads;
+        let mut shape_nanos = 0u64;
+        let mut rewrap_nanos = 0u64;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for part in fresh.chunks(chunk) {
+                let (locale, db, installed) = (locale.clone(), db.clone(), installed.clone());
+                handles.push(scope.spawn(move || {
+                    let mut fonts = FontSystem::new_with_locale_and_db(locale, db);
+                    let mut out = Vec::with_capacity(part.len());
+                    let (mut full_ns, mut rewrap_ns) = (0u64, 0u64);
+                    for content in part {
+                        let key = content.key();
+                        let t0 = std::time::Instant::now();
+                        let natural = shape_paragraph(&mut fonts, &installed, content, None);
+                        full_ns += t0.elapsed().as_nanos() as u64;
+                        // Min-content variant, the other half of every first-frame
+                        // measurement pair. `nowrap` content normalises every width to
+                        // None, so the unconstrained shape above already covers it.
+                        let zero = if content_wrap(content).0 { None } else {
+                            let t1 = std::time::Instant::now();
+                            let p = rewrap_paragraph(&natural.buffer, &mut fonts, content, Some(0.0));
+                            rewrap_ns += t1.elapsed().as_nanos() as u64;
+                            Some(p)
+                        };
+                        out.push((key, natural, zero));
+                    }
+                    (out, full_ns, rewrap_ns)
+                }));
+            }
+            for handle in handles {
+                let Ok((built, full_ns, rewrap_ns)) = handle.join() else { continue };
+                shape_nanos += full_ns;
+                rewrap_nanos += rewrap_ns;
+                for (key, natural, zero) in built {
+                    self.shape_count += 1;
+                    if zero.is_some() {
+                        self.rewrap_count += 1;
+                    }
+                    self.insert_prewarmed(key, natural, zero);
+                }
+            }
+        });
+        self.shape_nanos += shape_nanos;
+        self.rewrap_nanos += rewrap_nanos;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn prewarm_parallel_impl(&mut self, fresh: &[Arc<InlineContent>]) {
+        // No thread spawn on the web target: shape serially through the normal path,
+        // which still leaves the first frame with cache hits.
+        for content in fresh {
+            let _ = self.paragraph(content, None);
+        }
+    }
+
+    /// Cache a worker-built paragraph pair under the exact keys the on-demand path uses
+    /// (None → width_bits 0, Some(0.0) → width_bits 1), registering the unconstrained
+    /// paragraph as the content's rewrap template. Mirrors `paragraph`'s miss path,
+    /// including LRU eviction, so prewarmed and on-demand entries are indistinguishable.
+    fn insert_prewarmed(&mut self, key: u64, natural: Paragraph, zero: Option<Paragraph>) {
+        let natural = Rc::new(natural);
+        self.clock = self.clock.wrapping_add(1);
+        self.insert_bounded(ParaKey { content: key, width_bits: 0 }, natural.clone(), self.clock);
+        if let Some(zero) = zero {
+            self.clock = self.clock.wrapping_add(1);
+            self.insert_bounded(ParaKey { content: key, width_bits: width_bits(0.0) }, Rc::new(zero), self.clock);
+        }
+        if self.templates.len() >= PARA_CACHE_CAP {
+            if let Some(victim) = self.templates.iter().min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k) {
+                self.templates.remove(&victim);
+            }
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.templates.insert(key, TemplateEntry { para: natural, last_used: self.clock });
+    }
+
+    /// Insert with the same LRU bound as `paragraph`'s miss path.
+    fn insert_bounded(&mut self, key: ParaKey, para: Rc<Paragraph>, last_used: u64) {
+        if self.cache.len() >= PARA_CACHE_CAP && !self.cache.contains_key(&key) {
+            if let Some(victim) = self.cache.iter().min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k) {
+                self.cache.remove(&victim);
+            }
+        }
+        self.cache.insert(key, CacheEntry { para, last_used });
     }
 
     pub fn paragraph(&mut self, content: &InlineContent, width: Option<f32>) -> Rc<Paragraph> {
@@ -412,7 +725,7 @@ impl TextSystem {
                 self.cache.remove(&victim);
             }
         }
-        let p = Rc::new(self.build(content, qw));
+        let p = self.build(content, qw);
         self.clock = self.clock.wrapping_add(1);
         self.cache.insert(key, CacheEntry { para: p.clone(), last_used: self.clock });
         p
@@ -497,6 +810,7 @@ impl TextSystem {
 
     /// Rasterize a glyph at its cache key's size. `None` for blank glyphs (spaces).
     pub fn raster(&mut self, key: CacheKey) -> Option<Raster> {
+        self.ensure_loaded();
         let img = self.swash.get_image(&mut self.fonts, key).as_ref()?;
         let (w, h) = (img.placement.width, img.placement.height);
         if w == 0 || h == 0 {
@@ -544,13 +858,15 @@ impl TextSystem {
 // painted (paint additionally skips fully-clipped text before shaping; see the
 // renderer), and the font DB itself is reused across runs via this cache.
 //
-// Why shaping is NOT parallelised (considered and rejected): every shaping call needs
-// `&mut FontSystem` (cosmic-text's `Buffer::new`/`set_rich_text`/`shape_until_scroll` all take
-// `&mut`), `TextSystem` is reached through a `RefCell` and hands out `Rc<Paragraph>` (not `Send`),
-// and `FontSystem` is not `Sync`. Sharing it across threads would need a lock held for the whole
-// shape (serialising anyway) plus `Arc`/`Send` rewrites across the engine — high risk for no
-// win. The safe cold-start lever is `TextSystem::prewarm`: batch known content into the cache
-// during a genuine idle window, off the critical first-frame path.
+// Why the engine does NOT share one `FontSystem` across threads (considered and
+// rejected): every shaping call needs `&mut FontSystem`, `TextSystem` is reached through
+// a `RefCell` and hands out `Rc<Paragraph>` (not `Send`), and sharing would need a lock
+// held for the whole shape, serialising anyway. The cold-start levers instead:
+// `TextSystem::prewarm` (batch known content serially), template rewraps (clone a shaped
+// buffer, re-wrap at another width — no rustybuzz), and `prewarm_parallel` (first-frame
+// contents chunked over short-lived worker threads, each with its OWN `FontSystem` built
+// from a clone of this system's `fontdb::Database`; same DB + same cosmic-text ⇒
+// bit-identical glyphs, inserted through the ordinary cache keys afterwards).
 //
 // Env overrides (tests/debugging):
 // - `RENDRIX_CACHE_DIR`: directory holding `fontdb-v1.cache`.
@@ -881,16 +1197,19 @@ mod tests {
         let mut t = TextSystem::new();
         let c = content("cached", 16.0);
         t.measure(&c, Some(200.0));
-        let n = t.shape_count;
+        let n = t.shape_count + t.rewrap_count;
         t.measure(&c, Some(200.0));
         t.paragraph(&c, Some(200.0));
-        assert_eq!(t.shape_count, n);
+        assert_eq!(t.shape_count + t.rewrap_count, n);
         t.measure(&c, Some(300.0));
-        assert_eq!(t.shape_count, n, "a wider width reuses the unconstrained layout already shaped");
+        assert_eq!(t.shape_count + t.rewrap_count, n, "a wider width reuses the unconstrained layout already shaped");
         t.measure(&c, Some(500.0));
-        assert_eq!(t.shape_count, n);
+        assert_eq!(t.shape_count + t.rewrap_count, n);
         t.measure(&c, Some(20.0));
-        assert_eq!(t.shape_count, n + 1, "a width that forces wrapping needs its own layout");
+        // A width that forces wrapping gets its own layout; with a template already
+        // shaped, that build is a clone+rewrap rather than a second rustybuzz shape.
+        assert_eq!(t.shape_count + t.rewrap_count, n + 1, "a width that forces wrapping needs its own layout");
+        assert_eq!(t.rewrap_count, 1, "the wrapped variant is built by template rewrap");
     }
 
     #[test]
@@ -922,11 +1241,13 @@ mod tests {
         let c = content("hello world this wraps over several lines when the width is narrow", 16.0);
         let (nw, _) = t.measure(&c, None);
         assert!(nw > 160.0, "test needs wrapping content, natural width {nw}");
-        let n0 = t.shape_count;
+        // `build`s = full shapes + template rewraps (a rewrap serves a new bucket once
+        // the content has a shaped template; either way, one build per bucket).
+        let n0 = t.shape_count + t.rewrap_count;
         let (w1, h1) = t.measure(&c, Some(150.1));
-        assert_eq!(t.shape_count, n0 + 1, "the unconstrained shape is already cached; one bucket shape");
+        assert_eq!(t.shape_count + t.rewrap_count, n0 + 1, "the unconstrained shape is already cached; one bucket build");
         let (w2, h2) = t.measure(&c, Some(150.4));
-        assert_eq!(t.shape_count, n0 + 1, "same 0.5px bucket shares the shaping");
+        assert_eq!(t.shape_count + t.rewrap_count, n0 + 1, "same 0.5px bucket shares the shaping");
         assert_eq!((w1, h1), (w2, h2));
         assert!(t.cache_hits >= 2, "bucket lookups hit: {}", t.cache_hits);
         // Wrap-correctness: the bucket paragraph was shaped at the bucket floor, so it fits.
@@ -937,7 +1258,7 @@ mod tests {
             assert!(p.height > h1 * 0.99, "still wrapped");
         }
         t.measure(&c, Some(160.1));
-        assert_eq!(t.shape_count, n0 + 2, "a new bucket shapes once more");
+        assert_eq!(t.shape_count + t.rewrap_count, n0 + 2, "a new bucket builds once more");
         assert!(t.hit_rate() > 0.4, "hit rate {}", t.hit_rate());
     }
 
@@ -1023,6 +1344,94 @@ mod tests {
     // These pin the *result* of shaping (glyph geometry, not just counts), so any future
     // prewarm/batching/parallelization cannot change what is rendered without failing here.
 
+    /// Contents exercising the paths that rewrapping must survive: wrapping, single words,
+    /// spaces, CJK (glyph wrap fallback), hard breaks, uppercase transform.
+    fn identity_corpus() -> Vec<InlineContent> {
+        let mut out = vec![
+            content("Item number 5 with some descriptive text", 14.0),
+            content("hello world with several words to wrap around a narrow column", 16.0),
+            content("supercalifragilisticexpialidocious", 12.0),
+            content("  leading and trailing spaces  ", 16.0),
+            content("mixed script 日本語 and latin text", 15.0),
+            content("", 16.0),
+        ];
+        // Hard break between two runs.
+        let s = Arc::new(ComputedStyle::default());
+        out.push(InlineContent::new(
+            vec![
+                InlineRun { text: "first line".into(), style: s.clone(), node: 1, is_break: false },
+                InlineRun { text: String::new(), style: s.clone(), node: 1, is_break: true },
+                InlineRun { text: "second line".into(), style: s.clone(), node: 1, is_break: false },
+            ],
+            s.clone(),
+        ));
+        // Two runs with different font sizes (separate cosmic spans).
+        let big = ComputedStyle { font_size: 24.0, ..Default::default() };
+        out.push(InlineContent::new(
+            vec![
+                InlineRun { text: "small ".into(), style: s.clone(), node: 1, is_break: false },
+                InlineRun { text: "BIG".into(), style: Arc::new(big), node: 1, is_break: false },
+            ],
+            s.clone(),
+        ));
+        out
+    }
+
+    /// A width for each corpus entry that forces wrapping (so rewrap and full shape
+    /// actually produce multi-line layouts).
+    fn narrow_widths() -> Vec<Option<f32>> {
+        vec![
+            Some(60.0), Some(80.0), Some(30.0), Some(40.0), Some(60.0), Some(10.0),
+            Some(30.0), Some(40.0),
+        ]
+    }
+
+    #[test]
+    fn rewrap_is_measurement_identical() {
+        // System `fresh` full-shapes every width from scratch; system `rewrapped`
+        // builds one width first (creating the template) and then serves the same
+        // width by clone+rewrap. The snapshots must agree bit for bit.
+        for (i, c) in identity_corpus().iter().enumerate() {
+            for w in [narrow_widths()[i], Some(0.0), None] {
+                let mut fresh = TextSystem::new();
+                let direct = snapshot(&fresh.paragraph(c, w));
+                let mut rewrapped = TextSystem::new();
+                // First build a different width: this creates the template.
+                let _ = rewrapped.paragraph(c, if w == Some(0.0) { Some(137.0) } else { Some(0.0) });
+                let via_template = snapshot(&rewrapped.paragraph(c, w));
+                assert_eq!(via_template, direct, "corpus[{i}] at width {w:?}: rewrap == fresh full shape");
+            }
+        }
+    }
+
+    #[test]
+    fn prewarm_parallel_matches_on_demand_and_leaves_hits() {
+        let mut corpus = identity_corpus();
+        // The parallel path engages only above its threshold; pad with unique fillers.
+        for i in 0..PREWARM_PARALLEL_MIN {
+            corpus.push(content(&format!("filler paragraph {i} with a few wrapped words"), 14.0));
+        }
+        // On-demand baseline: every paragraph shaped through the normal path.
+        let mut on_demand = TextSystem::new();
+        let expected: Vec<String> = corpus.iter().map(|c| snapshot(&on_demand.paragraph(c, None))).collect();
+
+        // Prewarmed system: workers shape, the cache serves afterwards.
+        let mut prewarmed = TextSystem::new();
+        let arcs: Vec<Arc<InlineContent>> = corpus.iter().map(|c| Arc::new(c.clone())).collect();
+        prewarmed.prewarm_parallel(&arcs);
+        for (c, want) in corpus.iter().zip(&expected) {
+            assert_eq!(&snapshot(&prewarmed.paragraph(c, None)), want, "prewarmed paragraph == on-demand paragraph");
+        }
+        // Post-prewarm lookups must be pure cache hits.
+        let (shapes, rewraps, hits) = (prewarmed.shape_count, prewarmed.rewrap_count, prewarmed.cache_hits);
+        for c in &corpus {
+            let _ = prewarmed.paragraph(c, None);
+        }
+        assert_eq!(prewarmed.shape_count, shapes, "post-prewarm lookup does not full-shape");
+        assert_eq!(prewarmed.rewrap_count, rewraps, "post-prewarm lookup does not rewrap");
+        assert!(prewarmed.cache_hits > hits, "post-prewarm lookup is a cache hit");
+    }
+
     #[test]
     fn memoized_shape_is_measurement_identical() {
         let mut t = TextSystem::new();
@@ -1065,14 +1474,20 @@ mod tests {
         let mut t = TextSystem::new();
         let c = content("identity survives an LRU eviction: measure me twice", 16.0);
         let before = snapshot(&t.paragraph(&c, Some(220.0)));
-        // Force the original entry out of the cache.
+        // Force the original entry out of the paragraph cache. The content's template
+        // survives, so the rebuild is a clone+rewrap (still one new paragraph).
         for i in 0..(PARA_CACHE_CAP + 8) {
             let other = content(&format!("filler paragraph {i} with enough words to shape"), 16.0);
             t.measure(&other, Some(220.0));
         }
         assert!(t.cache_len() <= PARA_CACHE_CAP);
+        let (shapes, rewraps) = (t.shape_count, t.rewrap_count);
         let after = snapshot(&t.paragraph(&c, Some(220.0)));
-        assert_eq!(after, before, "a re-shaped paragraph is bit-for-bit the original");
+        assert_eq!(after, before, "a re-built paragraph is bit-for-bit the original");
+        assert!(
+            t.shape_count + t.rewrap_count > shapes + rewraps,
+            "evicted entries rebuild on demand (full shape or template rewrap)"
+        );
     }
 
     #[test]
@@ -1102,8 +1517,8 @@ mod tests {
         assert!(t.shape_count > shapes, "shape_count advances");
         assert!(t.shape_nanos >= nanos, "shape_nanos never decreases");
         assert!(t.cache_hits >= hits);
-        // The font-DB phase timer is populated by `new()` and is non-negative by construction.
-        let _ = super::last_font_db_load_nanos();
+        // The font-DB phase timer reports the background load after the first font use.
+        assert!(super::last_font_db_load_nanos() > 0, "the loader thread has finished by now");
         let _ = super::last_font_db_cache_hit();
     }
 
@@ -1140,12 +1555,14 @@ mod tests {
             let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
             // Cold: no cache file yet.
             assert!(load_font_db_cache(&locale).is_none(), "miss on empty dir");
-            // A full scan populates the cache as a side effect.
-            let sys = TextSystem::new();
+            // A full scan populates the cache as a side effect. The DB loads on a
+            // background thread now, so join it before asserting on the file.
+            let mut sys = TextSystem::new();
+            let _ = sys.fonts();
             assert!(font_cache_path().is_file(), "scan writes the cache");
             let db = load_font_db_cache(&locale).expect("roundtrip hit");
             let (mut a, mut b): (Vec<_>, Vec<_>) =
-                (sys.fonts.db().faces().collect(), db.faces().collect());
+                (sys.fonts().db().faces().collect(), db.faces().collect());
             assert_eq!(a.len(), b.len(), "no faces lost");
             assert!(!a.is_empty(), "system has fonts");
             // Both iterate in insertion order; spot-check the first 32 faces field by field.
@@ -1165,7 +1582,8 @@ mod tests {
                 }
             }
             // A cache-built system resolves the same families as a scanned one.
-            let cached = TextSystem::new();
+            let mut cached = TextSystem::new();
+            let _ = cached.fonts();
             assert_eq!(cached.installed, sys.installed, "same installed-family set");
         });
     }
@@ -1185,7 +1603,9 @@ mod tests {
             std::fs::write(&path, &FONT_CACHE_MAGIC.to_le_bytes()[..2]).unwrap();
             assert!(load_font_db_cache(&locale).is_none(), "truncation rejected");
             // Valid cache, then tampered: wrong locale, trailing bytes, truncation.
-            let _sys = TextSystem::new();
+            // The scan (and cache write) happen on the loader thread; join it first.
+            let mut _sys = TextSystem::new();
+            let _ = _sys.fonts();
             assert!(load_font_db_cache(&locale).is_some());
             assert!(load_font_db_cache("xx-OTHER-LOCALE-xx").is_none(), "locale-keyed");
             let mut bytes = std::fs::read(&path).unwrap();
