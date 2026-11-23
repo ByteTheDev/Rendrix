@@ -445,21 +445,23 @@ impl Engine {
             // dirty box units instead of rebuilding the whole tree — a class/text toggle
             // now touches one subtree rather than all ~9k boxes.
             if let Some(mut tree) = self.layout_tree.take() {
-                let roots: Vec<NodeId> = dirty
+                // Animating nodes must also be patched: their *effective* style changes
+                // every frame (sampled transition/animation), even though no DOM mutation
+                // marked them. Rebuilding just their units keeps a running transition on
+                // the incremental path instead of forcing a full tree rebuild per frame.
+                let mut roots: Vec<NodeId> = dirty
                     .style_roots
                     .iter()
                     .chain(dirty.state_roots.iter())
                     .copied()
-                    .filter(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n))
+                    .chain(self.anim_paint_ids())
                     .collect();
-                let anim_paint = !self.anim_paint_ids().is_empty();
-                if !all && !anim_paint && roots.is_empty() {
+                roots.retain(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n));
+                if !all && roots.is_empty() {
                     // No box input changed (e.g. caret blink, static fill): reuse as-is.
                     self.layout_tree = Some(tree);
                     refreshed = true;
-                } else if !all && !anim_paint && !roots.is_empty()
-                    && boxtree::patch_tree(self, &mut tree, &roots)
-                {
+                } else if !all && boxtree::patch_tree(self, &mut tree, &roots) {
                     // Only the dirty units were rebuilt; the old Taffy solution is still
                     // valid because no geometry-affecting property changed.
                     self.layout_tree = Some(tree);
@@ -507,11 +509,15 @@ impl Engine {
             // `layout_tree`; dirty regions are rebuilt and spliced by NodeId while clean
             // style-identical subtrees are reused. Falls back to `build_root` whenever the
             // patch cannot preserve full-build semantics (then output is still identical).
+            // Animations no longer disable patching: running motion only patches the
+            // animating units each frame (their effective styles change per frame), and
+            // layout-affecting motion reaches Taffy through the rebuilt units' style diff.
             let mut patched = false;
-            if !all && !animating {
+            if !all {
                 if let Some(mut tree) = self.layout_tree.take() {
                     let mut roots: Vec<NodeId> =
                         dirty.style_roots.iter().chain(dirty.state_roots.iter()).copied().collect();
+                    roots.extend(self.anim_ids());
                     roots.retain(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n));
                     let mut dirty_boxes: HashSet<u64> = HashSet::new();
                     if roots.is_empty() {
@@ -1320,6 +1326,19 @@ fn apply_float_clear(tree: &LayoutNode, out: &mut LayoutResult) {
     use rendrix_css::{Clear, Float};
 
     fn adjust(parent: &LayoutNode, out: &mut LayoutResult) {
+        // Floats and clears only re-arrange a container's own children. When none of this
+        // parent's children float or clear, the pass is a no-op for it: skip the child
+        // collect + sort entirely (the per-parent sort was a whole-tree cost on every
+        // layout, dominate or not) and only keep descending.
+        let relevant = parent.children.iter().any(|c| {
+            c.style.float != Float::None || c.style.clear != Clear::None
+        });
+        if !relevant {
+            for c in &parent.children {
+                adjust(c, out);
+            }
+            return;
+        }
         if let Some(pbox) = out.boxes.get(&parent.id).copied() {
             let cx = pbox.border[3] + pbox.padding[3];
             let cw = (pbox.width - pbox.border[1] - pbox.border[3] - pbox.padding[1] - pbox.padding[3]).max(0.0);

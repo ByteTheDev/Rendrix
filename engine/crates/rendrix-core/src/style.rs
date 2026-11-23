@@ -541,6 +541,13 @@ impl Engine {
         out
     }
 
+    /// Every id with any transition or animation state, running or retained (fill-forwards).
+    /// Their effective styles are sampled per frame, so the incremental box patcher must
+    /// rebuild their units even when the DOM itself did not change.
+    pub(crate) fn anim_ids(&self) -> Vec<NodeId> {
+        self.anim.keys().copied().collect()
+    }
+
     /// Effective style of an element at the engine's current time.
     pub fn style_of(&self, id: NodeId) -> Option<Arc<ComputedStyle>> {
         let base = self.styles.get(id as usize)?.as_ref()?;
