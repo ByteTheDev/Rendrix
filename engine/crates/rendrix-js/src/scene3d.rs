@@ -49,7 +49,7 @@
 //!   next paint — removal stops future renders, it does not unpaint.
 
 use crate::engine_trait::Val;
-use crate::host::DomHost;
+use crate::host::{base64_decode, DomHost};
 use rendrix_gfx::canvas::{self, Paint};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -105,6 +105,17 @@ enum Geo {
 struct Material {
     color: [f32; 4],
     emissive: f32,
+    /// GPU face-cull mode: none | back | front.
+    cull: String,
+}
+
+/// Light description shared by the CPU rasterizer and the GPU viewport. The CPU path
+/// uses only the first directional light; the GPU path shades all of them.
+#[derive(Clone, Debug)]
+enum JLight {
+    Directional { dir: [f32; 3], color: [f32; 3], intensity: f32 },
+    Ambient { color: [f32; 3], intensity: f32 },
+    Point { pos: [f32; 3], color: [f32; 3], intensity: f32, range: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +137,7 @@ struct SceneFile {
     camera: Camera,
     meshes: Vec<Mesh>,
     light_dir: [f32; 3],
+    lights: Vec<JLight>,
     background: [f32; 4],
 }
 
@@ -338,6 +350,11 @@ fn parse_scene(json: &str) -> Result<SceneFile, String> {
                 .and_then(num)
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0),
+            cull: match mo.get("material").and_then(|m| m.get("cull")).and_then(|v| v.as_str()) {
+                Some("back") => "back".to_string(),
+                Some("front") => "front".to_string(),
+                _ => "none".to_string(),
+            },
         };
         out.push(Mesh {
             geo,
@@ -346,17 +363,36 @@ fn parse_scene(json: &str) -> Result<SceneFile, String> {
         });
     }
     let mut dir = [0.4f32, 0.8, 0.6];
-    if let Some(lights) = o.get("lights").and_then(|l| l.as_array()) {
-        if let Some(first) = lights.first() {
-            let d = first
-                .get("dir")
-                .or_else(|| first.get("direction"))
-                .map(|v| vec3(v, dir))
-                .unwrap_or(dir);
-            if d != [0.0, 0.0, 0.0] {
-                dir = d;
+    let mut lights: Vec<JLight> = Vec::new();
+    if let Some(arr) = o.get("lights").and_then(|l| l.as_array()) {
+        for l in arr {
+            let kind = l.get("kind").and_then(|v| v.as_str()).unwrap_or("dir");
+            let c = color_of(l.get("color"), [1.0, 1.0, 1.0, 1.0]);
+            let color = [c[0], c[1], c[2]];
+            let intensity = l.get("intensity").and_then(num).unwrap_or(1.0).max(0.0);
+            match kind {
+                "ambient" => lights.push(JLight::Ambient { color, intensity }),
+                "point" => {
+                    let pos = l
+                        .get("pos")
+                        .or_else(|| l.get("position"))
+                        .map(|v| vec3(v, [0.0, 0.0, 0.0]))
+                        .unwrap_or([0.0, 0.0, 0.0]);
+                    let range = l.get("range").and_then(num).unwrap_or(0.0).max(0.0);
+                    lights.push(JLight::Point { pos, color, intensity, range });
+                }
+                _ => {
+                    let d = l.get("dir").or_else(|| l.get("direction")).map(|v| vec3(v, dir)).unwrap_or(dir);
+                    if d != [0.0, 0.0, 0.0] {
+                        dir = d;
+                    }
+                    lights.push(JLight::Directional { dir: d, color, intensity });
+                }
             }
         }
+    }
+    if lights.is_empty() {
+        lights.push(JLight::Directional { dir, color: [1.0, 1.0, 1.0], intensity: 1.0 });
     }
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     if len > 0.0 {
@@ -366,6 +402,7 @@ fn parse_scene(json: &str) -> Result<SceneFile, String> {
         camera,
         meshes: out,
         light_dir: dir,
+        lights,
         background: color_of(o.get("background").or_else(|| o.get("clearColor")), [0.0, 0.0, 0.0, 0.0]),
     })
 }
@@ -420,6 +457,22 @@ fn run(host: &DomHost, op: &str, args: &[Val]) -> Result<Val, String> {
                 None => Ok(Val::Null),
             }
         }
+        "scene3d_texture" => {
+            let id = num_arg(args, 0)? as u32;
+            let payload = base64_decode(&str_of(args, 1))
+                .ok_or_else(|| "EncodingError: scene3d_texture payload is not valid base64".to_string())?;
+            let w = num_arg(args, 2)? as u32;
+            let h = num_arg(args, 3)? as u32;
+            rendrix_gfx::scene3d::set_scene_texture(id, payload, w, h)?;
+            // Invalidate cached images using this material so the GPU pass re-uploads.
+            host.engine.borrow_mut().doc.dirty.paint = true;
+            Ok(Val::Undefined)
+        }
+        "scene3d_texture_remove" => {
+            let id = num_arg(args, 0)? as u32;
+            rendrix_gfx::scene3d::remove_scene_texture(id);
+            Ok(Val::Undefined)
+        }
         _ => Err(format!("unknown native operation '{op}'")),
     }
 }
@@ -429,6 +482,12 @@ fn node(args: &[Val], i: usize) -> Result<u32, String> {
         .and_then(|v| v.as_f64())
         .map(|n| n as u32)
         .ok_or_else(|| format!("TypeError: scene op argument {i} must be a node id"))
+}
+
+fn num_arg(args: &[Val], i: usize) -> Result<f64, String> {
+    args.get(i)
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| format!("TypeError: scene op argument {i} must be a number"))
 }
 
 fn str_of(args: &[Val], i: usize) -> String {
@@ -474,7 +533,11 @@ fn upsert(host: &DomHost, n: u32, json: &str) -> Result<(), String> {
     // (`<rendrix-scene>` / `<canvas data-3d>`) while the CPU rasterizer above covers
     // plain `<canvas>` bitmaps. Best-effort: a gfx-side parse rejection never fails
     // the JS call (the CPU path is the source of truth for validation).
-    let _ = rendrix_gfx::scene3d::upsert_scene(n as u64, &canonical);
+    // Best-effort, but never silent: a schema mismatch here used to be discarded and left
+    // `<rendrix-scene>` / `<canvas data-3d>` hosts with no GPU scene at all.
+    if let Err(e) = rendrix_gfx::scene3d::upsert_scene(n as u64, &canonical) {
+        eprintln!("[rendrix] GPU scene bridge rejected scene {n}: {e}");
+    }
     // Invalidation reuses the Canvas 2D path: the element repaints without restyle/relayout.
     canvas::mark_dirty(key, n);
     host.engine.borrow_mut().doc.dirty.paint = true;
@@ -631,16 +694,20 @@ fn canonical_json(d: &SceneFile) -> String {
         .meshes
         .iter()
         .map(|m| {
-            let (kind, extra) = match &m.geo {
-                Geo::Box(s) => ("box", serde_json::json!({ "size": s })),
-                Geo::Plane(s) => ("plane", serde_json::json!({ "size": s })),
-                Geo::Sphere(r) => ("sphere", serde_json::json!({ "size": r })),
+            // The GPU backend uses unit primitives and applies `transform.scale`, while the
+            // JS schema carries a per-geometry `size`. Bake size into the scale so both the
+            // CPU bitmap rasterizer and the GPU viewport render the same sized object.
+            let (kind, extra, size_scale) = match &m.geo {
+                Geo::Box(s) => ("box", serde_json::json!({}), *s),
+                Geo::Plane(s) => ("plane", serde_json::json!({}), [s[0], s[1], 1.0]),
+                Geo::Sphere(r) => ("sphere", serde_json::json!({}), [*r * 2.0, *r * 2.0, *r * 2.0]),
                 Geo::Tris(pts, idx) => (
                     "tris",
                     serde_json::json!({
                         "verts": pts.iter().flat_map(|p| [p[0], p[1], p[2]]).collect::<Vec<f32>>(),
                         "indices": idx,
                     }),
+                    [1.0, 1.0, 1.0],
                 ),
             };
             let mut geo = serde_json::Map::new();
@@ -648,11 +715,31 @@ fn canonical_json(d: &SceneFile) -> String {
             for (k, v) in extra.as_object().unwrap() {
                 geo.insert(k.clone(), v.clone());
             }
+            let scale: Vec<f32> =
+                m.xf.scale.iter().zip(size_scale).map(|(a, b)| a * b).collect();
+            // `emissive` must be a 3-vector: the GPU MatDesc deserializes Vec<f32>, and a
+            // JSON number here silently rejected every scene before this fix.
+            let emissive = [m.mat.emissive, m.mat.emissive, m.mat.emissive];
             serde_json::json!({
                 "geo": geo,
-                "material": { "color": m.mat.color, "emissive": 0.0 },
-                "transform": { "pos": m.xf.pos, "rotEulerDeg": m.xf.rot_deg, "scale": m.xf.scale },
+                "material": { "color": m.mat.color, "emissive": emissive, "cull": m.mat.cull },
+                "transform": { "pos": m.xf.pos, "rotEulerDeg": m.xf.rot_deg, "scale": scale },
             })
+        })
+        .collect();
+    let lights: Vec<serde_json::Value> = d
+        .lights
+        .iter()
+        .map(|l| match l {
+            JLight::Directional { dir, color, intensity } => serde_json::json!({
+                "kind": "dir", "dir": dir, "color": color, "intensity": intensity,
+            }),
+            JLight::Ambient { color, intensity } => serde_json::json!({
+                "kind": "ambient", "color": color, "intensity": intensity,
+            }),
+            JLight::Point { pos, color, intensity, range } => serde_json::json!({
+                "kind": "point", "pos": pos, "color": color, "intensity": intensity, "range": range,
+            }),
         })
         .collect();
     serde_json::json!({
@@ -661,7 +748,7 @@ fn canonical_json(d: &SceneFile) -> String {
             "position": d.camera.pos, "lookAt": d.camera.look_at,
         },
         "meshes": meshes,
-        "lights": [{ "dir": d.light_dir }],
+        "lights": lights,
         "background": d.background,
     })
     .to_string()

@@ -103,16 +103,22 @@ masks, full table (`colspan`/`rowspan`, automatic sizing) and float (text wrap, 
 Open/closed shadow roots, `customElements.define/get/whenDefined/upgrade` and connected/disconnected
 callbacks. No closed-root styling APIs or full form-associated custom elements.
 
-### R3.6 3D scenes — experimental
+### R3.6 3D scenes — experimental, GPU path upgraded
 `RendrixScene.createScene(...)` plus a `webgl`/`webgl2` alias rasterize JSON-described scenes into a canvas
 texture; a GPU scene backend (`scene3d.rs`, `Item::Scene3D`) composites `<rendrix-scene>` / `<canvas data-3d>`
-hosts. No depth buffer, backface culling, glTF, PBR, shadows or real shaders. This is not a full 3D engine.
+hosts. The JS→GPU bridge was repaired (it silently rejected every scene before) and the GPU forward pass now
+has Depth24Plus testing, up to 4 directional + 4 point lights with range falloff, alpha blending with
+back-to-front sorting, optional backface culling, frustum culling, and UV-mapped material textures
+(`RendrixScene.setTexture`). Still missing: shadows, glTF, PBR, skeletal animation, instancing, and
+real WebGL shaders/framebuffers. This is not a full 3D engine.
 
 ### R3.7 Web target (`rendrix-web`) — experimental
 The same engine compiled to wasm runs in a Worker using the browser's JS engine. Pointer/touch/keyboard/IME,
-fetch, canvas and rendering work under SwiftShader WebGPU. Open: WebGL2 fallback (the renderer currently
-panics without WebGPU), browser-backed WebSocket/Workers/localStorage persistence, static import cycles,
-and a runaway-script interrupt (native QuickJS has a 5 s/task budget).
+fetch, canvas and rendering work under SwiftShader WebGPU. The renderer now has a WebGL2 fallback
+(uniform-backed instances and polygon clip, selected from device limits) covered by a native
+downlevel-limits pixel test; a browser run without WebGPU is still unrecorded. Open: browser-backed
+WebSocket/Workers/localStorage persistence, static import cycles, and a runaway-script interrupt
+(native QuickJS has a 5 s/task budget).
 
 ## Phase 4 — JavaScript and TypeScript parity
 

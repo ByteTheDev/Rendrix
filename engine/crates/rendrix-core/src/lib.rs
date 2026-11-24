@@ -24,6 +24,18 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Collect the inline content of every text block in a box tree (deduplicated by the
+/// caller's text system, which keys by `InlineContent::key`). Used by the first-frame
+/// prewarm so the text system can shape before Taffy asks.
+fn collect_inline_texts(n: &LayoutNode, out: &mut Vec<Arc<InlineContent>>) {
+    if let rendrix_layout::LayoutKind::Text(c) = &n.kind {
+        out.push(c.clone());
+    }
+    for c in &n.children {
+        collect_inline_texts(c, out);
+    }
+}
+
 /// Adapter so layout can measure text through the engine's shared text system.
 struct Measurer<'a>(&'a RefCell<TextSystem>);
 
@@ -60,12 +72,17 @@ pub struct EngineStats {
     /// snapshotted from `TextSystem::shape_nanos`. Includes layout measurement and display-list
     /// painting (both call `TextSystem::paragraph`); excludes renderer glyph rasterisation / GPU.
     pub last_text_shape_micros: u64,
+    /// Micros spent in the first-frame parallel text prewarm (between box build and Taffy
+    /// layout; zero on later frames and when the prewarm skips). Counted separately so the
+    /// box-build and Taffy rows stay attributable.
+    pub last_prewarm_micros: u64,
     /// First repainted update of the session, latched before `frames` increments so a second
     /// `update` in the same frame cannot overwrite it. Zero until that phase actually runs.
     pub first_style_micros: u64,
     pub first_box_build_micros: u64,
     pub first_taffy_layout_micros: u64,
     pub first_text_shape_micros: u64,
+    pub first_prewarm_micros: u64,
     pub first_paint_micros: u64,
     /// M0 shaping signals (populated per frame; Taffy new/restyled node counts
     /// stay inside `TaffyEngine` until its layout API exposes them).
@@ -333,6 +350,7 @@ impl Engine {
         self.stats.last_box_build_micros = 0;
         self.stats.last_taffy_layout_micros = 0;
         self.stats.last_text_shape_micros = 0;
+        self.stats.last_prewarm_micros = 0;
         // Latch the first repainted update. A second `update` inside the same `Session::frame`
         // sees `frames >= 1` and leaves the first-frame snapshot alone.
         let is_first = self.stats.frames == 0;
@@ -427,21 +445,23 @@ impl Engine {
             // dirty box units instead of rebuilding the whole tree — a class/text toggle
             // now touches one subtree rather than all ~9k boxes.
             if let Some(mut tree) = self.layout_tree.take() {
-                let roots: Vec<NodeId> = dirty
+                // Animating nodes must also be patched: their *effective* style changes
+                // every frame (sampled transition/animation), even though no DOM mutation
+                // marked them. Rebuilding just their units keeps a running transition on
+                // the incremental path instead of forcing a full tree rebuild per frame.
+                let mut roots: Vec<NodeId> = dirty
                     .style_roots
                     .iter()
                     .chain(dirty.state_roots.iter())
                     .copied()
-                    .filter(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n))
+                    .chain(self.anim_paint_ids())
                     .collect();
-                let anim_paint = !self.anim_paint_ids().is_empty();
-                if !all && !anim_paint && roots.is_empty() {
+                roots.retain(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n));
+                if !all && roots.is_empty() {
                     // No box input changed (e.g. caret blink, static fill): reuse as-is.
                     self.layout_tree = Some(tree);
                     refreshed = true;
-                } else if !all && !anim_paint && !roots.is_empty()
-                    && boxtree::patch_tree(self, &mut tree, &roots)
-                {
+                } else if !all && boxtree::patch_tree(self, &mut tree, &roots) {
                     // Only the dirty units were rebuilt; the old Taffy solution is still
                     // valid because no geometry-affecting property changed.
                     self.layout_tree = Some(tree);
@@ -489,11 +509,15 @@ impl Engine {
             // `layout_tree`; dirty regions are rebuilt and spliced by NodeId while clean
             // style-identical subtrees are reused. Falls back to `build_root` whenever the
             // patch cannot preserve full-build semantics (then output is still identical).
+            // Animations no longer disable patching: running motion only patches the
+            // animating units each frame (their effective styles change per frame), and
+            // layout-affecting motion reaches Taffy through the rebuilt units' style diff.
             let mut patched = false;
-            if !all && !animating {
+            if !all {
                 if let Some(mut tree) = self.layout_tree.take() {
                     let mut roots: Vec<NodeId> =
                         dirty.style_roots.iter().chain(dirty.state_roots.iter()).copied().collect();
+                    roots.extend(self.anim_ids());
                     roots.retain(|n| self.doc.is_alive(*n) && self.doc.is_connected(*n));
                     let mut dirty_boxes: HashSet<u64> = HashSet::new();
                     if roots.is_empty() {
@@ -546,9 +570,23 @@ impl Engine {
                     tree.style = Arc::new(s);
                     let box_elapsed = t1.elapsed();
                     self.stats.last_box_build_micros += box_elapsed.as_micros() as u64;
+                    // Cold-start lever: on the first layout every text block is about to be
+                    // measured at min- and max-content, so its shaping is knowable now. Hand
+                    // the contents to the text system before Taffy runs; it decides whether
+                    // parallel prewarming pays off (`prewarm_parallel` no-ops below its
+                    // threshold). Later frames rely on incremental caching and never pay this.
+                    if is_first {
+                        let mut contents = Vec::new();
+                        collect_inline_texts(&tree, &mut contents);
+                        if !contents.is_empty() {
+                            let t_prewarm = web_time::Instant::now();
+                            self.text.borrow_mut().prewarm_parallel(&contents);
+                            self.stats.last_prewarm_micros = t_prewarm.elapsed().as_micros() as u64;
+                        }
+                    }
+                    let t_taffy = web_time::Instant::now();
                     self.layout_result = self.layout.layout(&tree, self.viewport, &mut Measurer(&self.text));
-                    self.stats.last_taffy_layout_micros +=
-                        t1.elapsed().saturating_sub(box_elapsed).as_micros() as u64;
+                    self.stats.last_taffy_layout_micros += t_taffy.elapsed().as_micros() as u64;
                     self.layout_tree = Some(tree);
                     self.apply_float_clear();
                 } else {
@@ -593,6 +631,7 @@ impl Engine {
             self.stats.first_box_build_micros = self.stats.last_box_build_micros;
             self.stats.first_taffy_layout_micros = self.stats.last_taffy_layout_micros;
             self.stats.first_text_shape_micros = self.stats.last_text_shape_micros;
+            self.stats.first_prewarm_micros = self.stats.last_prewarm_micros;
             self.stats.first_paint_micros = self.stats.last_paint_micros;
         }
     }
@@ -1287,6 +1326,19 @@ fn apply_float_clear(tree: &LayoutNode, out: &mut LayoutResult) {
     use rendrix_css::{Clear, Float};
 
     fn adjust(parent: &LayoutNode, out: &mut LayoutResult) {
+        // Floats and clears only re-arrange a container's own children. When none of this
+        // parent's children float or clear, the pass is a no-op for it: skip the child
+        // collect + sort entirely (the per-parent sort was a whole-tree cost on every
+        // layout, dominate or not) and only keep descending.
+        let relevant = parent.children.iter().any(|c| {
+            c.style.float != Float::None || c.style.clear != Clear::None
+        });
+        if !relevant {
+            for c in &parent.children {
+                adjust(c, out);
+            }
+            return;
+        }
         if let Some(pbox) = out.boxes.get(&parent.id).copied() {
             let cx = pbox.border[3] + pbox.padding[3];
             let cw = (pbox.width - pbox.border[1] - pbox.border[3] - pbox.padding[1] - pbox.padding[3]).max(0.0);

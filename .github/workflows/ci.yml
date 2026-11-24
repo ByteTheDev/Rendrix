@@ -21,8 +21,14 @@ jobs:
       - name: Linux system libraries (windowing, clipboard, software Vulkan)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libxcb1-dev mesa-vulkan-drivers libudev-dev
+      # The GPU-heavy gfx suite creates a fresh wgpu instance/device per test. On Linux's
+      # headless software drivers (lavapipe/X11) concurrent device creation intermittently
+      # segfaults the test binary, so run that package's tests serially. It is a separate
+      # process from the rest of the workspace, which stays parallel.
       - name: Rust tests (GPU tests skip themselves when no adapter exists)
-        run: cargo test --workspace --manifest-path engine/Cargo.toml
+        run: |
+          cargo test --workspace --exclude rendrix-gfx --manifest-path engine/Cargo.toml
+          cargo test -p rendrix-gfx --manifest-path engine/Cargo.toml -- --test-threads=1
       - name: Build the release runtime
         run: cargo build --release -p rendrix-runtime --manifest-path engine/Cargo.toml
       - name: CLI tests (uses the runtime built above)
@@ -32,3 +38,73 @@ jobs:
           export RENDRIX_RUNTIME="$PWD/engine/target/release/rendrix-runtime"
           [ -f "$RENDRIX_RUNTIME.exe" ] && export RENDRIX_RUNTIME="$RENDRIX_RUNTIME.exe"
           node --test packages/cli/test/*.test.mjs
+
+  windows-cross-compile:
+    name: engine cross-compile check (windows ${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            target: i686-pc-windows-msvc
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      # rquickjs-sys has no pregenerated bindings for i686-pc-windows-msvc, so the x86 leg
+      # enables its `bindgen` feature, which needs libclang at build time.
+      - name: Install LLVM for libclang (x86 only)
+        if: matrix.arch == 'x86'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) {
+            choco install llvm -y --no-progress
+          }
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install Rust toolchain with ${{ matrix.target }} target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check rendrix-runtime compiles for windows ${{ matrix.arch }} (${{ matrix.target }})
+        run: cargo check --target ${{ matrix.target }} -p rendrix-runtime --manifest-path engine/Cargo.toml
+
+  linux-cross-compile:
+    name: engine cross-compile check (linux ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            target: i686-unknown-linux-gnu
+            cross: i686-linux-gnu
+          - arch: armv7
+            target: armv7-unknown-linux-gnueabihf
+            cross: arm-linux-gnueabihf
+          - arch: riscv64
+            target: riscv64gc-unknown-linux-gnu
+            cross: riscv64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      # rquickjs-sys (rendrix-js) compiles QuickJS from C source for the target, so every leg
+      # needs the matching cross gcc/g++. `cargo check` never links the final binary, so gilrs'
+      # libudev-sys build script only needs pkg-config to succeed: libudev-dev plus
+      # PKG_CONFIG_ALLOW_CROSS=1 let it probe the host metadata harmlessly.
+      - name: Install the ${{ matrix.cross }} cross C toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-${{ matrix.cross }} g++-${{ matrix.cross }} libudev-dev
+      - name: Install Rust toolchain with ${{ matrix.target }} target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Point cargo and cc at the ${{ matrix.cross }} toolchain
+        run: |
+          triple="$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
+          echo "CARGO_TARGET_${triple}_LINKER=${{ matrix.cross }}-gcc" >> "$GITHUB_ENV"
+          echo "CC_${triple}=${{ matrix.cross }}-gcc" >> "$GITHUB_ENV"
+          echo "CXX_${triple}=${{ matrix.cross }}-g++" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+      - name: Check rendrix-runtime compiles for linux ${{ matrix.arch }} (${{ matrix.target }})
+        run: cargo check --target ${{ matrix.target }} -p rendrix-runtime --manifest-path engine/Cargo.toml

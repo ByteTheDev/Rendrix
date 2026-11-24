@@ -18,14 +18,21 @@ Usage:
   rendrix build [dir] [--out file] [--no-typecheck] [--check-js] compile to a .rdxapp bundle
   rendrix run [dir]                                 build and run once
   rendrix check [dir] [--check-js]                  type-check only
-  rendrix package [dir] [--out file] [--runtime P] [--installer none|nsis] [--sign] [--manifest file] [--manifest-key key.pem] [--publish-url url] [--app-version x.y.z]
-  build a standalone executable
+  rendrix package [dir] [--out file] [--runtime P] [--target TRIPLE] [--icon FILE] [--installer none|nsis|zip|tarball] [--sign] [--manifest file] [--manifest-key key.pem] [--publish-url url] [--app-version x.y.z]
+  build a standalone executable, .app bundle (macOS) or tarball (Linux)
   rendrix render <page.html|dir> -o out.png|out.pdf|frames/ [--size WxH] [--scale S] [--frames N] [--frame-ms MS] [--script steps.json]
   render a page headlessly (PNG, PDF, or a PNG frame sequence for the /video pipeline)
   rendrix doctor [dir]                              verify the toolchain, GPU and runtime
   rendrix help | version
 
 Options (any command that takes [dir] defaults to the current directory):
+  --target TRIPLE                                    package for another OS/arch (e.g. aarch64-apple-darwin,
+                                                     x86_64-unknown-linux-gnu, i686-pc-windows-msvc / win32-x86,
+                                                     i686-unknown-linux-gnu / linux-x86,
+                                                     armv7-unknown-linux-gnueabihf / linux-armv7,
+                                                     riscv64gc-unknown-linux-gnu / linux-riscv64);
+                                                     needs --runtime or RENDRIX_HOME
+  --icon FILE                                        square .png or .icns used for the macOS/Linux app icon
   --headless / --screenshot <png> / --script <json>   passed through to the runtime by \`run\`
 `;
 
@@ -43,6 +50,8 @@ function parse(argv) {
     else if (a === '--name') opts.name = argv[++i];
     else if (a === '--template') opts.template = argv[++i];
     else if (a === '--runtime') opts.runtime = argv[++i];
+    else if (a === '--target') opts.target = argv[++i];
+    else if (a === '--icon') opts.icon = argv[++i];
     else if (a === '--installer') opts.installer = argv[++i];
     else if (a === '--sign') opts.sign = true;
     else if (a === '--manifest') opts.manifest = argv[++i];

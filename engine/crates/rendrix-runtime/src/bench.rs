@@ -68,9 +68,13 @@ struct StartupBreakdown {
     first_box_build_ms: f64,
     first_taffy_ms: f64,
     first_shape_ms: f64,
+    first_prewarm_ms: f64,
     first_paint_ms: f64,
     first_gpu_submit_ms: f64,
     first_frame_shapes: usize,
+    first_frame_rewraps: usize,
+    first_cache_hits: usize,
+    first_cache_len: usize,
 }
 
 impl StartupBreakdown {
@@ -78,6 +82,7 @@ impl StartupBreakdown {
         println!("\nStartup breakdown (single observation — re-run on a quiet machine before publishing):");
         println!("  setup total              {:8.2} ms", self.setup_ms);
         println!("    font DB load           {:8.2} ms  ({})", self.font_db_ms, if self.font_db_cache_hit { "cache hit" } else { "full scan" });
+        println!("      (loads on a background thread; overlaps JS eval and the rest of setup)");
         println!("    JS DOM construction    {:8.2} ms", self.js_dom_ms);
         println!("    other setup            {:8.2} ms  (DOM parse, JS engine init, GPU init)", self.other_setup_ms);
         println!("  first frame (CPU)        {:8.2} ms", self.first_frame_ms);
@@ -85,6 +90,9 @@ impl StartupBreakdown {
         println!("    first box build        {:8.2} ms", self.first_box_build_ms);
         println!("    first Taffy layout     {:8.2} ms", self.first_taffy_ms);
         println!("    first text shaping     {:8.2} ms  ({} paragraphs)", self.first_shape_ms, self.first_frame_shapes);
+        println!("    template rewraps       {:8}  (paragraphs built by clone+rewrap, no rustybuzz)", self.first_frame_rewraps);
+        println!("    first prewarm          {:8.2} ms  (parallel shaping between box build and layout; 0 when skipped)", self.first_prewarm_ms);
+        println!("    text cache on frame 1  {:8} hits, {} entries", self.first_cache_hits, self.first_cache_len);
         println!("    first paint (display)  {:8.2} ms", self.first_paint_ms);
         println!("  first GPU submit         {:8.2} ms  (render + device poll)", self.first_gpu_submit_ms);
         println!("  (text shaping overlaps layout + display paint; do not sum the indented rows)");
@@ -102,6 +110,9 @@ pub fn run(items: usize, iterations: usize) -> Result<(), String> {
     // the first GPU submit of the freshly built display list. These feed only the breakdown below.
     let fs = h.session.engine.borrow().stats.clone();
     let shapes_first = h.session.engine.borrow().text_system().shape_count;
+    let rewraps_first = h.session.engine.borrow().text_system().rewrap_count;
+    let cache_first = h.session.engine.borrow().text_system().cache_hits;
+    let cache_len_first = h.session.engine.borrow().text_system().cache_len();
     let gpu_first = h.render_timed();
     h.settle(Duration::from_secs(1));
     let nodes = h.session.engine.borrow().doc.node_count();
@@ -122,9 +133,13 @@ pub fn run(items: usize, iterations: usize) -> Result<(), String> {
         first_box_build_ms: fs.first_box_build_micros as f64 / 1000.0,
         first_taffy_ms: fs.first_taffy_layout_micros as f64 / 1000.0,
         first_shape_ms: fs.first_text_shape_micros as f64 / 1000.0,
+        first_prewarm_ms: fs.first_prewarm_micros as f64 / 1000.0,
         first_paint_ms: fs.first_paint_micros as f64 / 1000.0,
         first_gpu_submit_ms: gpu_first.as_secs_f64() * 1000.0,
         first_frame_shapes: shapes_first,
+        first_frame_rewraps: rewraps_first,
+        first_cache_hits: cache_first,
+        first_cache_len: cache_len_first,
     }
     .print();
 

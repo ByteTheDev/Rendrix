@@ -7,7 +7,7 @@ Date of audit: 2026-11-14. Platform: Windows 11, NVIDIA GeForce RTX 3060, Vulkan
 - **Interactive scenarios fit a 60 FPS budget (16.7 ms).** Hover and scrolling run at ~1.2 ms; DOM mutations at ~6.5–7 ms; 120 FPS (8.3 ms) is met for hover/scroll and at the limit for mutations.
 - **The old whole-tree bottleneck is fixed.** Incremental box generation ("P1"), stylesheet/`RuleSet` caching and viewport-dependency pruning landed; the remaining mutation cost is the Taffy re-solve plus `InlineContent::key` rehashing, not full box-tree rebuilds.
 - **Viewport resize is no longer the worst case** (~10 ms in the last clean run, down from 36.1 ms): CSS restyle is ~0.35 ms when no media-dependent rules changed; the residual ~8 ms is Taffy re-solving 9,009 nodes.
-- **Cold-start numbers below are stale.** A disk font-database cache and LRU glyph atlas landed after they were recorded. Two re-measurement attempts on 2026-11-16 produced mutually inconsistent results (see "Re-measurement note" below), so no new cold-start claim is made — re-run on a quiet machine before publishing.
+- **Cold-start numbers below are stale.** A disk font-database cache and LRU glyph atlas landed after they were recorded. Two re-measurement attempts on 2026-11-16 produced mutually inconsistent results (see "Re-measurement note" below), so no new cold-start claim is made there. A labeled concurrent-load re-measurement **and** cold-start cuts landed on 2026-11-22 — see "Cold start re-measured and cut" below; a quiet-machine re-measurement is still pending.
 - **Idle applications do no work** (no timer/animation/pending change → no frame); an idle frame is GPU-only when one is produced.
 - **Executable size 13.8 MB** (release, Windows, thin LTO). GPU instance buffer grows to the next power of two.
 
@@ -193,6 +193,98 @@ and JS DOM construction at ~56–60 ms). The `< 0.2 s` first-frame goal is **not
 shaping count is inherent to the benchmark's unique text and already deduplicated by
 `content.key()` and width-bucketing. See `docs/PERF_RESIZE_DESIGN.md` for the resize analysis
 and `docs/PERF_BINARY_SIZE.md` for the (unverified) release-profile size work.
+
+## Post cache/nowrap observation (2026-11-18)
+
+Single quiet-machine `bench 1000` run after raising `PARA_CACHE_CAP` to 8192 and collapsing
+nowrap widths to one shaping. The scenario table is unchanged within run-to-run variance;
+the first-frame numbers moved substantially:
+
+| Metric | Previous reference | This observation |
+|---|---:|---:|
+| Startup total | 588–952 ms | 670.4 ms |
+| First frame (CPU) | 726–1086 ms | 313.0 ms |
+| First-frame paragraphs shaped | ~9,985 | 4,017 |
+| Frame-1 text cache | not instrumented | 23,051 hits, 4,017 entries |
+| Viewport resize | 7.81–10.07 ms | 8.24 ms |
+
+The shape count is the meaningful change: with a cache large enough to hold a first-frame key
+set, layout→paint and repeat lookups hit instead of re-shaping evicted entries. The nowrap
+normalization does not affect this benchmark (its content uses normal `white-space`). First
+frame is still well above the `< 0.2 s` goal, and ~268 ms of its ~286 ms layout time is
+shaping; deriving min-content widths from the max-content paragraph instead of shaping at
+width 0 remains the next real lever. Treat this as one observation, not a published result —
+re-run on a quiet machine before replacing the numbers above.
+
+## Cold start re-measured and cut (2026-11-22, cold-start track)
+
+**Measurement conditions, read first.** All numbers below are medians of 3 `bench 1000` release
+runs on the reference machine **while two other agents were building and testing on it** —
+they are relative signals under concurrent load, not quiet-machine absolutes; the maintainer
+should re-measure quietly after merge. The "before" medians were taken the same way, minutes
+earlier, on the same tree state. The working tree also contains the layout track's in-flight
+Taffy/boxtree work, so steady-state scenario rows are **not** attributable to this track; the
+startup/first-frame rows are (they are dominated by phases the layout track does not touch,
+and the new breakdown rows attribute them exactly).
+
+### What the profile showed (evidence before fixing)
+
+- First frame was ~85% text shaping: 416.0 ms total, of which 354.4 ms shaped 4,017
+  paragraphs (~2 per unique content: min-content at width 0 + max-content unconstrained).
+  Taffy's own solve was ~29 ms (383.4 layout minus the shaping inside it); restyle ~30 ms;
+  paint and first GPU submit ≤5 ms.
+- A probe built each paragraph twice — fresh full shape vs clone-of-shaped-buffer + re-wrap —
+  and compared full glyph geometry: **bit-for-bit identical** (widths, line counts, glyph
+  positions, metadata), with the rewrap at ~2–25 µs vs ~12–240 µs per full shape.
+- Startup (684.6 ms median) split into: GPU context init **~544 ms** (wgpu instance +
+  adapter + device), session construction ~114 ms (font DB 24 + JS DOM 71 + parse/engine),
+  renderer pipelines ~28 ms — all strictly serial before this work.
+
+### What landed
+
+1. **Template rewraps** (`rendrix-gfx/text.rs`): the first fully shaped paragraph per content
+   is registered as a template; every other width for that content clones its cosmic-text
+   `Buffer` and re-wraps (cosmic keeps the shaped `ShapeLine` in a cloned `BufferLine`, and
+   `set_size` only re-runs the wrapping). Pinned bit-for-bit by
+   `rewrap_is_measurement_identical` over wrapping/CJK/hard-break/multi-size content.
+   `shape_count` now counts full rustybuzz shapes; new `rewrap_count` counts rewraps.
+2. **First-frame parallel prewarm**: after the first box build the engine collects every
+   inline content (`rendrix-core` hook, first frame only) and `TextSystem::prewarm_parallel`
+   shapes them across worker threads (each with its own `FontSystem` from a cloned font DB,
+   deterministic) plus the width-0 variant by rewrap, inserting both under the exact cache
+   keys Taffy will query. Below 16 fresh contents it no-ops; worker failure degrades to
+   on-demand shaping. Identity pinned by `prewarm_parallel_matches_on_demand_and_leaves_hits`.
+3. **Font DB loads on a background thread** (disk cache or full system scan), started in
+   `TextSystem::new()`, joined at the first font use — overlapping DOM parse + JS eval
+   instead of blocking startup. A dead loader falls back to a synchronous load.
+4. **Headless driver overlap** (`rendrix-runtime/headless.rs`): `Session::new` (CPU-only) now
+   runs while the GPU context + renderer initialize on a worker thread. The **windowed**
+   driver keeps serial init (surface/event-loop/a11y ordering, untestable headless from this
+   track) — adopting the same overlap there is a noted follow-up.
+
+### Before/after (medians of 3, concurrent load, `bench 1000`)
+
+| Metric | Before | After | Note |
+|---|---:|---:|---|
+| Startup (Headless::new) | 684.6 ms | **419.5 ms** | session + font DB now hide under GPU init |
+| First frame (CPU) | 416.0 ms | **81.0 ms** | goal `< 200 ms` met; worst of 3 runs was 94.9 ms |
+| — first Taffy layout | 383.4 ms | 14.5 ms | measurements hit the prewarmed cache |
+| — shaping work | 354.4 ms / 4,017 full shapes | 228.5 ms cumulative / 2,008 full + 2,009 rewraps | executed in **~37–42 ms wall** across workers |
+| — first parallel prewarm | — | 37.2 ms | new phase between box build and Taffy |
+| — first restyle | 30.2 ms | 24.8 ms | unchanged path, run-to-run variance |
+| Font DB load | 24.1 ms (serial) | 14.7 ms (background) | off the startup path entirely |
+| JS DOM construction | 71.3 ms | 65.1 ms | unchanged |
+| Other setup (GPU init + parse + engine) | 586.2 ms | 339.7 ms | remaining startup floor is wgpu init |
+| First GPU submit | 3.3–4.4 ms | 3.3–4.3 ms | unchanged |
+| Display list | 119 items / 1 batch / 773 instances | identical | pixels unchanged |
+
+Full-scan robustness check: with `RENDRIX_NO_FONT_CACHE=1` (no disk cache) the background
+full system scan (54 ms that run, OS-warm) stays fully hidden under GPU init + JS eval.
+
+The `< 0.2 s` first-frame goal is **met** for this benchmark under load. Startup's remaining
+~340 ms is almost entirely wgpu adapter/device initialization — the next lever is GPU-context
+work (or deferring first-frame GPU work), which is outside the text/startup track. Re-measure
+quietly before publishing absolutes.
 
 ## Pipeline cost breakdown
 

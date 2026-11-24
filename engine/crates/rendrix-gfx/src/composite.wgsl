@@ -37,7 +37,9 @@ const MODE_REPLACE_BACKDROP: f32 = 1.0;
 const MODE_REPLACE_PLAIN: f32 = 2.0;
 
 @group(0) @binding(0) var<uniform> u: LayerU;
-@group(0) @binding(1) var<storage, read> poly: array<vec2<f32>>;
+// Uniform rather than storage: WebGL2 has no SSBOs. vec4 gives the 16-byte
+// uniform-array stride WGSL requires; only .xy is used.
+@group(0) @binding(1) var<uniform> poly: array<vec4<f32>, 64>;
 @group(1) @binding(0) var layer_tex: texture_2d<f32>;
 @group(1) @binding(1) var backdrop_tex: texture_2d<f32>;
 @group(1) @binding(2) var raw_backdrop_tex: texture_2d<f32>;
@@ -128,8 +130,8 @@ fn point_in_poly(p: vec2<f32>, n: u32) -> bool {
     var inside = false;
     var j = n - 1u;
     for (var i = 0u; i < n; i = i + 1u) {
-        let a = poly[i];
-        let b = poly[j];
+        let a = poly[i].xy;
+        let b = poly[j].xy;
         if (((a.y > p.y) != (b.y > p.y)) && (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x)) {
             inside = !inside;
         }

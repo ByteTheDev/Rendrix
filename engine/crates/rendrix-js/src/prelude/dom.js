@@ -1363,6 +1363,7 @@ function normalizeMesh(m, i) {
       metal: Number.isFinite(+mat.metal) ? +mat.metal : 0,
       rough: Number.isFinite(+mat.rough) ? +mat.rough : 0.8,
       emissive: Number.isFinite(+mat.emissive) ? Math.min(1, Math.max(0, +mat.emissive)) : 0,
+      cull: (mat.cull === 'back' || mat.cull === 'front') ? mat.cull : 'none',
     },
     transform: {
       pos: num3(xf.pos, [0, 0, 0]),
@@ -1414,7 +1415,23 @@ class RendrixSceneHandle {
   addPlane(opts) { return this._add({ kind: 'plane', size: (opts && opts.size !== undefined) ? opts.size : 1 }, opts); }
   remove() { N('scene3d_remove', this._el[ID]); }
 }
+function rgbaToB64(data) {
+  if (typeof data === 'string') return data; // already base64
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 8192) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  }
+  return btoa(s);
+}
 const RendrixScene = {
+  /** Stage an RGBA texture (Uint8Array, ImageData.data, or base64 string) for material.textureId. */
+  setTexture(id, data, width, height) {
+    mut('scene3d_texture', +id, rgbaToB64(data), +width, +height);
+  },
+  deleteTexture(id) {
+    mut('scene3d_texture_remove', +id);
+  },
   createScene(target, desc = {}) {
     const el = resolveSceneHost(target);
     const full = normalizeDesc(desc);

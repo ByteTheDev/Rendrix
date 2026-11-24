@@ -819,6 +819,13 @@ pub(crate) fn patch_tree_with_units(engine: &Engine, old_root: &mut LayoutNode, 
         if !engine.doc.is_alive(*id) || !engine.doc.is_connected(*id) {
             continue; // removed; the surviving parent covers it via its own dirty root
         }
+        // The document node (not an element, no parent) reaches the roots through hover
+        // chains: it generates no box and the restyle pass already skips it, so the
+        // element roots below it carry the change. Bailing here would force a full
+        // `build_root` for every pointer-driven state flip.
+        if engine.doc.element(*id).is_none() && engine.doc.parent(*id).is_none() {
+            continue;
+        }
         let mut chosen = None;
         for cand in unit_candidates(engine, *id) {
             if old_root.id == cand as u64 || find_node(old_root, cand as u64).is_some() {
@@ -839,7 +846,8 @@ pub(crate) fn patch_tree_with_units(engine: &Engine, old_root: &mut LayoutNode, 
     let dirty: HashSet<NodeId> = dirty_ids.iter().copied().collect();
     let mut pool: HashMap<u64, LayoutNode> = HashMap::new();
     let mut rebuilt_units = Vec::with_capacity(units.len());
-    for u in units {
+    for u in &units {
+        let u = *u;
         if old_root.id == u as u64 {
             let children = std::mem::take(&mut old_root.children);
             for ch in children {
@@ -878,7 +886,7 @@ pub(crate) fn patch_tree_with_units(engine: &Engine, old_root: &mut LayoutNode, 
             None => {
                 // The whole unit is now `display: none`: drop it.
                 if old_root.id == u as u64 {
-                    return (false, Vec::new()); // root `display: none`: let build_root produce None
+                    return (false, Vec::new()); // root display: none: let build_root produce None
                 }
                 remove_node(old_root, u as u64);
                 // The removed box is no longer in the tree, so its former parent must re-run

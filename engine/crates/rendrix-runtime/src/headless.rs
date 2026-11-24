@@ -84,11 +84,41 @@ impl Shot {
 
 impl Headless {
     /// `size` is in logical pixels; the target is `size * scale` physical pixels.
+    ///
+    /// GPU-context + renderer construction (adapter/device init, pipeline compile — the
+    /// bulk of cold setup) runs on a worker thread while the main thread builds the
+    /// `Session` (DOM parse + JS evaluation are CPU-only and do not touch the GPU). Both
+    /// wgpu resources and the renderer are plain data on the other side, so the join is
+    /// just a thread handoff; the two phases used to run serially.
     pub fn new(bundle: &AppBundle, size: (u32, u32), scale: f32) -> Result<Headless, String> {
-        let ctx = GpuContext::headless()?;
-        let adapter = ctx.adapter_name();
-        let renderer = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
-        let session = Session::new(bundle, Box::new(MemoryClipboard::default()), (size.0 as f32, size.1 as f32, scale))?;
+        let gpu = std::thread::Builder::new()
+            .name("rendrix-gpu-init".into())
+            .spawn(|| -> Result<(String, Renderer), String> {
+                let ctx = GpuContext::headless()?;
+                let adapter = ctx.adapter_name();
+                let renderer = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+                Ok((adapter, renderer))
+            })
+            .expect("GPU init thread");
+        // CPU-only session construction overlaps the GPU init above.
+        let session = match Session::new(bundle, Box::new(MemoryClipboard::default()), (size.0 as f32, size.1 as f32, scale)) {
+            Ok(s) => s,
+            Err(e) => {
+                // Don't leak a running init thread on the error path.
+                let _ = gpu.join();
+                return Err(e);
+            }
+        };
+        let (adapter, renderer) = match gpu.join() {
+            Ok(Ok(pair)) => pair,
+            // The thread died (never expected): redo the init synchronously.
+            _ => {
+                let ctx = GpuContext::headless()?;
+                let adapter = ctx.adapter_name();
+                let renderer = Renderer::new(ctx.device, ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+                (adapter, renderer)
+            }
+        };
         Ok(Headless { session, renderer, size, scale, adapter })
     }
 

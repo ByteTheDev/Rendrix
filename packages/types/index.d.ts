@@ -43,11 +43,16 @@ export interface RendrixSceneGeo {
 }
 
 export interface RendrixSceneMaterial {
-  /** `[r,g,b]`/`[r,g,b,a]` in 0-1 (or 0-255) or a CSS color string. */
+  /** `[r,g,b]`/`[r,g,b,a]` in 0-1 (or 0-255) or a CSS color string.
+   * `a < 1` selects the GPU alpha-blended pipeline; opaque meshes render first. */
   color?: [number, number, number] | [number, number, number, number] | string;
   metal?: number;
   rough?: number;
   emissive?: number;
+  /** Which faces the GPU pipeline culls. Defaults to `"none"` (double-sided). */
+  cull?: "none" | "back" | "front";
+  /** Id registered with `RendrixScene.setTexture`. Textures sample with primitive UVs. */
+  textureId?: number;
 }
 
 export interface RendrixSceneTransform {
@@ -63,8 +68,18 @@ export interface RendrixSceneMesh {
 }
 
 export interface RendrixSceneLight {
+  /** `"dir"` (default), `"ambient"`, or `"point"`. */
+  kind?: "dir" | "directional" | "ambient" | "point";
+  /** Travel direction for directional lights. Alias: `direction`. */
   dir?: [number, number, number];
   direction?: [number, number, number];
+  /** World-space position for point lights. Alias: `position`. */
+  pos?: [number, number, number];
+  position?: [number, number, number];
+  color?: [number, number, number] | string;
+  intensity?: number;
+  /** Point-light falloff distance; 0 (default) means no attenuation. */
+  range?: number;
 }
 
 /** Scene description shared with the GPU scene backend (forwards-compatible). */
@@ -108,6 +123,9 @@ export interface RendrixBoxSceneOptions {
 declare global {
   /** Primary 3D API: desc-based scenes on `<canvas>` (and API-compatible `<rendrix-scene>` hosts). */
   const RendrixScene: {
+    /** Stage an RGBA texture for a material's `textureId`. */
+    setTexture(id: number, data: Uint8Array | Uint8ClampedArray | number[] | string, width: number, height: number): void;
+    deleteTexture(id: number): void;
     createScene(target: HTMLCanvasElement | Element | string, desc?: RendrixSceneDesc): RendrixSceneHandle;
     getScene(target: HTMLCanvasElement | Element | string): RendrixSceneDesc | null;
   };

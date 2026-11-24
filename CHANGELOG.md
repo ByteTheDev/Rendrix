@@ -14,6 +14,14 @@ and runtime. See `docs/ENGINE_ASSESSMENT.md`.
   transitions/animations, timers/`requestAnimationFrame`, images (see `docs/COMPATIBILITY.md`).
 - New CLI: `rendrix init | dev | build | run | check | package | doctor` with TypeScript type-checking, TSX
   (`rendrix/jsx-runtime`), `node_modules` ESM resolution and `.rdxapp` / standalone executable output.
+- Multi-architecture Windows packaging: `--target win32-x86` (32-bit, `i686-pc-windows-msvc` /
+  `i686-pc-windows-gnu`, aliases `x86` / `ia32`) joins `win32-x64` and `win32-arm64`; x64 is hardware-verified,
+  the other two are compile-checked in CI but not run here.
+- Multi-architecture Linux packaging: `--target linux-x86` (`i686-unknown-linux-gnu`), `linux-armv7`
+  (`armv7-unknown-linux-gnueabihf`, aliases `armv7` / `armhf`, the Raspberry Pi 32-bit target; 32-bit ARM
+  hosts, which Node reports as arch `arm`, auto-detect to it) and `linux-riscv64`
+  (`riscv64gc-unknown-linux-gnu`, alias `riscv64`) join `linux-x64` / `linux-arm64`; all three are
+  compile-checked in CI only, not run on hardware here.
 - `examples/app-counter` and a scripted end-to-end test (`npm run e2e`); `npm run bench`.
 - Offscreen compositing layers: real `backdrop-filter`, true Gaussian `filter: blur()` and per-pixel
   `clip-path: polygon()` (ordinary frames keep the single-draw-call path).
@@ -37,6 +45,18 @@ and runtime. See `docs/ENGINE_ASSESSMENT.md`.
 - Small images (≤512 px per edge) pack into a shared atlas and merge into one draw batch; large images and dynamic canvases keep dedicated textures.
 - All passes in a layered frame (flat runs, backdrop snapshots, blur, composite, blit) are recorded in display-list order into one encoder and submitted once; flat content after a layer paints above it again, and a layer's backdrop excludes later content. Pooled layer targets are cleared to transparent each frame, and `backdrop-filter` grayscale/brightness now affect the backdrop.
 - Fixed zero-size `render_to_rgba`, frame-wide profiling counters for layered frames, and mid-frame glyph-atlas recycling inside nested layers.
+
+### Performance and web target (2026-11-18)
+- First-frame shaping: `nowrap`/`pre` text now shares one shaping across min-content, max-content and definite-width queries instead of up to three, with a geometry-identity test. The paragraph LRU grows to 8192 entries so a ~10k-key first frame no longer thrashes; small apps still allocate only what they use. The benchmark's startup breakdown now prints frame-1 cache hits and cache size.
+- WebGL2 fallback: the renderer no longer needs shader storage buffers. Instance data is read from a 48-entry uniform array with chunked draws, and polygon clipping uses a uniform buffer, both selected from device limits so the native WebGPU path is byte-for-byte unchanged. A native regression test renders identical pixels under `downlevel_webgl2_defaults()`. A real no-WebGPU browser run is still unrecorded.
+- The two superseded ignored Session-level tests now print why they were replaced instead of panicking with `todo!()`, so `cargo test -- --ignored` stays green.
+
+### Cold start (2026-11-22)
+- First-frame text no longer re-runs rustybuzz per width: the first fully shaped paragraph per content becomes a *template*, and every other width (min-content, max-content, definite) re-wraps a clone of its cosmic-text buffer. A geometry-identity test (`rewrap_is_measurement_identical`, over wrapping/CJK/hard-break/multi-size content) pins the clone+rewrap bit-for-bit to a fresh shape; the probe measured it ~5–15× cheaper. `TextSystem` gains `rewrap_count`/`rewrap_nanos`, and `shape_count` now counts full shapes only.
+- The first frame prewarms in parallel: after the first box build the engine hands every inline content to `TextSystem::prewarm_parallel`, which shapes them across worker threads (each with its own `FontSystem` built from a cloned font database) plus the width-0 variants by rewrap, and inserts both under the exact cache keys Taffy will query. On-demand identity is test-pinned; below 16 fresh contents the prewarm no-ops, and a failed worker degrades to on-demand shaping. New `EngineStats::first/last_prewarm_micros` keep the phase attributable.
+- The font database now loads on a background thread (disk cache or full system scan), overlapping DOM parse + JS evaluation; the first font use joins it, and a dead loader thread falls back to a synchronous load. `TextSystem::fonts` is private behind an `ensure_loaded` accessor as part of this.
+- The headless driver builds its `Session` while the GPU context and renderer initialize on a worker thread (both phases were serial). The windowed driver keeps serial init for now (surface/event-loop ordering is untestable from a headless track) — noted as a follow-up.
+- `bench 1000` medians under concurrent load (two other agents building on the same machine; relative signals — re-measure quietly): startup 684.6 → 419.5 ms, first frame 416.0 → **81.0 ms** (the `< 0.2 s` goal), 4,017 full shapes → 2,008 full + 2,009 rewraps executed in ~37–42 ms of prewarm wall time, first Taffy layout 383.4 → 14.5 ms (measurement cache hits), display list unchanged (119 items / 1 batch / 773 instances). The startup breakdown prints the new rewrap, prewarm and background-load rows.
 
 ### Removed
 - Electron compatibility layer, Electron project importer and their docs/examples.
