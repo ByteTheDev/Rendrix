@@ -1337,7 +1337,7 @@ for (const [k, v] of Object.entries(rendrixApi)) Object.defineProperty(global, '
 
 // Public application API (also importable as the `rendrix` module).
 const rendrixPublic = Object.freeze({
-  version: '0.5.0', engine: 'rendrix',
+  version: '0.5.1', engine: 'rendrix',
   quit: () => N('quit'),
   window: Object.freeze({ setTitle: t => { document.title = String(t); }, close: () => N('window_close'), resize: (w, h) => N('window_resize', +w, +h), open: (url, target, features) => openWindow(url, target, features) }),
   clipboard: navigatorObj.clipboard,
