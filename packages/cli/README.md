@@ -1,4 +1,4 @@
-# @bytethedeveloper/rendrix (CLI)
+# @renasine-studios/rendrix (CLI)
 
 The `rendrix` command builds and runs TypeScript applications on the Rendrix engine.
 
