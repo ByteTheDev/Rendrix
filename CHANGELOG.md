@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.5.0 — Rendrix becomes a rendering engine and application runtime (unreleased)
+## 0.5.1 — Startup, animation layout and architecture targets
+
+Patch release on top of 0.5.0. Full details are in the 0.5.0 sections below; the changes since the
+0.5.0 tag are:
+
+- **Startup:** first frame cut roughly 5× (template rewraps and parallel text prewarm); font database loads
+  on a background thread. See *Cold start (2026-11-22)*.
+- **Layout:** animations stay on the incremental layout path instead of forcing a full re-solve.
+- **Packaging:** 32-bit Windows (`win32-x86`), 32-bit Linux (`linux-x86`), ARMv7 (`linux-armv7`) and
+  RISC-V 64 (`linux-riscv64`) targets join the existing x64/ARM64 packages.
+- **CI:** rendrix-gfx tests run serialized on Linux, fixing an intermittent SIGSEGV.
+- Engine/CLI/types packages now report version `0.5.1`.
+
+## 0.5.0 — Rendrix becomes a rendering engine and application runtime
 
 Direction change: Rendrix no longer targets Electron compatibility or a static HTML-subset compiler. It is
 an independent engine that runs TypeScript applications with its own DOM, CSS engine, layout, GPU renderer
