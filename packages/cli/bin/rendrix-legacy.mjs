@@ -427,7 +427,7 @@ async function checkReleaseManifest(renderer,report,{explicit,cached}) {
     // A repository checkout has no bundled manifest and its version has no release, so a missing one is only a note there.
     const offline = downloadsDisabled();
     if (offline || nativeSource()) { report('ok',`release manifest not checked (${offline ? 'downloads are disabled' : 'repository checkout'}): ${error.message}`); return; }
-    report(cached.state==='ok' ? 'warn' : 'fail',`cannot read the host manifest: ${error.message}`,'update rendrix (npm i -g @bytethedeveloper/rendrix@latest) or check your network and RENDRIX_HOST_BASE_URL');
+    report(cached.state==='ok' ? 'warn' : 'fail',`cannot read the host manifest: ${error.message}`,'update rendrix (npm i -g @renasine-studios/rendrix@latest) or check your network and RENDRIX_HOST_BASE_URL');
     return;
   }
   const entry = loaded.manifest.hosts.find(host=>host.renderer===renderer && host.target===currentTarget());

@@ -1,5 +1,5 @@
 {
-  "name": "@bytethedeveloper/rendrix",
+  "name": "@renasine-studios/rendrix",
   "version": "0.5.1",
   "description": "The Rendrix command line: build and run TypeScript applications on Rendrix's own rendering engine",
   "type": "module",

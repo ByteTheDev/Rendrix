@@ -9,7 +9,7 @@
       },
     },
     "packages/cli": {
-      "name": "@bytethedeveloper/rendrix",
+      "name": "@renasine-studios/rendrix",
       "version": "0.5.1",
       "bin": {
         "rendrix": "bin/rendrix.mjs",
@@ -40,7 +40,7 @@
     },
   },
   "packages": {
-    "@bytethedeveloper/rendrix": ["@bytethedeveloper/rendrix@workspace:packages/cli"],
+    "@renasine-studios/rendrix": ["@renasine-studios/rendrix@workspace:packages/cli"],
 
     "csstype": ["csstype@3.2.4", "", {}, "sha512-PoKaoPzQapnEoqUSnHx1u6W6ku8CVEgKsnpmmzU3m1nwkidpPBQ8V/Zq2+bWNrsOKoKLwTGdbx6xF7BXP1zLVQ=="],
 
