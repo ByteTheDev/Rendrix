@@ -10,8 +10,9 @@ runtime, the rendering pipeline and the application platform, and is not trying 
 > **Status: early.** The first end-to-end milestone works on Windows; the web-platform surface is broad but
 > incomplete, and several capabilities are approximations rather than full browser implementations.
 > [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) lists exactly what is supported, partial and missing,
-> and only claims behaviour that has a test. macOS and Linux share the code but have not been built or run
-> by hand. Rendrix is not a sandbox for hostile code; see [docs/SAFETY.md](docs/SAFETY.md).
+> and marks ✅ only where there is a test. macOS and Linux are built and tested in CI but have not been
+> manually run with GPU-visible output. Rendrix is not a sandbox for hostile code; see
+> [docs/SAFETY.md](docs/SAFETY.md).
 
 ```tsx
 import { render } from "rendrix/jsx-runtime";
@@ -48,7 +49,9 @@ npm run wpt                           # curated CSS layout conformance subset
 ```
 
 Create your own: `rendrix init my-app && cd my-app && rendrix dev`. Ship it: `rendrix package` produces one
-standalone executable (≈13.8 MB on Windows) that needs no Node, Bun or browser. Packaging is target-driven:
+standalone executable that needs no Node, Bun or browser. The bare Windows `rendrix-runtime.exe` built with
+the current release profile is roughly 15–16 MB; the older ≈13.8 MB figure was a *packaged app* from a
+pre-0.5.0 revision and is not comparable (see [PERF_BINARY_SIZE.md](docs/PERF_BINARY_SIZE.md)). Packaging is target-driven:
 `rendrix package --target win32-x86` (also `i686-pc-windows-msvc` / `ia32`) cross-packages 32-bit Windows
 alongside `win32-x64` and `win32-arm64`; Linux covers `linux-x64` / `linux-arm64` plus the 32-bit
 `linux-x86` (`i686-unknown-linux-gnu`), `linux-armv7` (`armv7-unknown-linux-gnueabihf`, the Raspberry Pi
@@ -75,9 +78,9 @@ CLI: `init`, `dev`, `build`, `run`, `check`, `package`, `render`, `doctor`. Deta
   clipping and 2D transforms, a shared atlas that batches small images into one draw, offscreen compositing
   layers (isolated group opacity, separable Gaussian blur, real backdrop-filter), high-DPI, Canvas 2D
   (CPU-rasterized, GPU texture), SVG painting, and an experimental 3D scene API (`RendrixScene` plus a small
-  WebGL subset). A 9,000-node
-  page re-renders a hover in ~1 ms and a DOM mutation in ~6.5 ms; resize is ~10 ms
-  ([measurements](docs/PERFORMANCE_AUDIT.md)).
+  WebGL subset). On one Windows 11 / RTX 3060 machine, a 9,009-node page re-renders a hover in
+  ~1–1.8 ms, a DOM mutation in ~4.4–8.4 ms, and resizes in ~8–10 ms across recorded runs
+  ([measurements](docs/PERFORMANCE_AUDIT.md), single-machine observations).
 * **Web APIs.** `fetch` (with a cookie jar and `FormData`), `WebSocket`, `URL`, `localStorage`,
   `AbortController`, `TextEncoder`/`Decoder`, `matchMedia`, `structuredClone`, `crypto.getRandomValues`
   and `crypto.subtle.digest`, images, clipboard and native dialogs.
@@ -91,7 +94,8 @@ CLI: `init`, `dev`, `build`, `run`, `check`, `package`, `render`, `doctor`. Deta
 Not yet: full browser parity, a manually verified screen-reader pass, macOS/Linux hardware validation,
 a browser-verified WebGL2 run (the renderer has a WebGL2 path, tested so far only under native downlevel
 limits), browser-backed WebSocket/Workers/storage on the web target,
-Service Workers, XHR, IndexedDB, video/audio playback, canvas WebGPU, a React adapter, full table/float
+Service Workers, XHR, IndexedDB, video/audio playback, canvas WebGPU, a *working* React adapter (the
+experimental `packages/react-adapter` currently has a failing integration test), full table/float
 fidelity, `writing-mode`, WOFF2 and complex masks. Rendrix is not a browser and makes no browser-compatibility
 claim.
 
@@ -103,11 +107,12 @@ claim.
 | `packages/cli/` | The `rendrix` command (Node): build pipeline, packaging, templates, tests |
 | `packages/types/` | TypeScript declarations and JSX types (`rendrix`, `rendrix/jsx-runtime`) |
 | `packages/solid-adapter/` | Solid reactivity adapter that renders on the Rendrix DOM |
+| `packages/react-adapter/` | Experimental `react-reconciler` adapter; its real-runtime integration test is not green |
 | `examples/app-counter/` | The milestone application and its scripted end-to-end test |
 | `examples/app-3d/` | 3D scene example |
 | `website/` | Marketing site and in-page documentation tabs (synced from `docs/`) |
 | `video/` | Optional Remotion project that renders launch videos from the Render/frame-sequence pipeline (not part of the engine) |
-| `docs/` | [Architecture](docs/ARCHITECTURE.md), [compatibility](docs/COMPATIBILITY.md), [building](docs/BUILDING.md), [safety](docs/SAFETY.md), [performance](docs/PERFORMANCE_AUDIT.md), [web performance](docs/WEB_PERFORMANCE.md), [roadmap](docs/ROADMAP.md), [accessibility plan](docs/ACCESSIBILITY_PLAN.md) |
+| `docs/` | [Architecture](docs/ARCHITECTURE.md), [compatibility](docs/COMPATIBILITY.md), [building](docs/BUILDING.md), [safety](docs/SAFETY.md), [performance](docs/PERFORMANCE_AUDIT.md), [binary size](docs/PERF_BINARY_SIZE.md), [roadmap](docs/ROADMAP.md), [accessibility plan](docs/ACCESSIBILITY_PLAN.md) |
 
 Earlier versions of this project compiled a static HTML subset to a native view tree and shipped an Electron
 compatibility layer. That direction was replaced; the old code remains in git history

@@ -1,5 +1,10 @@
 # rendrix-react-adapter
 
+> **Status: experimental, not green.** The adapter package is committed, but in this checkout its real-runtime
+> integration test fails (`packages/react-adapter/test/adapter.test.mjs`: 2 tests pass, 1 fails with
+> `cannot read property 'textContent' of null` in the headless expect step). The unit-level tests and the API
+> below describe the intended surface; do not treat the adapter as verified end to end until that test passes.
+
 Run [React](https://react.dev/) components on Rendrix's DOM. A `react-reconciler` host
 config maps React's operations onto `document.createElement` / text / attribute patching —
 there is **no `react-dom` and no second renderer**. The adapter is a thin, adapter-scoped

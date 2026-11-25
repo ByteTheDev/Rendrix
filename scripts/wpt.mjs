@@ -206,13 +206,13 @@ No browser parity is claimed.
 Run it: \`node scripts/wpt.mjs\` (needs a built runtime: \`npm run runtime\`).
 History: \`scripts/wpt-history.json\` (appended per run, last 50 kept).
 
-## Latest (${latest.date}): ${latest.pass}/${latest.total} (${rate})
+## Latest recorded run (${latest.date}): ${latest.pass}/${latest.total} (${rate})
 
-|  | Case | Checks |
+${history.length === 1 ? 'Only one run has been recorded in `scripts/wpt-history.json` so far; this is that run, not a repeated result.\n\n' : ''}|  | Case | Checks |
 |---|---|---|
 ${rows}
 
-## Pass rate over time (last 12 runs)
+## Recorded runs (up to 12 most recent; currently ${history.length})
 
 | Date | Pass |
 |---|---|

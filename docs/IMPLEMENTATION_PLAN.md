@@ -2,12 +2,15 @@
 
 Date: 2026-11-14. Source: `ARCHITECTURE_REVIEW.md` (three subagent investigations + four audits). Status labels: ✅ implemented (keep), 🟡 partially implemented (extend), ❌ missing (build). Every item lists justification, crates/files, build-vs-retain, perf implications, tests, and dependencies. No application code was modified to produce this plan. All perf targets are goals to be measured with the Phase-0 harness on the reference setup (Windows 11, RTX 3060, Vulkan) — not claimed results.
 
-> **Superseded (2026-11-16).** This is the original execution plan. All 24 of its tasks have since landed in
-> the working tree (including the A3/A4/D2–D4 follow-ups), along with later work it did not cover:
-> CSS at-rules, compositing, Shadow DOM, range/Selection/contenteditable, form validation and pickers,
-> touch/gamepad input, SVG, 3D scenes and the wasm web target. The ✅/🟡/❌ labels and the 156/234 test
-> counts below are historical. Current status is in [ROADMAP.md](ROADMAP.md), current features in
-> [COMPATIBILITY.md](COMPATIBILITY.md), and current measurements in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
+> **Superseded (2026-11-16; updated 2026-11-24).** This is the original execution plan. Its 24 tasks have
+> since landed and shipped in 0.5.0/0.5.1 (including the A3/A4/D2–D4 follow-ups), along with later work it
+> did not cover: CSS at-rules, compositing, Shadow DOM, range/Selection/contenteditable, form validation
+> and pickers, touch/gamepad input, SVG, 3D scenes and the wasm web target. The ✅/🟡/❌ labels and the
+> 156/234 test counts below are historical. One planned item was delivered in reduced form: D3 shipped as
+> an on-demand `--inspect` JSON snapshot, **not** an in-app overlay UI (see
+> [BUILDING.md](BUILDING.md)). Current status is in [ROADMAP.md](ROADMAP.md), current features in
+> [COMPATIBILITY.md](COMPATIBILITY.md), and current measurements in
+> [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
 
 ## Ordering summary
 
@@ -72,7 +75,7 @@ variants; engine/renderer-level coverage landed). `node --test packages/cli/test
 | D1 | Done | `sourceMaps` in bundle + `sourcemap.rs` VLQ remap + session load + CLI tests |
 | D2 | Done | `hot_reload.rs` validate-in-scratch + commit-on-live-Engine design; CLI diffs modules + writes sidecar; runtime polls `RENDRIX_HOT_FILE` in `about_to_wait`; `--no-hot` fallback; 3 dx + 3 CLI tests green; failed updates keep last-good |
 | D3 | Done | `inspector.rs` on-demand JSON snapshot (DOM/styles/layout/stats/console/errors); `--inspect` headless flag; 0 per-frame cost; no overlay UI (documented) |
-| D4 | Done | `packages/solid-adapter` on upstream `solid-js@1.9.19` (adapter-scoped): mount/update/unmount/cleanup/events/`Show`/`For`; 13-step headless matrix green; limitations documented (shim, accessor rules, no SSR, pinned version) |
+| D4 | Done | `packages/solid-adapter` on upstream `solid-js@1.9.19` (adapter-scoped): mount/update/unmount/cleanup/events/`Show`/`For`; 14-step headless matrix green; limitations documented (shim, accessor rules, no SSR, pinned version) |
 | S1 | Done (Windows-verified) | `--sign/--installer/--manifest/--publish-url/--app-version`, macOS `.app` layout, NSIS fix, update client w/ hash verify; macOS/Linux runs still unvalidated (no claims) |
 
 Deferred as decided (not blockers): KV/`redb`/`sled`, pty/terminal, 3D, media decode, multi-process, `Val` widening, `InlineContent::key` memo, id-map, dedicated `__rendrix_wsDone`/`dialogDone` hooks, core-owned a11y tree (host-side equivalent tested).
@@ -166,7 +169,7 @@ Deferred as decided (not blockers): KV/`redb`/`sled`, pty/terminal, 3D, media de
 - **Dependencies:** M0 (budget harness).
 
 ### L5/L6. Retain decisions (✅ keep, no work)
-- **L5 Keep `rquickjs =0.14.0`, no V8.** Justification: behind `JsEngine` trait; 13.8 MB single binary; JS not the measured bottleneck (`PERFORMANCE_AUDIT.md:40-44`). Files: `engine/Cargo.toml:25`, `quickjs.rs`, `engine_trait.rs`. Tests: existing 27 JS tests.
+- **L5 Keep `rquickjs =0.14.0`, no V8.** Justification: behind `JsEngine` trait; single binary (the 13.8 MB figure in the original plan is historical — see [PERF_BINARY_SIZE.md](PERF_BINARY_SIZE.md)); JS not the measured bottleneck. Files: `engine/Cargo.toml:25`, `quickjs.rs`, `engine_trait.rs`. Tests: existing 27 JS tests.
 - **L6 Keep `typescript` npm, no runtime TS.** Justification: runtime must never see TS; Rust transpiler would duplicate the compiler API and bloat the binary. Build-only dep, not shipped.
 
 ## Phase G — Rendering hygiene (small, risk-averse; GPU is not the bottleneck)
@@ -282,7 +285,11 @@ Deferred as decided (not blockers): KV/`redb`/`sled`, pty/terminal, 3D, media de
 ## Phase S — Shipping
 
 ### S1. Signing/install/update wiring + macOS/Linux validation (🟡/❌)
-- **Justification:** Trailer pack works on Windows (13.8 MB); `signing.mjs` + `installer/nsis.mjs` are unwired (`bin/rendrix.mjs` has no sign/install flags; only `bin/rendrix-legacy.mjs:531-569` references them); CI (`ci.yml`) never run; macOS/Linux unbuilt/unrun (`COMPATIBILITY.md:9-10`). Blocks any "native application platform" claim.
+- **Justification (as of the 2026-11-14 plan):** trailer packing worked on Windows; `signing.mjs` and
+  `installer/nsis.mjs` were unwired at that point; CI had not been run. **Since then:** signing, NSIS
+  installer, manifest and update client are wired into `rendrix package`, and CI runs on all three desktop
+  OSes. What remains unrecorded is a signed release and manual macOS/Linux hardware runs — see
+  [ROADMAP.md](ROADMAP.md) R6.4 and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
 - **Crates/files:** `packages/cli/src/{signing.mjs,installer/*,commands.mjs,bin/rendrix.mjs}` (reconnect flags, manifest `.sig`, publish URL), minimal update client (download + SHA-256 vs manifest, `quitAndInstall` semantic) or delete `autoUpdater` refs from `nsis.mjs:16`, `rendrix-runtime/src/{window.rs,host.rs}` platform fixes, `.github/workflows/ci.yml` on all three OSes.
 - **Build vs retain:** Reuse existing helpers + OS tools (`signtool`/`codesign`/`notarytool`); add macOS app-bundle + Linux artifact paths. No new update framework unless the minimal client proves insufficient.
 - **Perf:** No runtime impact; packaging-time only.
@@ -299,6 +306,11 @@ Deferred as decided (not blockers): KV/`redb`/`sled`, pty/terminal, 3D, media de
 - `Val` widening to objects/ArrayBuffers: deferred until M0 profiles implicate the `__native` boundary; batch getters first.
 - V8, `swc`, media/3D crates: explicitly rejected for now per §Retain decisions.
 
-## Test policy (applies to every phase)
+## Test policy (applies to every phase — historical plan)
 
-Per `ENGINE_ASSESSMENT.md:110-114`: `cargo test --workspace` (156 Rust), `node --test packages/cli/test` (9 CLI), `npm run e2e` (26 scripted steps with eye-checked screenshots), release build + real windowed run at 125% DPI. Each perf phase additionally reports `cargo run --release -p rendrix-runtime -- bench 1000` medians vs the `PERFORMANCE_AUDIT.md` baseline and updates that document instead of projecting.
+The counts here are from the 2026-11-14 plan: `cargo test --workspace` (156 Rust at that time),
+`node --test packages/cli/test` (9 CLI then), `npm run e2e` (26 scripted steps with eye-checked screenshots),
+release build + real windowed run at 125% DPI. Current commands are in [BUILDING.md](BUILDING.md); a
+2026-11-24 run reported 410 Rust tests, 44 CLI tests and 2 Solid adapter tests. Each perf phase reports
+`npm run bench` medians vs the [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) baseline and updates that document
+instead of projecting.

@@ -1,6 +1,9 @@
 # Rendrix Dependency Audit
 
-Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package.json`. No dependencies were added or removed during this audit.
+Date of audit: 2026-11-14, refreshed 2026-11-24 for dependency attribution and status notes. Workspace:
+`engine/Cargo.toml`, `packages/cli/package.json`. No dependencies were added or removed as part of writing
+this document. Versions below are the manifest declarations at the time of the audit; the lockfiles are
+authoritative for resolved versions.
 
 ## Classification key
 
@@ -13,8 +16,8 @@ Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package
 
 | Dependency | Version | Used by | Does | Why used | Performance implications | Class | Recommendation |
 |---|---|---|---|---|---|---|---|
-| `taffy` | 0.9 (flexbox, grid, block_layout, content_size, taffy_tree) | `rendrix-layout` | Flexbox/grid/block layout engine | Mature, tested layout; incremental tree reuse | Layout is ~5–12 ms; Taffy is not the bottleneck; incremental results reused | 1 Essential | Keep. Replacing would cost months for no gain. |
-| `cosmic-text` | 0.14 | `rendrix-gfx` | Text shaping, font DB, swash rasterization | Complex scripts, bidi, font fallback, glyph rasterization | First-frame font scan ~0.75 s; paragraph cache amortizes shaping | 1 Essential | Keep. Do not rewrite text shaping. |
+| `taffy` | 0.9 (flexbox, grid, block_layout, content_size, taffy_tree) | `rendrix-layout` | Flexbox/grid/block layout engine | Mature, tested layout; incremental tree reuse and dirty-aware sync | Layout is the retained ~4–10 ms floor for mutations and resize; whole-tree box generation and full restyle are no longer the bottleneck | 1 Essential | Keep. Replacing would cost months for no gain. |
+| `cosmic-text` | 0.14 | `rendrix-gfx` | Text shaping, font DB, swash rasterization | Complex scripts, bidi, font fallback, glyph rasterization | Historical first-frame figure ~0.75 s; a disk font cache, template rewraps and parallel prewarm later reported 81.0 ms under concurrent load (see PERFORMANCE_AUDIT.md) | 1 Essential | Keep. Do not rewrite text shaping. |
 | `wgpu` | 25 | `rendrix-gfx`, `rendrix-runtime` | GPU abstraction (Vulkan/Metal/DX12) | Cross-platform GPU rendering, single draw call | GPU 0.3–0.6 ms/frame; instance buffer upload per frame | 1 Essential | Keep. Core to the renderer. |
 | `winit` | 0.30 | `rendrix-runtime` | Windowing, input, event loop, IME | OS window/input integration | Negligible; event-driven | 1 Essential | Keep. |
 | `pollster` | 0.4 | `rendrix-gfx`, `rendrix-runtime` | Block on async (GPU init, readback) | Synchronous GPU initialization | Only at startup/readback | 1 Essential | Keep. |
@@ -41,7 +44,7 @@ Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package
 
 | Dependency | Version | Used by | Class | Notes |
 |---|---|---|---|---|
-| `typescript` | ^5.9.3 (dev) | `packages/cli` build | 1 Essential | Type-checking + transpilation. Required for TS/TSX. Keep. |
+| `typescript` | ^5.9.3 | `packages/cli` build | 1 Essential | Type-checking + transpilation. Required for TS/TSX. Declared as a devDependency at the monorepo root and a runtime dependency of `packages/cli`. Keep. |
 | Node.js built-ins (fs, path, etc.) | runtime | CLI | 1 Essential | Build tooling only; not shipped to apps. |
 
 ## Dependency-by-dependency recommendations
@@ -61,7 +64,8 @@ Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package
 ### Taffy
 - **What it does:** Flexbox/grid/block layout.
 - **Why used:** Correct, tested, incremental tree reuse.
-- **Performance:** Layout 5–12 ms; Taffy reuses its tree; box generation is the cost, not Taffy.
+- **Performance:** Layout is the retained ~4–10 ms floor for mutations and resize. Taffy reuses its tree and
+  dirty-aware sync skips unchanged nodes; whole-tree box generation is no longer the cost.
 - **Replace?** No. Implementing layout internally would be a large regression risk with no measurable gain.
 
 ### winit
@@ -73,7 +77,8 @@ Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package
 ### Text shaping (cosmic-text)
 - **What it does:** Font database, shaping, swash rasterization, paragraph cache.
 - **Why used:** Complex scripts, font fallback, glyph rasterization.
-- **Performance:** First-frame cost ~0.75 s; paragraph cache amortizes.
+- **Performance:** Historical first-frame cost ~0.75 s; font-DB disk cache, template rewraps and parallel
+  prewarm later brought it to 81.0 ms in concurrent-load runs (see PERFORMANCE_AUDIT.md).
 - **Replace?** No. Could cache the font DB to disk; that is an implementation improvement, not a replacement.
 
 ### Image decoding (image crate)
@@ -103,12 +108,12 @@ Date of audit: 2026-11-14. Workspace: `engine/Cargo.toml`, `packages/cli/package
 
 | Dependency | Version | Used by | Why | Class |
 |---|---|---|---|---|
-| `rfd` | 0.18 | `rendrix-runtime` | Native file open/save dialogs (A2); tiny sync dialogs, no hand-rolled per-OS code | 1 Essential |
+| `rfd` | 0.18 | `rendrix-js` (`host.rs` dialog ops) | Native file open/save dialogs (A2); tiny sync dialogs, no hand-rolled per-OS code | 1 Essential |
 | `tungstenite` | 0.30 | `rendrix-js` (+ dev-dep for echo tests) | WebSocket client framing (A5); `rustls-tls-webpki-roots` matches `ureq` TLS posture | 1 Essential |
 | `rustls` | 0.23 | `rendrix-js` | TLS for WebSocket client | 1 Essential |
 | `accesskit` | 0.25 | `rendrix-js` (host a11y tree) | Accessibility tree roles/states (A7) | 1 Essential |
 | `accesskit_winit` | 0.34 | `rendrix-runtime` | OS-AT bridge (UIA/NSAccessibility/AT-SPI) (A7) | 1 Essential |
-| `criterion` | dev-only | all crates (`benches/`) | Micro-benchmarks (M0); never shipped | 1 Essential (dev) |
+| `criterion` | 0.5 (dev-only) | `rendrix-css`, `-core`, `-layout`, `-gfx`, `-js`, `-runtime` (`benches/`); not `rendrix-web` | Micro-benchmarks (M0); never shipped | 1 Essential (dev) |
 | `solid-js` | 1.9.19 (exact, adapter-scoped) | `packages/solid-adapter` only | Real fine-grained reactivity for the D4 Solid adapter; no second renderer; never touches the engine | Approved, adapter-scoped |
 | `sha2` | 0.11 | `rendrix-js` | `crypto.subtle.digest` (SHA-1/256/384/512) | 1 Essential |
 | `gilrs` | 0.11 | `rendrix-runtime` (non-mobile) | Desktop gamepad input forwarded into `Session` | 1 Essential |

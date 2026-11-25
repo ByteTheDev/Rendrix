@@ -4,7 +4,13 @@ Date: 2026-11-13. Checkpoint tag: `checkpoint/pre-engine-transformation` (HEAD `
 Direction change: Rendrix is a standalone rendering engine and application runtime for TypeScript
 apps. It is **not** an Electron alternative, wrapper, or compatibility layer.
 
-## 1. What exists today (audited, not assumed)
+> **Historical document (2026-11-13, with a status update on 2026-11-16).** Sections 1–2 and 6 describe the
+> pre-rewrite tree at checkpoint `8d4bd59` and the first milestone; they are preserved as decision history,
+> not as the current state. Section 3's roadmap has been overtaken by releases 0.5.0 and 0.5.1. For what is
+> true today, use [ARCHITECTURE.md](ARCHITECTURE.md), [COMPATIBILITY.md](COMPATIBILITY.md),
+> [ROADMAP.md](ROADMAP.md) and [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
+
+## 1. What existed at the checkpoint (audited, not assumed)
 
 | Area | Location | What it really is | Verdict |
 |---|---|---|---|
@@ -56,8 +62,8 @@ rendrix-runtime  Platform shell: winit window, input → DOM events, frame sched
 
 Boundaries:
 * **JS engine is replaceable:** `rendrix-js` exposes a `JsEngine` trait; only `quickjs.rs` names rquickjs.
-  Web API surface is a JS prelude over a small native `__rendrix` binding table, so another engine
-  needs only the trait implementation plus that table.
+  Web API surface is a JS prelude over the single native `__native(op, ...)` binding table, so another engine
+  needs only the trait implementation plus that entry point.
 * **Layout engine is replaceable:** `LayoutEngine` consumes a neutral box tree (`LayoutNode` + `ComputedStyle`),
   not DOM types. Taffy is one implementation.
 * **TypeScript:** compiled to ES-module JavaScript before execution (build step in the CLI using the
@@ -66,7 +72,10 @@ Boundaries:
 * **App format:** `rendrix-app/1` bundle (JSON: `html`, `modules`, `assets`, window config). The packager
   appends it to a prebuilt `rendrix-runtime` executable, reusing the existing PE/ELF/Mach-O trailer logic.
 
-## 3. Roadmap and status (updated after Milestone 1)
+## 3. Roadmap and status at Milestone 1 (2026-11-14)
+
+This table records status at the milestone, not today; runaway-script limits, workers, WebAssembly, Canvas 2D,
+SVG, WebSocket and the a11y bridge have all landed since. See [ROADMAP.md](ROADMAP.md) for current status.
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -75,15 +84,25 @@ Boundaries:
 | 2 | Rendering foundation | **Done, with gaps**: wgpu SDF renderer (rounded rects, per-side/dashed borders, gradients, shadows, clips, transforms, images, text), persistent glyph atlas with LRU, display list, culling, one-draw-call frames, and offscreen compositing layers for true Gaussian `filter: blur()`, real `backdrop-filter` and per-pixel `clip-path: polygon()` (ordinary frames keep the one-draw-call path). Canvas 2D, SVG painting and an experimental 3D scene path reuse the same pipeline. Not done: dirty-rect presentation, full `filter` completeness, spatially-varying masks |
 | 3 | Web platform | **Broad, not complete**: real DOM, CSS cascade/animations/at-rules (`@supports`, `@layer`, `@container`, nesting, `@import`), events, forms with validation and pickers, observers (Mutation/Resize/Intersection), Shadow DOM, custom elements, `Range`/`Selection`, `contenteditable`, `fetch`/cookies, WebSocket, Workers, storage, Canvas 2D subset. See [COMPATIBILITY.md](COMPATIBILITY.md) for exact gaps (full table/float fidelity, `writing-mode`, WOFF2, Service Workers, XHR/IndexedDB, media, `cqw`/`cqh`, complex masks) |
 | 4 | Application platform | **Started, Windows-verified**: winit window, DPI, input, IME commit, clipboard, multi-window, OS file dialogs, native file drag-and-drop, touch and gamepad entry points, AccessKit bridge, update client, standalone executables. Not done: macOS/Linux validation, tray/global shortcuts, Android/iOS shells |
-| 5 | Developer ecosystem | **Started**: `init/dev/build/run/check/package/render/doctor`, TSX with a direct-DOM JSX runtime, source maps, state-preserving hot reload, `--inspect` snapshot, a Solid adapter, an experimental wasm web target and mobile-input scaffolding. Not done: React adapter, overlay inspector UI/devtools protocol |
+| 5 | Developer ecosystem | **Started**: `init/dev/build/run/check/package/render/doctor`, TSX with a direct-DOM JSX runtime, source maps, state-preserving hot reload, `--inspect` snapshot, a Solid adapter, an experimental wasm web target and mobile-input scaffolding. Not done at the milestone: React adapter, overlay inspector UI/devtools protocol. An experimental React adapter now exists but its real-runtime test is not green |
 | 6 | Production readiness | **Not complete**: CI config builds/tests three OSes but no cross-platform results are recorded; no memory soak has been run; signing/installer/manifest helpers are wired but unsigned and unrun on macOS/Linux; the AccessKit bridge exists but no manual screen-reader pass is recorded |
 
-### Next priorities (in order — updated 2026-11-16)
+### Priorities (historical 2026-11-16 list, with 0.5.1 status)
 
-1. **Re-measure cold start.** The font database is now cached to disk and the glyph atlas has LRU eviction; the old ~0.75 s first frame figure predates both. Target < 0.2 s, then publish fresh numbers in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
-2. **Mutation latency under 3 ms (120 FPS).** Incremental box generation, stylesheet caching and viewport-dependency pruning landed; the remaining ~6.5–7 ms is Taffy re-solve plus `InlineContent::key` rehashing.
-3. **macOS and Linux validation** on real hardware, plus the manual screen-reader pass in [A11Y_CHECKLIST.md](A11Y_CHECKLIST.md). The CI config exists but no cross-platform results are recorded.
-4. **Web-target gaps**: a WebGL2 renderer fallback (the current renderer panics where WebGPU is unavailable), browser-backed WebSocket/Workers/storage persistence, static import cycles and a runaway-script interrupt for the worker.
+This list is kept as decision history. Item 1 has since been worked on; the rest are still current, and
+[ROADMAP.md](ROADMAP.md) is authoritative.
+
+1. **Cold start — worked on in 0.5.1.** Template rewraps, parallel first-frame prewarm, a background font-DB
+   load and headless-init overlap cut the first frame from 416.0 ms to 81.0 ms in medians of three runs
+   **taken under concurrent load**; the `< 0.2 s` goal is met in those runs. A quiet-machine absolute is
+   still pending. See [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) §"Cold start re-measured and cut".
+2. **Mutation latency under 3 ms (120 FPS) — open.** Incremental box generation, stylesheet caching and
+   viewport-dependency pruning landed; the remaining ~4.4–7 ms is Taffy re-solve plus
+   `InlineContent::key` rehashing.
+3. **macOS and Linux validation** on real hardware, plus the manual screen-reader pass in [A11Y_CHECKLIST.md](A11Y_CHECKLIST.md). CI builds and tests all three desktop targets, but no cross-platform hardware results are recorded.
+4. **Web-target gaps**: a browser run of the WebGL2 fallback (the renderer no longer requires shader storage
+   buffers and has a native downlevel-limits pixel test, but no browser run has been recorded), browser-backed
+   WebSocket/Workers/storage persistence, static import cycles and a runaway-script interrupt for the worker.
 5. **Scale measurement**: 50k+ node documents and a second machine/GPU, to find the real O(n) wall beyond the 9,009-node reference benchmark.
 6. **Compatibility gaps with high web value**: `cqw`/`cqh`, WOFF2, `writing-mode`, spatially-varying masks, table `colspan`/`rowspan`, float text wrap, the range input and a visual validation bubble.
 7. **Ecosystem**: a React reconciler (the Solid adapter and state-preserving hot reload have landed) and an overlay inspector UI on top of the existing `--inspect` JSON snapshot.
@@ -98,14 +117,14 @@ Removed in the Milestone 1 change set (everything is recoverable from the checkp
 | `packages/cli/src/electron-compat/**`, `import-electron.mjs`, Electron examples, Electron docs | Emulated Electron 33's API and imported Electron projects | **Dropped on purpose** (no compatibility goal) |
 | `native/` GPUI host (`main.rs`, `view/*`), M0 `gpu/*`, `package.rs` | The previous renderer(s) and static `Node` IR | `engine/` (DOM → CSS → layout → wgpu) |
 | `packages/cli/src/{html,css,compiler,backend,library,pack,native,hosts,preview}.mjs`, old templates, `types/app.d.ts` | Build-time static HTML/CSS compiler, `{state, actions}` backend model, host fetching | `packages/cli/src/app/*` (TS build pipeline, bundle, packaging) |
-| `native/src/platform.rs` (clipboard, dialogs, power blockers, external links) | Native services | Clipboard re-implemented via `arboard`; **dialogs, power blockers, external links still to port** (Phase 4) |
-| `native/src/{tray,hotkeys}.rs` | Tray icon, global shortcuts | **Still to port** (Phase 4) |
-| `native/src/updater.rs`, `packages/cli/src/signing.mjs` (kept), `installer/` (kept) | Update download/verify/install, signing helpers | Updater **still to port**; signing and NSIS helpers remain in the CLI, unwired |
+| `native/src/platform.rs` (clipboard, dialogs, power blockers, external links) | Native services | Clipboard re-implemented via `arboard`; native dialogs and external links implemented via `rfd`/host ops. Power blockers were not ported. |
+| `native/src/{tray,hotkeys}.rs` | Tray icon, global shortcuts | **Not ported** (still open in [ROADMAP.md](ROADMAP.md) R2.3) |
+| `native/src/updater.rs`, `packages/cli/src/signing.mjs` (kept), `installer/` (kept) | Update download/verify/install, signing helpers | Update client, signing and NSIS helpers are wired into `rendrix package`; only Windows has been exercised and no signed release has been recorded |
 | `native/src/capabilities.rs` permission model | Filesystem/network/process grants | Re-implemented smaller in `rendrix-js/host.rs` (network, fs read/write); process grants intentionally not carried over |
 | `scripts/*` (smoke/benchmark/drive scripts), `.github/workflows/*` | Old host smoke tests and release automation | `scripts/e2e.mjs`, `engine` benchmark, `.github/workflows/ci.yml` |
 
-The website under `website/` still carries the previous product copy and needs a rebrand pass; only its
-documentation tabs were repointed.
+The website under `website/` has been rebranded to the engine product; it has no Electron-era copy. Its
+documentation tabs are synced from `docs/` by `website/sync-docs.mjs`.
 
 ## 5. Verification policy
 Every milestone: `cargo test --workspace`, a release build, an actual rendered screenshot inspected by

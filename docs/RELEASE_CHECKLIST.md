@@ -1,11 +1,14 @@
 # Release checklist (manual runs)
 
 CI (`.github/workflows/ci.yml`) already builds and tests all three desktop targets:
-`cargo test --workspace`, a release `rendrix-runtime` build, and the CLI suite run on
-Windows, macOS and Linux (Linux installs windowing/clipboard libs and software Vulkan).
-What CI does **not** do is run the app on macOS/Linux hardware — the compatibility
-matrix entry "macOS/Linux ❓ untested" stays until the steps below are executed and
-recorded. Nothing here has been run yet.
+`cargo test --workspace --exclude rendrix-gfx` plus the `rendrix-gfx` suite run serially
+(because concurrent headless device creation intermittently segfaults on Linux), a release
+`rendrix-runtime` build, and the CLI suite run on Windows, macOS and Linux (Linux installs
+windowing/clipboard libs and software Vulkan). CI does not run `npm run e2e`, `npm run wpt`,
+or the Solid adapter tests.
+What CI does **not** do is run the app on macOS/Linux hardware with GPU-visible output — the
+compatibility matrix keeps describing those platforms as CI-tested but not manually verified until the
+steps below are executed and recorded. Nothing here has been run yet.
 
 ## macOS manual run
 
@@ -18,7 +21,8 @@ Prerequisites: a Mac with Xcode command-line tools and Rust stable.
    counter increments on click, no console errors.
 5. Headless: `RENDRIX_RUNTIME=engine/target/release/rendrix-runtime node scripts/e2e.mjs`
    (or the macOS equivalent path) — scripted expectations pass, screenshot written.
-6. `node scripts/wpt.mjs` — record the pass rate in `docs/WPT.md` as the macOS row.
+6. `node scripts/wpt.mjs` — this script regenerates `docs/WPT.md` itself with a dated result row; record
+   the OS/device alongside the run in the results log below.
 7. Package: `rendrix package examples/app-counter` — `.app` bundle produced;
    double-click launches outside a terminal.
 8. Record: macOS version, chip (Intel/Apple Silicon), date, results.
@@ -47,7 +51,7 @@ Procedure (no soak has been run; no numbers below are results):
    bounded; detached DOM subtrees are GC'd about once a second). A steady climb of
    more than ~1 MB/min after the first 5 minutes is a leak — file it with the RSS
    series and the soak page attached.
-4. Also run `cargo run -p rendrix-runtime -- bench 1000` before/after and compare the
+4. Also run `npm run bench` before/after (it supplies `--manifest-path engine/Cargo.toml`) and compare the
    M0 `shapes`/`restyles`/`layouts` counters in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
 
 ## Results log

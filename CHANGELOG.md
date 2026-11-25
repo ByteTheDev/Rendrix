@@ -77,32 +77,25 @@ and runtime. See `docs/ENGINE_ASSESSMENT.md`.
   `{ state, actions }` backend model, old host fetching/packaging scripts, old CI workflows.
   Migration notes: `docs/ENGINE_ASSESSMENT.md` §4.
 
-### Known limitations
-Windows is the only verified platform; no accessibility tree; see the compatibility matrix.
+### Known limitations (as of the 2026-11-11 rewrite checkpoint)
+Windows was the only verified platform and there was no accessibility tree at that checkpoint. Both have
+since changed: an AccessKit tree and OS bridge are implemented, but no manual screen-reader pass has been
+recorded. See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) and
+[docs/A11Y_CHECKLIST.md](docs/A11Y_CHECKLIST.md) for the current state.
 
-## Unreleased — the Rendrix rewrite
+## Historical — the 2026-11-11 rewrite decision
 
-**Rendrix renames from Rendrix; WebView renderer removed; Rendrix is the sole rendering engine.**
-Owner-authorized decision of 2026-11-11; the full contract is
-[docs/REWRITE_RENDRIX.md](docs/REWRITE_RENDRIX.md). The pre-rewrite implementation is preserved
-at branch `backup/webview-era` (tag `webview-era-checkpoint`, commit `0fc860b`).
+This section records a decision, **not** the current state of the product. On 2026-11-11 the owner
+authorized replacing the WebView/Electron-compatibility direction with an independent rendering engine;
+the pre-rewrite tree is preserved on branch `backup/webview-era` (tag `webview-era-checkpoint`, commit
+`0fc860b`). The plan was executed by the 0.5.0 release: the Electron compatibility layer, Electron importer,
+WebView host and legacy GPUI host were removed, and `engine/` became the only engine. The bundle trailer
+magic is `RENDRAPP` (`engine/crates/rendrix-runtime/src/bundle.rs`), the app format is `rendrix-app/1`, the
+CLI command is `rendrix`, and the home-directory override is `RENDRIX_HOME`.
 
-- **Developer experience.** Compile errors in HTML and CSS now print `file:line:col` (CSS no longer shows `<css input>`). `rendrix doctor` also checks the release manifest, can probe the download URL (`--online`) and checks the TypeScript/PostCSS toolchain. `rendrix init --template` adds `form`, `list-detail` and `electron-import` starters. The Electron importer resolves concatenated/templated/`url.format` `file:` page URLs, falls back to a root `index.html`, explains remote-only apps, and no longer flags `app.*` calls the runtime implements. Results on real apps: [docs/ELECTRON_IMPORT_RESULTS.md](docs/ELECTRON_IMPORT_RESULTS.md).
-$2** Product Rendrix (was Rendrix); CLI package/command `rendrix`; bundle magic `RENDRI01`;
-  home env var `RENDRIX_HOME`; renderer config key `"rendrix"` (the default). Entries below the
-  Unreleased section describe releases as they shipped under the old name and are left as
-  written.
-- **WebView renderer removed.** `renderer: "webview"` is a hard error with migration guidance;
-  the webview host binary, `webview-host` feature, `gtk`/`tao`/`wry` dependencies, page bridge,
-  custom protocol, CDP e2e, and WebKitGTK CI dependencies are deleted. The Rendrix engine
-  (`rendrix-host`, feature `rendrix`) is the only rendering engine. It is in **early beta**:
-  feature coverage is limited and a long way from stable; state-driven re-render, hover/active/
-  focus, scrolling, images, text editing, accessibility, and animations are on the M1–M3 ladder.
-- **Deprecated legacy host.** `rendrix-legacy-host` (renderer key `"native"`) still works with a
-  deprecation warning and is scheduled for removal at the Rendrix M1 gate.
-- **Preserved.** The Electron-compat runtime, the updater (host-side download/verify/install),
-  the QuickJS backend + permissions model, and the renderer-agnostic smoke/benchmark scripts
-  all continue to work; they never depended on the WebView renderer.
+The detailed "Unreleased" notes that once lived here described intermediate states (a still-working legacy
+host, an Electron importer, M1–M3 feature ladders) that no longer exist; they were removed rather than left to
+be read as current. Entries below this section are release history as originally written under the old name.
 
 ## 0.4.0
 
@@ -137,7 +130,7 @@ This is a beta. Interfaces may change before 0.4.0, and the platform hosts for m
 ### Known limits
 
 - The native renderer has one window and no page. `window.create`, `window.load` and `ipc.invoke` from the backend are unavailable. `webContents.send` messages are dropped with a warning, and close listeners cannot cancel a close.
-- Tray, global shortcuts, cursor position and display events are partial or unsupported. See the [coverage ledger](packages/cli/src/electron-compat/coverage.mjs).
+- Tray, global shortcuts, cursor position and display events were partial or unsupported in the old Electron-compatibility layer. The coverage ledger was removed with that layer in 0.5.0; tray and global shortcuts are still unimplemented in Rendrix (see [ROADMAP.md](docs/ROADMAP.md)).
 - GPUI does not report a scale factor per display, so the native renderer reports the app window's scale factor for every display.
 - The browser preview does not run the Electron shims.
 - Clipboard, dialogs and power blockers work on Windows only.
@@ -145,4 +138,4 @@ This is a beta. Interfaces may change before 0.4.0, and the platform hosts for m
 - Motion on the native path: CSS transitions, animations and transforms are reported as unsupported. A GPUI animation primitive would close this; otherwise use the WebView renderer for motion.
 - Signing and update support: packages are produced unsigned by default; signing, notarization and in-app updates are handled outside the tool or remain roadmap work.
 
-See [docs/SUPPORTED_SYNTAX.md](docs/SUPPORTED_SYNTAX.md) for the full `api.native` reference.
+The old `docs/SUPPORTED_SYNTAX.md` `api.native` reference was removed with the Electron-compatibility layer in 0.5.0; current capabilities are listed in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).

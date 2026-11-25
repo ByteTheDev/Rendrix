@@ -1,10 +1,11 @@
 # Release executable size
 
-Baseline: the Windows `rendrix-runtime` release executable is **13.8 MB**. That figure
-was recorded in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) with the previous profile
-(`lto = "thin"`, `codegen-units = 4`, `opt-level = 3`). **No new build was measured for
-this change** — the estimates below are qualitative expectations from typical Rust
-projects, not Rendrix measurements. Treat them as hypotheses to verify, not results.
+The historical **13.8 MB** figure was a *packaged Windows app* reported in
+[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) under the old profile (`lto = "thin"`,
+`codegen-units = 4`, `opt-level = 3`). It is not the bare `rendrix-runtime.exe` and is not comparable with
+current figures. A build with the current profile was measured on 2026-11-16 (see "Integration measurement"
+below); the estimates in the table are still qualitative expectations from typical Rust projects, not
+Rendrix measurements. Treat them as hypotheses unless a like-for-like A/B is recorded.
 
 The knobs live in the workspace root, [`engine/Cargo.toml`](../engine/Cargo.toml)
 `[profile.release]`. That is the profile used by `npm run runtime`, `npm run bench`,
@@ -86,10 +87,13 @@ The profile was built and measured on the reference machine (Windows 11, RTX 306
 - The release build with fat LTO + one codegen unit took **4 m 13 s** (cold, all crates
   rebuilt). This is the main cost of the change; dev/test builds were unaffected and
   `cargo test --workspace` stayed fast.
-- `engine/target/release/rendrix-runtime.exe` is **15.14 MB** (15,877,632 bytes) with the
-  new profile.
+- `engine/target/release/rendrix-runtime.exe` was **15.14 MB** (15,877,632 bytes) with the
+  new profile. A later release binary in this working tree, built 2026-11-22, measured
+  **16,054,272 bytes** (15.31 MiB). Later commits changed version metadata (including one engine prelude
+  version string) and npm package scope, not rendering code. These are single observations, not a controlled
+  series.
 
-**This is not yet evidence that the profile reduced size.** The historical 13.8 MB figure in
+**This is not evidence that the profile reduced size.** The historical 13.8 MB figure in
 PERFORMANCE_AUDIT.md refers to a *packaged app* produced by `rendrix package`, not the bare
 `rendrix-runtime.exe`, and predates the canvas/compositing/3D/wasm work that has since grown
 the codebase. A fair A/B requires building both profiles from the *same* source revision into

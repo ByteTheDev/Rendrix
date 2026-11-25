@@ -9,7 +9,9 @@ No browser parity is claimed.
 Run it: `node scripts/wpt.mjs` (needs a built runtime: `npm run runtime`).
 History: `scripts/wpt-history.json` (appended per run, last 50 kept).
 
-## Latest (2026-11-15): 15/15 (100.0%)
+## Latest recorded run (2026-11-15): 15/15 (100.0%)
+
+Only one run has been recorded in `scripts/wpt-history.json` so far; this is that run, not a repeated result.
 
 |  | Case | Checks |
 |---|---|---|
@@ -29,7 +31,7 @@ History: `scripts/wpt-history.json` (appended per run, last 50 kept).
 | ✅ | guard-block-percent-padding | 2/2 |
 | ✅ | guard-absolute-position | 2/2 |
 
-## Pass rate over time (last 12 runs)
+## Recorded runs (up to 12 most recent; currently 1)
 
 | Date | Pass |
 |---|---|

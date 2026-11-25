@@ -1,8 +1,16 @@
 # Rendrix Implementation Audit
 
-Date of audit: 2026-11-14. Scope: entire repository at `C:\Users\spoil\OneDrive\Desktop\Rendrix` (branch `dev`, HEAD `d4740ef`). This document reports only capabilities verified against source code and tests. Uncommitted working-tree changes in `engine/crates/rendrix-css/src/parser.rs`, `properties.rs`, `rendrix-js/src/quickjs.rs`, `rendrix-runtime/src/session.rs` are in-progress fixes and are not counted as shipped.
+Date of audit: 2026-11-14. Scope: entire repository at `C:\Users\spoil\OneDrive\Desktop\Rendrix` (branch `dev`, HEAD `d4740ef`). This document reports only capabilities verified against source code and tests.
 
-## Implementation-mission addendum (2026-11-14, main-agent verified, uncommitted)
+> **Historical snapshot (refreshed 2026-11-24).** The "uncommitted working-tree" fixes mentioned below were
+> committed during the engine rewrite and shipped in 0.5.0/0.5.1; the tree is clean at the 0.5.1 release
+> commits. The capability matrix in the lower half of this file is a 2026-11-14 snapshot — rows marked ❌
+> there may be implemented today. Use [COMPATIBILITY.md](COMPATIBILITY.md) for current features,
+> [ROADMAP.md](ROADMAP.md) for status and [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) for measurements.
+> Test counts quoted below are historical; a 2026-11-24 run reported 410 Rust tests (2 ignored), 44 CLI
+> tests and 2 Solid adapter tests passing.
+
+## Implementation-mission addendum (2026-11-14, main-agent verified; since committed)
 
 Five subagents + main-agent integration landed 19 of 24 plan tasks; full
 verification in `IMPLEMENTATION_PLAN.md` (completion table) and
@@ -39,7 +47,7 @@ tasks now done. Headline deltas vs the audit above (cumulative):
 ## 2026-11-16 update (supersedes the stale rows below)
 
 The capability matrix below is a historical snapshot from 2026-11-14. Several rows marked ❌ are now
-implemented in the working tree. [COMPATIBILITY.md](COMPATIBILITY.md) is the current source of truth.
+implemented and released in 0.5.0/0.5.1. [COMPATIBILITY.md](COMPATIBILITY.md) is the current source of truth.
 Since that audit the following landed: Canvas 2D (plus SVG painting and `OffscreenCanvas`), WebSocket,
 dedicated Workers, IntersectionObserver, Shadow DOM and custom elements, `Range`/`Selection`,
 `contenteditable`, drag-and-drop of files, `:has()`, `@supports`/`@layer`/`@container`/nesting/`@import`,
@@ -53,13 +61,13 @@ variants are superseded by engine/renderer-level tests.
 
 ## Executive summary
 
-1. **What Rendrix can genuinely do today.** On Windows 11 it builds, runs and packages a native desktop application written in TypeScript/TSX with CSS, a real DOM, flexbox/grid/block layout, a real CSS cascade with animations and at-rules, wgpu rendering (including offscreen compositing), OS input, text editing, Canvas 2D, WebSocket, Workers, observers, fetch/storage and an AccessKit bridge, in a single ~13.8 MB executable with no Chromium, Electron or WebView. Verified by 375 Rust tests, 22 CLI tests, an end-to-end scripted run (`npm run e2e`) and a real-window run.
-2. **What is partially implemented.** Tables, floats and multi-column are grid-like approximations; sticky positioning and auto-inset absolutes are simplified; gradients are limited to four stops; JPEG/GIF/WebP decode but only PNG is tested; `@font-face` is local fonts only; `getComputedStyle` covers a fixed property list; `ResizeObserver` reports one content box; scrollbars are overlay indicators, not draggable; transforms are 2D only; masks are spatially approximated; 3D scenes are CPU-rasterized with no depth buffer; macOS/Linux and screen readers are unvalidated.
-3. **What is not implemented.** Service Workers, XHR, IndexedDB, Notifications, Geolocation, video/audio playback, a canvas WebGPU context, fully general tables/floats, `writing-mode`, WOFF2, `cqw`/`cqh`, tray and global shortcuts, mobile OS shells, a React adapter, a multi-process security model and any full browser-compatibility claim. Rendrix is not a browser.
+1. **What Rendrix can genuinely do today.** On Windows 11 it builds, runs and packages a native desktop application written in TypeScript/TSX with CSS, a real DOM, flexbox/grid/block layout, a real CSS cascade with animations and at-rules, wgpu rendering (including offscreen compositing), OS input, text editing, Canvas 2D, WebSocket, Workers, observers, fetch/storage and an AccessKit bridge, in a single standalone executable with no Chromium, Electron or WebView. The bare Windows runtime measures ~15–16 MB under the current release profile (the ~13.8 MB figure is an older packaged-app measurement); see [PERF_BINARY_SIZE.md](PERF_BINARY_SIZE.md). A 2026-11-24 run passed 410 Rust tests and 44 CLI tests; `npm run e2e` and a real-window run are also recorded.
+2. **What is partially implemented.** Tables, floats and multi-column are grid-like approximations; sticky positioning and auto-inset absolutes are simplified; gradients are limited to four stops; JPEG/GIF/WebP decode but only PNG is tested; `@font-face` is local fonts only; `getComputedStyle` covers a fixed property list; scrollbars are overlay indicators, not draggable; transforms are 2D only; masks are spatially approximated; the 3D scene API has a GPU path with depth testing but no PBR/glTF/skeletal animation/instancing; `ResizeObserver` now exposes all three box options and is tested. macOS/Linux are CI-built and tested but not manually GPU-verified; no screen-reader pass is recorded.
+3. **What is not implemented.** Service Workers, XHR, IndexedDB, Notifications, Geolocation, video/audio playback, a canvas WebGPU context, fully general tables/floats, `writing-mode`, WOFF2, `cqw`/`cqh`, tray and global shortcuts, mobile OS shells, a *working* React adapter (an experimental `packages/react-adapter` exists but its real-runtime test fails), a multi-process security model and any full browser-compatibility claim. Rendrix is not a browser.
 4. **JavaScript.** JavaScript and TypeScript are both supported through the same build pipeline; both are transpiled to ES2022 ES modules and run in QuickJS. JavaScript is not executed as raw source by the runtime without the build step, but it does not require type-checking. Source maps, workers and a 5 s/task execution-budget interrupt for runaway scripts are in place.
 5. **External packages that should remain.** wgpu, winit, Taffy, cosmic-text, QuickJS (rquickjs), image, ureq, arboard, serde/serde_json, plus the narrow additions in [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md). None should be rewritten for originality.
-6. **Performance.** Measured on Windows 11 / RTX 3060 / Vulkan, 1000-item list (9009 nodes): idle ≈1.2 ms/frame, hover ≈1.2 ms, scroll ≈1.2 ms, DOM mutation ≈6.5–7 ms, viewport resize ≈10 ms. The last clean reference table is in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md). Incremental box generation and media-query pruning removed the old whole-tree rebuild (~5 ms) and full restyle (~23 ms) bottlenecks; the mutation target of < 3 ms is still open. A font-DB cache landed after those numbers were recorded, so cold-start figures need a fresh quiet re-measurement.
-7. **Highest-priority next steps.** Re-measure cold start and mutations; macOS/Linux hardware validation plus the manual screen-reader pass; WebGL2 fallback and browser-backed APIs on the web target; 50k-node and second-machine benchmarks; remaining CSS/API gaps; React adapter and overlay inspector. See [ROADMAP.md](ROADMAP.md).
+6. **Performance.** Measured on Windows 11 / RTX 3060 / Vulkan, 1000-item list (9009 nodes): idle ≈1.0–1.8 ms/frame, hover ≈1.0–1.8 ms, scroll ≈1.2–4.5 ms, DOM mutation ≈4.4–8.4 ms, viewport resize ≈7.8–10.1 ms across the runs in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md). Incremental box generation and media-query pruning removed the old whole-tree rebuild (~5 ms) and full restyle (~23 ms) bottlenecks; the mutation target of < 3 ms is still open. A 2026-11-22 concurrent-load measurement reported an 81.0 ms first frame; a quiet-machine absolute is still missing.
+7. **Highest-priority next steps.** Quiet-machine cold-start and mutation measurements; macOS/Linux hardware validation plus the manual screen-reader pass; browser verification of the WebGL2 fallback and browser-backed web-target APIs; 50k-node and second-machine benchmarks; remaining CSS/API gaps; fixing the React adapter's failing test and adding an overlay inspector. See [ROADMAP.md](ROADMAP.md).
 
 ## Crate and module inventory
 
