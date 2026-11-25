@@ -8,15 +8,16 @@
 * A GPU with a Vulkan, Metal or DirectX 12 driver. The runtime picks the adapter itself;
   `rendrix doctor` prints which one.
 
-Only Windows has been exercised so far (see [COMPATIBILITY.md](COMPATIBILITY.md)); specifically x64.
-Windows ARM64 and x86 are compile-checked in CI and cross-packaged by tests, but have not been run on
-hardware here.
+Only Windows x64 has been manually exercised with GPU-visible output (see
+[COMPATIBILITY.md](COMPATIBILITY.md)). macOS and Linux are built and tested in CI, but no manual run has
+been recorded. Windows ARM64 and x86 are compile-checked in CI and cross-packaged by tests, but have not
+been run on hardware here.
 
 ## Build the runtime
 
 ```sh
 cd engine
-cargo test --workspace                      # ~375 Rust tests (GPU tests skip themselves with no adapter)
+cargo test --workspace                      # 410 Rust tests / 2 ignored in the 2026-11-24 run (GPU tests skip with no adapter)
 cargo build --release -p rendrix-runtime    # engine/target/release/rendrix-runtime[.exe]
 ```
 

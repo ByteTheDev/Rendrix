@@ -97,4 +97,5 @@ with no live wrapper are freed by a periodic sweep and their ids reused.
   target are partial. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for exactly what is and is not supported, and
-[ENGINE_ASSESSMENT.md](ENGINE_ASSESSMENT.md) for the roadmap.
+[ROADMAP.md](ROADMAP.md) for current status. [ENGINE_ASSESSMENT.md](ENGINE_ASSESSMENT.md) is the dated
+assessment from the start of the engine rewrite.

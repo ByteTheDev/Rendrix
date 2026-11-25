@@ -7,11 +7,11 @@ capability checks. It is not a sandbox for hostile code.** Only run applications
 
 | Capability | Default | How it is enforced |
 |---|---|---|
-| Network (`fetch` to `http(s)`) | **denied** | `permissions.network` in `rendrix.json`; otherwise `fetch` rejects with a `TypeError`. There is no per-host allow-list yet. |
+| Network (`fetch` to `http(s)`) | **denied** | `permissions.network` in `rendrix.json`; otherwise `fetch` rejects with a `TypeError`. There is no per-host allow-list for `fetch`. WebSocket has one hardcoded exception: loopback (`localhost`, `127.0.0.1`, `::1`) is always allowed, even when `permissions.network` is false. |
 | File reads | **denied** | Only through `rendrix.fs`; paths are canonicalised and must lie inside a directory listed in `permissions.fs_read`. Plain Web APIs cannot touch the filesystem. |
 | File writes | **denied** | Same, with `permissions.fs_write`. |
 | Relative `fetch`, images, fonts, stylesheets | bundled assets only | `DirAssets` and bundle assets reject `..` segments. |
-| Process spawning, native add-ons, Node/Bun APIs | **do not exist** | There is no such API in the runtime. |
+| General process spawning, native add-ons, Node/Bun APIs | **do not exist** | There is no general script-facing spawn/add-on API. Two narrow host operations do reach the OS: `rendrix.update.install(path)` re-launches the current executable via `std::process::Command::spawn()`, and `rendrix.shell.openExternal()` asks the OS to open a URL. Neither accepts an arbitrary command. |
 | Remote script/module loading | **do not exist** | The build refuses `http(s):`/`node:` imports; the module loader only reads the bundle. |
 
 Covered by tests: `filesystem_access_is_permission_gated` (reads, writes, denied paths, denied network),

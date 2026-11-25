@@ -1,15 +1,26 @@
 # Rendrix Performance Audit
 
-Date of audit: 2026-11-14. Platform: Windows 11, NVIDIA GeForce RTX 3060, Vulkan, 125% DPI, headless and windowed. All numbers are measured on this machine only; macOS/Linux have not been measured.
+Original audit: 2026-11-14; latest measurements recorded here: 2026-11-22 (cold start). Platform: Windows 11,
+NVIDIA GeForce RTX 3060, Vulkan, 125% DPI, headless and windowed. All numbers are measurements on this
+machine only; macOS/Linux have not been measured.
+
+> **Read this as a chronological log, not a single result.** Each section below is dated and captures the
+> numbers from one run (or a small set of runs) at that point in the tree. Later sections supersede earlier
+> ones where they overlap, and some runs were contaminated by concurrent builds — those are called out and
+> discarded in place. No figure here is a quiet-machine absolute unless explicitly labelled as such. Test
+> counts quoted in passing (234 / 375 / 393) are historical observations from different runs, not a current
+> count; `cargo test --workspace` on the revision you are building is authoritative. The display-list figures
+> quoted throughout (119 items / 1 batch / 773 instances) are observations of the benchmark's 1,000-item
+> fixture, not hardcoded constants.
 
 ## Executive summary
 
-- **Interactive scenarios fit a 60 FPS budget (16.7 ms).** Hover and scrolling run at ~1.2 ms; DOM mutations at ~6.5–7 ms; 120 FPS (8.3 ms) is met for hover/scroll and at the limit for mutations.
-- **The old whole-tree bottleneck is fixed.** Incremental box generation ("P1"), stylesheet/`RuleSet` caching and viewport-dependency pruning landed; the remaining mutation cost is the Taffy re-solve plus `InlineContent::key` rehashing, not full box-tree rebuilds.
-- **Viewport resize is no longer the worst case** (~10 ms in the last clean run, down from 36.1 ms): CSS restyle is ~0.35 ms when no media-dependent rules changed; the residual ~8 ms is Taffy re-solving 9,009 nodes.
-- **Cold-start numbers below are stale.** A disk font-database cache and LRU glyph atlas landed after they were recorded. Two re-measurement attempts on 2026-11-16 produced mutually inconsistent results (see "Re-measurement note" below), so no new cold-start claim is made there. A labeled concurrent-load re-measurement **and** cold-start cuts landed on 2026-11-22 — see "Cold start re-measured and cut" below; a quiet-machine re-measurement is still pending.
+- **Interactive scenarios fit a 60 FPS budget (16.7 ms).** Across the runs recorded below, hover is ~1.0–1.8 ms, scrolling ~1.2–4.5 ms, and DOM mutations ~4.4–8.4 ms; 120 FPS (8.3 ms) is met for hover and usually for scrolling, but not for mutations.
+- **The old whole-tree bottleneck is fixed.** Incremental box generation, stylesheet/`RuleSet` caching and viewport-dependency pruning landed; the remaining mutation cost is the Taffy re-solve plus `InlineContent::key` rehashing, not full box-tree rebuilds.
+- **Viewport resize is no longer the worst case** (7.8–10.1 ms in later runs, down from ~36–39 ms): CSS restyle is ~0.35–0.40 ms when no media-dependent rules changed; the residual is Taffy re-solving 9,009 nodes.
+- **Cold-start numbers in the early tables are stale.** A disk font-database cache and LRU glyph atlas landed after them; two re-measurement attempts on 2026-11-16 were contaminated by concurrent builds and discarded. A concurrent-load re-measurement plus cold-start cuts on 2026-11-22 reported an 81.0 ms first frame (goal `< 200 ms` met **in those runs**) — see "Cold start re-measured and cut" below. A quiet-machine absolute is still pending.
 - **Idle applications do no work** (no timer/animation/pending change → no frame); an idle frame is GPU-only when one is produced.
-- **Executable size 13.8 MB** (release, Windows, thin LTO). GPU instance buffer grows to the next power of two.
+- **Executable size:** ~13.8 MB was a historical *packaged app* figure from an older thin-LTO profile. The current profile (fat LTO, one codegen unit, stripped symbols) produced a bare Windows `rendrix-runtime.exe` of 15,877,632 bytes (15.14 MB) on 2026-11-16; no like-for-like A/B of the two profiles exists. See [PERF_BINARY_SIZE.md](PERF_BINARY_SIZE.md). GPU instance buffer grows to the next power of two.
 
 ## Measured results (bench)
 
@@ -183,8 +194,9 @@ The structural changes are independent of that noise and are verified by tests:
 `layouts = 0.0` for class/JS toggles (no Taffy solve at all, via the paint-only fast path plus
 dirty-box plumbing), clean subtrees skipping `to_taffy()` conversion, and unchanged boxes
 being carried forward in place instead of rebuilding a ~9,000-entry map. Display list is
-unchanged at 119 items / 1 batch / 773 instances. All 393 Rust tests pass (2 pre-existing
-ignored), including new equivalence tests for dirty-aware sync and incremental collect.
+unchanged at 119 items / 1 batch / 773 instances. That run reported 393 passing Rust tests (2 pre-existing
+ignored), including new equivalence tests for dirty-aware sync and incremental collect; other documents in
+this repo record 375 for a similar period, so treat both as historical observations rather than a current count.
 A fair A/B needs an interleaved same-process harness, which is a follow-up.
 
 Startup remains the unresolved cost: the new breakdown reports a ~775–1086 ms first frame,
@@ -291,27 +303,41 @@ quietly before publishing absolutes.
 - `Engine::update` in `engine/crates/rendrix-core/src/lib.rs`: refresh_rules → sweep GC → take dirty → restyle → tick_motion → (if needed) box tree build (`boxtree::Builder::build_root`) → Taffy layout (`TaffyEngine::layout`) → paint (display list).
 - Idle: `has_pending_changes`/`needs_update` false → returns `UpdateInfo { repainted: false }` with no work; no frame produced by scheduler.
 - Restyle is incremental for attribute/class/inline-style (dirty subtrees) and for hover/active/focus and child-list changes only the element itself, descending when computed style changed or stylesheet has non-local state/structural selectors.
-- Layout results are incremental (Taffy keeps its tree between frames); only box generation is not.
+- Layout results are incremental (Taffy keeps its tree between frames), and box generation is now patched
+  per dirty subtree rather than rebuilt wholesale; Taffy still re-solves the affected layout tree.
 
 ## Bottleneck analysis
 
 ### Architectural vs implementation-level
 
-1. **Whole-tree box generation (~5 ms / 9000 nodes).** Implementation-level. `Engine::update` calls `boxtree::Builder::new(self).build_root()` whenever `relayout` is true, rebuilding all boxes. Taffy reuses its tree, but box generation does not. Fix: keep boxes per element and patch dirty subtrees (listed as next priority in ENGINE_ASSESSMENT.md).
-2. **Full restyle on viewport change (~23 ms).** Partly architectural (media queries depend on viewport; cascade must re-evaluate), partly implementation (no dirty-root pruning for media changes). Fix: invalidate only media-dependent rules and recompute affected subtrees.
-3. **Cold start (~0.75 s first frame at the time of the audit).** Was implementation-level: `TextSystem::new()` scanned the system font database and the first frame shaped 3000 paragraphs. A disk font-DB cache and LRU atlas have since landed; the figure above is stale and needs a quiet re-measurement (see "Re-measurement note" above).
-4. **Glyph atlas eviction.** Implementation-level but bounded. 2048×2048 atlas; eviction clears the map and re-rasters (`renderer.rs` `atlas_entry`). Could cause one-frame stale glyphs under heavy text. Fix: larger atlas / LRU eviction.
-5. **CPU-to-GPU transfer.** `queue.write_buffer` for instances + globals each frame; `write_texture` for glyph uploads. Measured GPU 0.3–0.6 ms. Not a bottleneck today. For large UIs, instance buffer reallocation to next power of two (`inst_cap`) is fine.
-6. **Memory allocations.** `Vec` allocations in flatten/paint; box tree allocation each frame. Part of the 5 ms. Incremental box generation would reduce.
+1. **Box generation — fixed at the audit, now incremental.** The audit observed a ~5 ms whole-tree
+   `build_root()`; boxes are now kept per element and dirty subtrees are patched (ROADMAP R1.1). This is no
+   longer the dominant mutation cost.
+2. **Full restyle on viewport change — fixed at the audit.** The audit observed ~23 ms of reparse and full
+   restyle; stylesheet/`RuleSet` caching and viewport-dependency pruning (R1.2) reduced CSS work to
+   ~0.35–0.40 ms on a static sheet.
+3. **Cold start.** The ~0.75 s figure was measured before the font-DB disk cache, LRU glyph atlas, template
+   rewraps, parallel prewarm and background font load. The 2026-11-22 section below reports an 81.0 ms first
+   frame under concurrent load; a quiet-machine absolute is still unmeasured.
+4. **Glyph atlas eviction — fixed at the audit.** The 2048×2048 atlas now uses LRU recycling rather than a
+   full clear (R1.4; `renderer.rs`), so the one-frame stale-glyph risk from a full clear is gone.
+5. **CPU-to-GPU transfer.** `queue.write_buffer` for instances + globals each frame; `write_texture` for glyph uploads. Measured GPU ~0.3–0.8 ms. Not a bottleneck today. For large UIs, instance buffer reallocation to next power of two is fine.
+6. **Memory allocations.** Per-frame `Vec` allocations in flatten/paint were reduced by the allocation
+   discipline work (P5); the retained per-mutation floor is Taffy sync/solve plus `InlineContent::key`
+   rehashing, not a whole box-tree allocation.
 7. **Frame pacing.** `PresentMode::AutoVsync`, `desired_maximum_frame_latency: 2`, `ControlFlow::Wait`/`WaitUntil`. Idle does no work. Good.
-8. **Executable size 13.8 MB.** LTO thin, codegen-units 4. Could reduce with `lto = "fat"` and strip, but not measured. A size-focused release profile (fat LTO, `strip = "symbols"`, 1 codegen unit) has since been configured but is **not yet measured**; see [PERF_BINARY_SIZE.md](PERF_BINARY_SIZE.md).
-9. **Large application interfaces.** 9009 nodes measured; hover 1.03 ms, mutation 7 ms. Scaling beyond ~10k nodes likely dominated by box generation and style traversal (O(n) dirty checks). Not yet measured.
+8. **Executable size.** The current release profile uses fat LTO, one codegen unit and `strip = "symbols"`
+   (`engine/Cargo.toml`); the bare Windows runtime measured 15,877,632 bytes on 2026-11-16. The ~13.8 MB
+   figure is a historical packaged-app measurement under the old thin-LTO profile — not a comparable A/B.
+   See [PERF_BINARY_SIZE.md](PERF_BINARY_SIZE.md).
+9. **Large application interfaces.** 9,009 nodes measured; hover ~1.0–1.8 ms, mutation ~4.4–8.4 ms across
+   runs. Scaling beyond ~10k nodes is unmeasured; O(n) style/layout walks are the expected wall.
 
 ## Existing benchmarks
 
 - `engine/crates/rendrix-runtime/src/bench.rs` (invoked by `rendrix-runtime bench <N>`): pipeline scenario benchmark with style/layout/paint/GPU breakdown. This is the primary benchmark.
   - Startup breakdown (additive, does not change the scenario table): separates font-DB load (`rendrix_gfx::text::last_font_db_load_nanos` / `last_font_db_cache_hit`), JS DOM construction (`rendrix_runtime::session::last_script_run_nanos`), and first-frame phases (restyle / box build / Taffy layout / text shaping / display paint latched in `EngineStats::first_*`, plus first GPU submit). These are distinct fields for a quiet-machine run to attribute cold start; the printed value is a single observation and is **not** a publishable number. Shaping time is snapshotted from `TextSystem::shape_nanos`. The first-frame shaping count is also reported.
-- M0 counters in `bench.rs`: per-scenario medians of newly shaped paragraphs (`TextSystem::shape_count` deltas) and engine `restyles`/`layouts` deltas, alongside the CPU columns. Taffy `last_new_nodes`/`last_restyled_nodes` and atlas `evictions` are not yet reachable from the harness (`Engine.layout` and `Renderer.atlas` are private) — production accessors still needed; see blockers below.
+- M0 counters in `bench.rs`: per-scenario medians of newly shaped paragraphs (`TextSystem::shape_count` deltas) and engine `restyles`/`layouts` deltas, alongside the CPU columns. `Renderer::atlas_evictions()` is public, but the harness does not print it; Taffy's `last_new_nodes`/`last_restyled_nodes` are public on `TaffyEngine` but are not exposed through `Engine`. See blockers below.
 - Criterion micro-benches (dev-only, `criterion` dev-dependency, never shipped):
   - `rendrix-css/benches/css.rs`: `Stylesheet::parse`, `RuleSet::add_stylesheet`, `compute_style` single + 9k tree, ruleset-size scaling.
   - `rendrix-core/benches/engine.rs`: full rebuild of the 9k tree, class/text mutations, static-sheet resize, display-list traversal.
@@ -327,17 +353,23 @@ quietly before publishing absolutes.
 ## What has not been measured
 
 - macOS/Linux performance (untested platform).
-- Startup breakdown beyond total first frame. Instrumentation now exists (see `bench.rs` startup breakdown above) but has only been wired, not run on a quiet machine — still unmeasured.
+- A quiet-machine cold-start absolute. The startup breakdown instrumentation exists and was run under
+  concurrent load on 2026-11-22 (restyle 24.8 ms, first Taffy layout 14.5 ms, prewarm 37.2 ms, font DB
+  14.7 ms); no quiet-machine equivalent has been recorded.
 - Large-interface scaling beyond 9009 nodes.
-- Text shaping cost isolated (paragraph hit/miss benches exist; machine medians pending a green tree).
-- GPU memory / atlas pressure (eviction counter not yet exposed to the harness).
+- Text shaping cost isolated (paragraph hit/miss Criterion benches exist; no published machine medians here).
+- GPU memory / atlas pressure (`Renderer::atlas_evictions()` is public, but the harness does not report it).
 - Multi-frame animation cost over time.
-- Per-scenario allocation bytes on the reference setup (harness records them; medians pending).
+- Per-scenario allocation bytes on the reference setup (harness records them; no published medians here).
 
 ## Recommendations (measurement, not implementation)
 
-- Add Criterion benchmarks for: CSS parsing (`Stylesheet::parse`), cascade (`compute_style`), box tree build, Taffy layout, display list flatten, text shaping.
-- Add allocation profiling (dhat or counting allocator) to quantify per-frame allocations.
-- Measure on a second machine/GPU to validate portability of the 1 ms idle claim.
+- Criterion benches for CSS parsing/cascade, engine and box build, Taffy layout, text, JS and the full
+  pipeline already exist (see "Existing benchmarks"); the remaining work is to publish quiet-machine
+  medians, not to add the harnesses.
+- A per-scenario counting allocator already records allocated-byte deltas; publish medians from a quiet run.
+- Measure on a second machine/GPU to validate portability of the ~1 ms idle claim.
 - Measure with 50k+ nodes to expose O(n) limits.
-- Do not optimize before measuring; current interactive targets are met.
+- Interleave A/B runs in one process before publishing percentage speedups; the current run-to-run variance
+  on the reference machine is large enough to invert conclusions.
+- Do not optimize before measuring; the interactive 60 FPS targets are met, the mutation <3 ms target is not.

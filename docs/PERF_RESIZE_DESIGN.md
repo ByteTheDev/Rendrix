@@ -1,6 +1,12 @@
 # Resize performance: root cause and design options
 
-Status: research/design only. No engine source was modified. All claims about Taffy
+> **Historical design document (2026-11-15).** No engine source was modified to produce this analysis.
+> Source line references describe the tree at that date and may no longer resolve. Several proposals have
+> since landed through other tracks — notably dirty-aware Taffy sync and in-place `LayoutResult` carry-forward
+> (T1/T2), which are close to the "L1" idea in §3. Current measurements are in
+> [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md); current status is in [ROADMAP.md](ROADMAP.md).
+
+Status at the time of writing: research/design only. No engine source was modified. All claims about Taffy
 internals were verified against `taffy 0.9.2` source in the local cargo registry
 (`C:\Users\spoil\.cargo\registry\src\index.crates.io-*\taffy-0.9.2`), which is the
 version resolved in `engine/Cargo.lock` (the manifest range is `0.9`, lock pins
@@ -64,7 +70,7 @@ child whose width is not fully fixed (`auto`, `%`, `fr`, `flex-grow`, cross-axis
 
 `Cache::store` for `RunMode::PerformLayout` unconditionally overwrites a single
 `final_layout_entry` (`cache.rs:163–167`). The benchmark alternates
-1000.0 / 960.0 (`bench.rs:153–157`, `engine.rs:100`). Each frame overwrites the only
+1000.0 / 960.0 (`bench.rs:232–238` at the time of writing — the earlier `153–157` reference was the warm-up loop — and `engine.rs:100`). Each frame overwrites the only
 final-layout result with the other width's geometry, so returning to a previously
 seen width is still a miss. `cache_get` for `PerformLayout` does skip the available
 space check when `known_dimensions` are `Some` (`cache.rs:118–131`), which is why
@@ -154,8 +160,10 @@ target workload.
 
 ### 2.4 L1 design detail (concrete)
 
-In `taffy_engine.rs`, extend `Cached` (line 18) with the source style identity and the
-parent-area dependency, and restructure `sync` (line 45):
+In `taffy_engine.rs`, extend `Cached` (line 21 at the time of writing) with the source style identity and
+the parent-area dependency, and restructure `sync` (line 151). **Status note:** dirty-aware sync and a
+`source_style: Arc<ComputedStyle>` field already exist in the current tree; this proposal was effectively
+superseded by that work (the `areas_sig` idea below was not adopted).
 
 ```rust
 struct Cached {
@@ -202,7 +210,8 @@ In `Engine` (`lib.rs:56–100`) add a cache of at most N (e.g. 4) entries keyed 
 `(viewport.0, viewport.1, viewport_scale, revision)` where `revision` is a monotonically
 increasing counter bumped on any DOM mutation, restyle, text change, or container-size
 change — i.e. any event that already sets one of the `dirty`/`rules_dirty` flags. Value
-is a cloned `LayoutResult` (9009 `BoxLayout`s ≈ 360 KB/entry; 4 entries ≈ 1.4 MB).
+is a cloned `LayoutResult` (9009 `BoxLayout`s × 56 bytes raw ≈ 493 KiB per entry; 4 entries ≈ 1.93 MB
+before `HashMap` overhead — the earlier 360 KB estimate was too low).
 
 In `update`, immediately after `vp_changed` is read and before the full layout path
 (`lib.rs:397–460`), if the key is present and `revision` matches, assign
@@ -253,7 +262,7 @@ team explicitly targets repeated-width scenarios.
   size arriving, DPR/scale change, dark-mode toggle). Today all of these funnel through
   flags that force layout, so tie `revision` to `layout_needed` rather than trying to
   enumerate causes.
-- Memory: 4 × 360 KB = ~1.4 MB resident; acceptable for a renderer, but expose a
+- Memory: 4 × ~493 KiB ≈ 1.9 MB raw (plus `HashMap` overhead); acceptable for a renderer, but expose a
   toggle and default small.
 - Test equivalence must cover "resize to width W via cache hit" vs "fresh engine at
   width W" for all 9,009 boxes.
@@ -268,18 +277,19 @@ actual edits; this is the hand-off plan.
 
 **Phase 0 — instrument before changing anything.**
 - Expose `TaffyEngine.last_new_nodes` / `last_restyled_nodes` through `Engine` (audit
-  `PERFORMANCE_AUDIT.md:179` lists this as a blocker). Add accessors in
-  `rendrix-core/src/lib.rs` near `Engine::layout_size` (line 618) and thread them into
-  `rendrix-runtime/src/bench.rs` `Sample` (line 42) and the printed table (line 166).
+  `PERFORMANCE_AUDIT.md` "What has not been measured"/"Existing benchmarks" sections). Add accessors in
+  `rendrix-core/src/lib.rs` near `Engine::layout_size` (line 723 at the time of writing) and thread them into
+  `rendrix-runtime/src/bench.rs` `Sample` (line 40) and the printed table (lines 247–249).
 - Add a Criterion timing around only `TaffyEngine::layout` inside
   `rendrix-layout/benches/taffy.rs` (separate from `Engine::update`) to separate Taffy
   solve from `sync` + `collect`. This decides whether L1 or L2 is worth doing.
 
 **Phase 1 — L1 (style-identity short-circuit).**
-- `engine/crates/rendrix-layout/src/taffy_engine.rs`: extend `Cached` (line 18), rework
-  `sync` (line 45), keep `layout` (line 108) unchanged. Add a unit test next to
-  `unchanged_tree_restyles_nothing…` (line 674) that rebuilds equal-content styles in
-  fresh `Arc`s and asserts identical `LayoutResult`.
+- `engine/crates/rendrix-layout/src/taffy_engine.rs`: extend `Cached`, rework `sync`, keep `layout`
+  unchanged (line numbers from the original document: 18, 45 and 108). Add a unit test next to
+  `unchanged_tree_restyles_nothing…` (originally around line 674) that rebuilds equal-content styles in
+  fresh `Arc`s and asserts identical `LayoutResult`. Much of this landed later via dirty-aware sync; the
+  equivalence tests are the part still worth keeping.
 - Expected observable: `last_restyled_nodes` stays 1 on static-sheet resize; layout ms
   drops by the measured sync cost; hover/scroll/mutation unchanged or better.
 
@@ -310,7 +320,7 @@ could change root geometry for non-block roots.
 Use quiet-machine runs only — `PERFORMANCE_AUDIT.md:135–153` documents two contaminated
 runs that were discarded.
 
-1. **Alternating-width resize** (existing `bench.rs:153–157`, `engine.rs:95–106`):
+1. **Alternating-width resize** (existing `bench.rs:232–238`, `engine.rs:95–106`):
    primary signal for L2; keep unchanged.
 2. **Monotonic new-width resize** (new): `set_viewport(960.0 + (i % 41), 700.0, 1.0)`
    or a continuously increasing width. This defeats Taffy's single-slot final-layout

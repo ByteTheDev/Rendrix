@@ -6,25 +6,28 @@ implemented (❌). Anything not listed is not supported. Tests live next to the 
 `engine/crates/*/src` (unit), `engine/crates/rendrix-runtime/tests` (input/frame integration, GPU pixels),
 `packages/cli/test` (build pipeline, runs bundles in the real runtime).
 
-Verified platform: **Windows 11, NVIDIA GeForce RTX 3060, Vulkan** (windowed at 125 % DPI and headless).
-macOS and Linux share the same code (winit, wgpu, arboard) but have **not been built or run**.
+Manually verified platform: **Windows 11, NVIDIA GeForce RTX 3060, Vulkan** (windowed at 125 % DPI and
+headless). macOS and Linux are built and tested in CI (`.github/workflows/ci.yml`), but no GPU-visible
+manual run has been recorded there; GPU tests skip themselves when CI has no adapter. The same distinction
+applies to the non-x64 Windows and Linux packaging targets: compile-checked or cross-packaged, not manually
+run on hardware here.
 
 Architecture note: the verified Windows platform above is **x64**. Windows **ARM64** (`aarch64-pc-windows-msvc`,
 key `win32-arm64`) and **x86 / 32-bit** (`i686-pc-windows-msvc` / `i686-pc-windows-gnu`, aliases `x86` / `ia32`,
-key `win32-x86`) are supported packaging targets compile-checked in CI, but neither has been run on hardware
-in this environment — treat them as packaged/compile-checked, not hardware-verified.
+key `win32-x86`) are supported packaging targets compile-checked in CI, but neither has been manually run on
+hardware here — treat them as packaged/compile-checked, not hardware-verified.
 
 The same applies to the non-x64/arm64 Linux keys: `linux-x86` (`i686-unknown-linux-gnu`), `linux-armv7`
 (`armv7-unknown-linux-gnueabihf`, aliases `armv7` / `armhf`, the Raspberry Pi 32-bit target) and
 `linux-riscv64` (`riscv64gc-unknown-linux-gnu`, alias `riscv64`) are **packaging targets** — the CLI resolves
 and cross-packages them (target resolution is test-covered), and CI compile-checks the runtime for each
-triple, but no Linux build of any architecture has been built or run on hardware in this environment.
+triple, but no Linux build of any architecture has been manually run with GPU-visible output here.
 
 ## JavaScript and modules
 
 | Feature | Status | Notes |
 |---|---|---|
-| ES2023 language, classes, private fields, `async`/`await`, generators | ✅ | Whatever QuickJS-ng provides; `BigInt`, `WeakRef`, `FinalizationRegistry`, `Object.groupBy`, `toSorted`, `Array.fromAsync` are present |
+| ES2023 language, classes, private fields, `async`/`await`, generators | ✅ | Provided by the pinned QuickJS-ng through `rquickjs 0.14`, including `BigInt`, `WeakRef`, `FinalizationRegistry`, `Object.groupBy`, `toSorted` and `Array.fromAsync`. The last three come from the vendored QuickJS-ng and are not separately covered by in-tree tests |
 | ES modules, relative imports, top-level `await` | ✅ | Bare specifiers resolved at build time (ESM packages only) |
 | Dynamic `import()` | ✅ | Provided by QuickJS; the build rewrites static and dynamic specifiers to bundle paths (variable specifiers pass through to the runtime loader). Covered by CLI rewrite tests and `rendrix-js` chunk/TLA ordering tests plus a `Session` end-to-end test |
 | CommonJS / `require` / Node built-ins | ❌ | Build error with an explanation |
@@ -32,7 +35,7 @@ triple, but no Linux build of any architecture has been built or run on hardware
 | Source maps | ✅ | `tsc` maps stored per module in `bundle.sourceMaps` (`rendrix-app/1` unchanged — additive field); runtime remaps `at name (file:line:col)` frames, invalid maps ignored |
 | Promises, microtask order, `queueMicrotask`, unhandled-rejection events | ✅ | Runaway scripts are interrupted by an execution budget (default 5 s/task) and reported as errors |
 | `setTimeout`/`setInterval`/`requestAnimationFrame` | ✅ | Frame-driven rAF; timers on the platform clock |
-| `Intl`, `WebAssembly`, Workers, `Temporal` | ❌ | Not defined (checked in the runtime); `toLocaleString` works without locale data |
+| `Intl`, `WebAssembly`, `Temporal` | ❌ | Not provided by the prelude or the pinned QuickJS build; `toLocaleString` works without locale data. Dedicated `Worker` is implemented and tested — see the Workers row below |
 
 ## DOM
 
@@ -46,7 +49,7 @@ triple, but no Linux build of any architecture has been built or run on hardware
 | Form controls: `input` (text-like, checkbox, radio, button), `textarea`, `select`, `button`, `label`, `form` | 🟡 | Typing, caret, selection, clipboard, `input`/`change`, label and submit activation work. Undo/redo via Ctrl+Z/Y (50-entry per-control history). Full constraint validation (`validity`, `checkValidity`/`reportValidity`/`setCustomValidity`, `required`/`pattern`/`minlength`/`maxlength`/`min`/`max`/`step`, email/url/number types, `invalid` events; `reportValidity` focuses the first invalid control — no visual bubble UI). `select` has keyboard navigation (arrows/Home/End) and `showPicker()` (renders an in-engine popup list). `stepUp`/`stepDown`/`valueAsDate` work. `input[type=file].showPicker()` opens the real OS file dialog (populates `files` with `File` objects carrying `path`, bytes still read via `rendrix.fs` with permission); `input[type=date].showPicker()` opens an in-engine calendar. Popups are engine-rendered, not OS widgets |
 | `getBoundingClientRect`, `offset*`, `client*`, `scroll*`, `scrollIntoView`, `elementFromPoint`, `getComputedStyle` | 🟡 | `getComputedStyle` implements a fixed list of properties (display, position, colour, size, margin/padding/border, font, opacity, overflow, z-index, transform, filter, backdrop-filter, clip-path, mask-image, text-shadow, text-overflow, custom properties); others return `""` |
 | `MutationObserver` | ✅ | childList, attributes (+filter, old value), characterData, subtree |
-| `ResizeObserver` | 🟡 | One content-box size; delivered per frame |
+| `ResizeObserver` | ✅ | `contentRect` plus `contentBoxSize`/`borderBoxSize`/`devicePixelContentBoxSize`; `observe(el, { box })` accepts `content-box`, `border-box` and `device-pixel-content-box`, with DPR scaling and invalid-value errors. Delivered per animation frame; covered by `rendrix-js` tests |
 | `IntersectionObserver`, Shadow DOM, custom elements, `Range`/`Selection`, `contenteditable`, drag and drop | ✅/🟡 | `IntersectionObserver` ✅ (thresholds, rootMargin). Shadow DOM ✅ minimal: `attachShadow({mode})` open/closed roots, `shadowRoot`, `customElements.define/get/whenDefined/upgrade` with `connectedCallback`/`disconnectedCallback` on insert/remove. `Range` ✅ (offsets, `selectNode/Contents`, `cloneRange`), `Selection` ✅ singleton (`addRange`/`getRangeAt`/`selectAllChildren`/`toString`). `contenteditable` ✅ reflection + `document.designMode` + `execCommand('insertText'/'delete'/'selectAll')`. Drag and drop 🟡: native OS file drops only (see row below) |
 
 ## CSS
@@ -95,7 +98,7 @@ triple, but no Linux build of any architecture has been built or run on hardware
 | XMLHttpRequest, IndexedDB, Notifications, Geolocation | ❌ | Not defined |
 | `<video>`/`<audio>` | ❌ | Not implemented |
 | Drag and drop | 🟡 | Native OS file drops deliver `dragenter`/`dragover`/`drop`/`dragleave` with a `DataTransfer` whose `files` carry `name` + Rendrix-extension `path` (read bytes only via `rendrix.fs` with permission). No draggable-element DnD, no `dragstart` synthesis from script yet |
-| `matchMedia` refinement | 🟡 | `prefers-reduced-motion` and `prefers-contrast` are answered from host OS prefs (env override `RENDRIX_REDUCED_MOTION=1` / `RENDRIX_CONTRAST_MORE=1` until per-OS queries land) |
+| `matchMedia` refinement | 🟡 | `prefers-reduced-motion` and `prefers-contrast` are answered on all native targets from `RENDRIX_REDUCED_MOTION=1` / `RENDRIX_CONTRAST_MORE=1`; real per-OS preference queries are not implemented on any platform yet |
 | `rendrix` module: `window`, `clipboard`, `quit`, `fs`, `dialog`, `shell`, `update` | ✅ | `fs` is limited to directories listed in `permissions.fs_read`/`fs_write`; `dialog`/`shell`/`update` documented below |
 
 ## Measured performance (M0 harness)
@@ -127,21 +130,21 @@ subset only — no browser parity is claimed, and it is not the full web-platfor
 
 | Capability | Status |
 |---|---|
-| Native window (winit), DPI scaling, resize, title, close | ✅ Windows x64 (verified); Windows ARM64/x86, macOS/Linux ❓ untested on hardware |
+| Native window (winit), DPI scaling, resize, title, close | ✅ Windows x64 (manually verified); macOS/Linux built and tested in CI, not manually GPU-verified; Windows ARM64/x86 compile-checked, not run on hardware here |
 | Mouse, keyboard, wheel, text input, IME commit | ✅ Windows x64 (IME composition itself untested) |
 | System clipboard | ✅ via `arboard` (text) |
-| Single standalone executable (`rendrix package`) | ✅ Windows x64 (13.8 MB, no external runtime); Windows ARM64/x86 packages plus macOS `.app` bundle and Linux binary layouts wired in the CLI (compile-checked in CI, not run here) |
+| Single standalone executable (`rendrix package`) | ✅ Windows x64 (no external runtime; the bare `rendrix-runtime.exe` measured ~15–16 MB under the current release profile — see [PERF_BINARY_SIZE.md](PERF_BINARY_SIZE.md)); Windows ARM64/x86 packages plus macOS `.app` bundle and Linux binary layouts are wired in the CLI (compile-checked in CI, not run here) |
 | File dialogs, multi-window, tray, global shortcuts, auto-update, accessibility tree | 🟡/❌ | Dialogs, multi-window, the update client and the accessibility bridge are implemented (rows below); tray and global shortcuts remain ❌ |
 | Native file dialogs | ✅ | `rendrix.dialog.showOpenDialog({ title, filters: [{ name, extensions }], multiple, properties: ['openDirectory'] })` and `showSaveDialog({ title, defaultPath, filters })` → `Promise<string[] | null>`; OS UI runs on a worker thread (never blocks the frame loop); `Headless::set_dialog_mock` / `host.set_dialog_mock` for tests |
 | External links | ✅ | `rendrix.shell.openExternal(url)` — `http(s)`/`mailto:` only, fire-and-forget |
 | Multi-window | 🟡 | `window.open(url, target, 'width=W,height=H')` boots a real second window with an isolated `Session` (own engine + JS context); `handle.close()` / per-window close box drops it; last window out quits. No shared document/clipboard beyond the OS clipboard yet |
-| Accessibility tree | 🟡 | AccessKit bridge (`accesskit_winit`: UIA/NSAccessibility/AT-SPI) with role/name/state/bounds built from the DOM, AT actions (Click/Focus/Blur/SetValue/ReplaceSelectedText) routed to session entry points, updates pushed on repainted frames only; `prefers-reduced-motion`/`prefers-contrast` via `matchMedia`. No manual Narrator/NVDA/VoiceOver/Orca pass yet — do not claim support (unexecuted procedure: [docs/A11Y_CHECKLIST.md](A11Y_CHECKLIST.md)) |
+| Accessibility tree | 🟡 | AccessKit bridge (`accesskit_winit`: UIA/NSAccessibility/AT-SPI) with role/name/state/bounds built from the DOM, AT actions (Click/Focus/Blur/SetValue/ReplaceSelectedText) routed to session entry points, updates pushed on repainted frames only; `prefers-reduced-motion`/`prefers-contrast` via `matchMedia` (environment-variable backed on all native targets). No manual Narrator/NVDA/VoiceOver/Orca pass yet — do not claim support (unexecuted procedure: [A11Y_CHECKLIST.md](A11Y_CHECKLIST.md)) |
 | App updates | 🟡 | `rendrix.update.check(feedUrl, version?)` → manifest `{ version, url, sha256 }`; `download(url, sha256)` verifies SHA-256 into a staged file; `install(path)` swaps the binary and relaunches (`quitAndInstall` semantics; Windows move-aside rename). Manifest written by `rendrix package --manifest` |
 | Code signing / installers | 🟡 | Helpers wired: `rendrix package --sign` (RENDRIX_SIGN_COMMAND / platform env), `--installer nsis` (Windows), `--manifest/--manifest-key/--publish-url`; macOS notarization helper present. No signed/macOS/Linux install runs yet |
 | Hot reload (`rendrix dev`) | ✅ | Rebuild diffs `bundle.modules`, writes `.rendrix/hot-update.json`; the running app picks it up via `RENDRIX_HOT_FILE` polling and hot-swaps modules in a fresh JS runtime on the live DOM (state preservation is script-cooperative; failed updates keep the last-good tree with the error logged). `--no-hot` restores restart behavior. End-to-end no-restart path verified at session level + CLI diff/sidecar tests |
 | Inspector | 🟡 | `rendrix-runtime --inspect out.json` (headless) dumps a JSON snapshot: DOM node table (capped at 500), computed styles, layout rects, `EngineStats` (incl. shaping signals), console tail, runtime errors. Snapshot on demand only, zero per-frame cost. No overlay UI |
 | Headless page render (`rendrix render page.html -o out.png` / `out.pdf` / `frames/`) | ✅ | PNG screenshot, one-page PDF, or a PNG frame sequence (the handoff the /video pipeline consumes; mp4 encoding is explicitly out of scope) through the existing headless path (`--screenshot` / `--pdf` / `--frame-dir`). Typechecking off; only the page plus the files it references are staged |
-| Solid adapter | ✅ | `packages/solid-adapter` (upstream `solid-js@1.9.19`, adapter-scoped dep) renders on the Rendrix DOM: mount/update/unmount/cleanup/events/`Show`/`For`/memo, `h` + `jsx-runtime` mapping, `onMount`/`onCleanup`, click handling. Headless 13-step matrix green. Limitations: `SVGElement` shim included; post-dispatch `currentTarget` cleanup warning is benign; `classList`-object-with-accessors is static (use function-valued props); `Show`/`For` need accessor props; no SSR/hydration; TSX `jsxImportSource` pragma unsupported (`buildApp` pins `rendrix`) |
+| Solid adapter | ✅ | `packages/solid-adapter` (upstream `solid-js@1.9.19`, adapter-scoped dep) renders on the Rendrix DOM: mount/update/unmount/cleanup/events/`Show`/`For`/memo, `h` + `jsx-runtime` mapping, `onMount`/`onCleanup`, click handling. Headless 14-step matrix green. Limitations: `SVGElement` shim included; post-dispatch `currentTarget` cleanup warning is benign; `classList`-object-with-accessors is static (use function-valued props); `Show`/`For` need accessor props; no SSR/hydration; TSX `jsxImportSource` pragma unsupported (`buildApp` pins `rendrix`) |
 
 ## Web target (wasm32-unknown-unknown, `rendrix-web`)
 
@@ -160,7 +163,7 @@ wasm stub) and `rendrix-web`. Native-only code in `rendrix-js/src/host.rs` (`std
 | JavaScript engine | 🟡 | The browser's own engine, not QuickJS: `BrowserEngine` (`rendrix-web/src/engine.rs`) routes `__native(op, ...args)` to the same `DomHost`, runs the same prelude, and forwards console output to the page. No bundling of an engine in the wasm binary; browser JIT performance |
 | ES modules | 🟡 | Each bundle module becomes a Blob URL with static specifiers rewritten post-order to dependency URLs, so the browser loader does linking, TLA and live bindings. Literal and computed `import()` go through `__rendrix_dynImport`, resolved against the bundle map at call time; unknown specifiers reject. **Static import cycles cannot be expressed with Blob URLs and are reported as errors** — keep the module graph acyclic for the web target. `boot` (`DOMContentLoaded`/`load`) is deferred until the module queue is idle, as in a page |
 | Tasks and microtasks | 🟡 | Microtasks cannot be drained on demand (`run_jobs` is a no-op; promise jobs run when control returns to the worker event loop). The frame loop still settles several extra frames after input so queued jobs land. **No execution-budget interrupt**: a runaway script hangs the worker (the page stays alive), whereas native QuickJS is preempted after 5 s/task |
-| Rendering | 🟡 | wgpu `BROWSER_WEBGPU \| GL` on the transferred `OffscreenCanvas`, with downlevel WebGL2 limits requested where WebGPU is missing. Instance creation probes for a *usable* WebGPU adapter (`new_instance_with_webgpu_detection`): a bare `Instance::new` locks onto the WebGPU-only path from `navigator.gpu` alone, which headless Chromium (SwiftShader) exposes without being able to create an adapter. Headless Chromium 153 run is green (10-check driver test: mount, rAF frames, in-app clicks, storage, dialog rejection, WS error event) with SwiftShader WebGPU flags (`--enable-unsafe-swiftshader --in-process-gpu --disable-gpu-sandbox`); real-GPU runs are untested. When the device has no storage buffers, the renderer now uses a uniform-backed 48-instance array with chunked draws and a uniform polygon buffer instead of SSBOs; a native pixel test under `downlevel_webgl2_defaults()` is identical to the WebGPU path, and the native single-storage-buffer path is unchanged. A real no-WebGPU browser run is still unrecorded, so treat this target as unverified on such browsers |
+| Rendering | 🟡 | wgpu `BROWSER_WEBGPU \| GL` on the transferred `OffscreenCanvas`, with downlevel WebGL2 limits requested where WebGPU is missing. Instance creation probes for a *usable* WebGPU adapter (`new_instance_with_webgpu_detection`): a bare `Instance::new` locks onto the WebGPU-only path from `navigator.gpu` alone, which headless Chromium (SwiftShader) exposes without being able to create an adapter. A manually reported headless Chromium 153 run was green (10 checks: mount, rAF frames, in-app clicks, storage, dialog rejection, WS error event) with SwiftShader WebGPU flags (`--enable-unsafe-swiftshader --in-process-gpu --disable-gpu-sandbox`); no automated browser driver test is checked into this repository, and real-GPU runs are untested. When the device has no storage buffers, the renderer now uses a uniform-backed 48-instance array with chunked draws and a uniform polygon buffer instead of SSBOs; a native pixel test under `downlevel_webgl2_defaults()` is identical to the WebGPU path, and the native single-storage-buffer path is unchanged. A real no-WebGPU browser run is still unrecorded, so treat this target as unverified on such browsers |
 | Input and environment | ✅ | Pointer/touch/wheel, keys, IME composition, text commit, paste, resize/DPR, focus, safe area, keyboard height, `prefers-color-scheme`, `maxTouchPoints`, gamepads (polled on the page — the Gamepad API is main-thread only) are forwarded by `rendrix-web.js`. `WebApp::eval` evaluates expressions in the app for diagnostics/tests |
 | `fetch` | ✅ | Browser `fetch` behind the host HTTP hook (forbidden headers are dropped by the browser); `data:` and bundle-relative URLs as on native |
 | Clipboard | 🟡 | App copies are forwarded to `navigator.clipboard`; pastes arrive as page events. No `clipboardchange` events |

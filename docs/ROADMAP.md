@@ -1,38 +1,42 @@
 # Rendrix Implementation Roadmap
 
-Date of original audit: 2026-11-14. **Updated 2026-11-16** to reflect what is actually in the tree.
-Status reflects verified source and tests, not README claims. The authoritative feature list is
-[COMPATIBILITY.md](COMPATIBILITY.md); measurements are in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
+Date of original audit: 2026-11-14. **Updated 2026-11-24** to reflect the 0.5.1 release and the
+2026-11-22 cold-start measurements. Status reflects verified source and tests, not README claims. The
+authoritative feature list is [COMPATIBILITY.md](COMPATIBILITY.md); measurements are in
+[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md). A 2026-11-24 run reported 410 Rust tests passing (2 ignored),
+44 CLI tests and 2 Solid adapter tests; older counts in this repo (234/375/393 Rust, 22 CLI) were recorded
+at earlier points. Re-run `cargo test --workspace` on the revision you are building for the current count.
 
 ## Current state
 
-`cargo test --workspace`: **375 passed / 0 failed / 2 ignored** (the two ignored session-level variants
-are superseded by engine/renderer-level tests). CLI 22/22, Solid adapter 2/2. A large batch of new work
-(CSS at-rules, compositing, DOM APIs, canvas, forms, 3D, web target) is **in the working tree but not yet
-committed**; treat "landed" below as "present in source with tests", not "released".
+A 2026-11-24 run reported **410 passed / 0 failed / 2 ignored** (the two ignored session-level variants
+are superseded by engine/renderer-level tests); CLI 44/44, Solid adapter 2/2. The React adapter has 2 passing
+tests and 1 failing real-runtime test. CSS at-rules, compositing, DOM APIs, canvas, forms, 3D and the web
+target are **committed and released** in 0.5.0/0.5.1.
 
 Landed task IDs: R0.2, R1.1–R1.4, R2.1, R2.3 (except tray/shortcuts), R3.1, R3.2, R3.5, R4.1–R4.3,
 R5.1 (Solid), R5.2 (snapshot inspector), plus 3D scenes, the wasm web target and mobile-input scaffolding.
 Partial: R3.3, R3.4, R2.3 (tray/shortcuts), R6.x distribution. Open: R2.2, the web-target follow-ups,
-manual accessibility verification and scale/cold-start measurement.
+manual accessibility verification, a quiet-machine cold-start absolute and scale measurement. A
+concurrent-load cold-start re-measurement landed in 0.5.1 (see R1.3 and the performance audit).
 
-## Guiding priorities (updated 2026-11-16)
+## Guiding priorities (updated 2026-11-24)
 
-1. Re-measure cold start now that the font database is cached and the atlas uses LRU; target first frame < 0.2 s.
+1. Re-measure cold start on a **quiet machine**. The concurrent-load 2026-11-22 run met the `< 0.2 s`
+   first-frame goal (81.0 ms), but no quiet absolute has been recorded.
 2. Mutation latency under 3 ms (120 FPS): residual Taffy re-solve + `InlineContent::key` rehashing.
 3. macOS/Linux validation on real hardware plus the manual screen-reader pass in [A11Y_CHECKLIST.md](A11Y_CHECKLIST.md).
-4. Web-target gaps: WebGL2 fallback, browser-backed WebSocket/Workers/storage, import cycles, runaway-script interrupt.
+4. Web-target gaps: browser verification of the WebGL2 fallback, browser-backed WebSocket/Workers/storage, import cycles, runaway-script interrupt.
 5. Scale measurement: 50k+ nodes and a second machine/GPU.
 6. Compatibility gaps with high web value: `cqw`/`cqh`, WOFF2, `writing-mode`, spatially-varying masks,
    table `colspan`/`rowspan`, float text wrap, range input, validation bubble UI.
-7. Ecosystem: React reconciler and an overlay inspector on top of the existing `--inspect` snapshot.
+7. Ecosystem: make the experimental React adapter's integration test green, and build an overlay inspector on top of the existing `--inspect` snapshot.
 
 ## Phase 0 — Stabilize and measure
 
-### R0.1 Uncommitted fix review and commit
-- **Status:** in progress. The CSS parser (non-finite keyframe offsets), border-width, QuickJS array unwrap
-  and session element-unwrap fixes are present in the working tree alongside the larger feature batch.
-- **Missing:** review, add any missing tests and **commit** — nothing here is committed yet.
+### R0.1 Fix review and commit — done
+- The CSS parser (non-finite keyframe offsets), border-width, QuickJS array unwrap and session element-unwrap
+  fixes landed with the engine rewrite and are shipped in 0.5.0/0.5.1. No uncommitted batch is pending.
 
 ### R0.2 Expand benchmarks
 - **Status:** done. Criterion micro-benchmarks live in `engine/crates/*/benches/` (css, engine, taffy,
@@ -50,10 +54,12 @@ is guarded by `patch_tree_splices_non_root_units_instead_of_rebuilding` and
 Stylesheet/`RuleSet` caching plus media/viewport-dependency flags skip restyle when viewport-dependent rules
 are absent. Viewport resize improved from ~36 ms to ~10 ms (below the 15 ms goal).
 
-### R1.3 Cold-start font cache — landed, needs re-measurement
+### R1.3 Cold-start font cache — landed; re-measured under load, quiet absolute still pending
 The font database is serialized to a disk cache (keyed to reject tampering) and shaping uses an LRU with
-quantised widths. The old ~0.75 s first-frame figure predates this work; re-run `bench 1000` and replace the
-startup numbers in the performance audit before making any claim.
+quantised widths. 0.5.1 added template rewraps, parallel first-frame prewarm, a background font-DB load and
+headless-init overlap; medians of three concurrent-load `bench 1000` runs reported a first frame of 416.0 →
+81.0 ms and startup 684.6 → 419.5 ms. Those are relative signals, not quiet-machine absolutes; see
+[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) §"Cold start re-measured and cut".
 
 ### R1.4 Glyph atlas LRU — done
 Least-recently-used eviction replaces the full clear; overflow recovery is covered by a renderer pixel test.
@@ -137,9 +143,11 @@ last-good tree. `--no-hot` restores restart behaviour.
 
 ## Phase 5 — Developer ecosystem
 
-### R5.1 Framework adapters — Solid done, React open
+### R5.1 Framework adapters — Solid done; React present but not green; Vue not started
 `packages/solid-adapter` runs upstream `solid-js` on the Rendrix DOM (mount/update/cleanup/events/`Show`/`For`,
-13-step headless matrix). A React reconciler and Vue adapter have not been started.
+14-step headless matrix). `packages/react-adapter` is an experimental `react-reconciler` host config: 2 of its
+3 tests pass, but the real-runtime integration test fails (`cannot read property 'textContent' of null` in the
+headless expect step). A Vue adapter has not been started.
 
 ### R5.2 Devtools / inspector — snapshot done, overlay open
 `rendrix-runtime --inspect out.json` dumps DOM, computed styles, layout rects, engine stats and console tail
@@ -163,19 +171,18 @@ sequence (the handoff to the video pipeline).
 
 | Order | Task | Impact |
 |---:|---|---|
-| 1 | Commit the in-flight batch | Stability / risk |
-| 2 | Re-measure cold start and mutation latency; publish numbers | Performance claims |
-| 3 | macOS/Linux validation + manual AT pass | Real-world use |
-| 4 | WebGL2 fallback and web-target API gaps | Browser target viability |
-| 5 | 50k-node and second-machine benchmarks | Scaling knowledge |
-| 6 | CSS/API gap list (R3.3/R3.4) | Web compatibility |
-| 7 | React adapter + overlay inspector | Ecosystem |
+| 1 | Re-measure cold start on a quiet machine and publish mutation numbers | Performance claims |
+| 2 | macOS/Linux validation + manual AT pass | Real-world use |
+| 3 | Browser verification of the WebGL2 fallback and web-target API gaps | Browser target viability |
+| 4 | 50k-node and second-machine benchmarks | Scaling knowledge |
+| 5 | CSS/API gap list (R3.3/R3.4) | Web compatibility |
+| 6 | Fix the experimental React adapter's integration test + overlay inspector | Ecosystem |
 
 ## What Rendrix is NOT close to today
 
 - Browser: no full HTML5 tree builder, no security/multi-process model, no navigation, no full CSS.
 - IDE class app: no terminal/pty, no process model, no overlays/devtools protocol.
-- Full 3D engine or video editor: no depth buffer/PBR/glTF, no media decoding, no timeline.
+- Full 3D engine or video editor: the GPU scene path has depth testing, but there is no PBR, glTF, skeletal animation or instancing; no media decoding or timeline either.
 - Complex multi-window desktop: several windows and dialogs work; no tray or global shortcuts yet.
 
 ## Dependencies and blockers

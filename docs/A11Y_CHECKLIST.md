@@ -6,9 +6,11 @@ performed or recorded**. Do not claim support for any screen reader. When a pass
 record the date, build, OS/AT versions and results in the table at the bottom; until then
 this page is a procedure, not a result.
 
-Test app: any `examples/` app with labelled controls (buttons with text, a text input
-with `<label>`, a checkbox). Build it with `rendrix package` (or run with `rendrix run`)
-so the native accessibility bridge is active.
+Test app: `examples/app-counter` has labelled buttons but **no text input or checkbox**, so it only covers
+the button steps below. For the full pass, build a small temporary app (or extend the counter example) with a
+`<label>`-associated text input and a checkbox, then build it with `rendrix package` (or run it with
+`rendrix run`) so the native accessibility bridge is active. Record which app and build was used in the
+results log.
 
 ## Narrator (Windows)
 

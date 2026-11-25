@@ -144,7 +144,7 @@ cd my-app &amp;&amp; rendrix dev</code></pre>
               <div class="layer layer-host">Rendrix engine: DOM · CSS · layout · GPU · QuickJS</div>
             </figure>
           </div>
-          <p class="stack-note">These are layers, not file sizes. The only measured artifact is a single ~13.8 MB Windows executable; no size, memory or startup comparison has been measured.</p>
+          <p class="stack-note">These are layers, not file sizes. The measured artifacts are a bare Windows runtime of roughly 15–16 MB under the current release profile and, historically, a ~13.8 MB packaged app under an older profile; no like-for-like size, memory or startup comparison has been measured.</p>
         </div>
       </section>
 
@@ -316,18 +316,18 @@ render(
 
             <div class="stage" style="--s: 2">
               <h3><code>rendrix package</code></h3>
-              <p>Appends the bundle to the runtime executable with a <code>RENDRI01</code> trailer, producing one standalone file.</p>
+              <p>Appends the bundle to the runtime executable with a <code>RENDRAPP</code> trailer, producing one standalone file.</p>
               <div class="layout-bar" role="img" aria-label="Executable layout: runtime, bundle, length, marker">
                 <span class="seg seg-host">host</span>
                 <span class="seg seg-bundle">bundle</span>
                 <span class="seg seg-len">len</span>
-                <span class="seg seg-magic">RENDRI01</span>
+                <span class="seg seg-magic">RENDRAPP</span>
               </div>
               <p class="layout-caption">
                 Runtime executable, the <code>.rdxapp</code> JSON, an 8-byte little-endian length, then the
-                <code>RENDRI01</code> marker.
+                <code>RENDRAPP</code> marker.
               </p>
-              <p class="stage-result">Writes <code>dist/my-app.exe</code> (~13.8 MB on Windows).</p>
+              <p class="stage-result">Writes <code>dist/my-app.exe</code> (bare Windows runtime roughly 15–16 MB under the current release profile).</p>
             </div>
           </div>
         </div>
@@ -421,8 +421,9 @@ rendrix run</code></pre>
               </div>
               <p>
                 <code>rendrix build</code> type-checks and writes a <code>.rdxapp</code> bundle;
-                <code>rendrix package</code> writes one standalone executable (~13.8 MB on
-                Windows), with optional <code>--sign</code> and <code>--installer nsis</code>;
+                <code>rendrix package</code> writes one standalone executable (bare Windows runtime
+                roughly 15–16 MB under the current release profile), with optional <code>--sign</code>
+                and <code>--installer nsis</code>;
                 <code>rendrix run</code> launches it.
               </p>
             </div>
@@ -488,8 +489,8 @@ rendrix help</code></pre>
             <p class="section-lede">
               Rendrix is early alpha, not a production-ready GUI SDK. Verified by hand on
               Windows 11 / NVIDIA RTX 3060 with Vulkan only. macOS and Linux share the code and
-              are built and tested in CI, but no manual hardware pass is recorded. Around 360
-              Rust tests pass, along with the CLI and adapter tests.
+              are built and tested in CI, but no manual hardware pass is recorded. A 2026-11-24 run
+              passed 410 Rust tests, 44 CLI tests and 2 Solid adapter tests.
             </p>
           </header>
 
@@ -516,17 +517,17 @@ rendrix help</code></pre>
               <li>Full browser parity — Rendrix is not a browser and makes no browser-compatibility claim</li>
               <li>A manual screen-reader pass (the AccessKit bridge exists, but Narrator/NVDA/VoiceOver/Orca have not been run)</li>
               <li>macOS and Linux hardware validation — CI builds and tests them, but no manual pass is recorded</li>
-              <li>A WebGL2 fallback for browsers without WebGPU; browser-backed WebSocket, Worker and localStorage on the web target</li>
+              <li>Browser verification of the WebGL2 fallback; browser-backed WebSocket, Worker and localStorage on the web target</li>
               <li>Service Workers, XHR/IndexedDB, video/audio playback and canvas WebGPU</li>
-              <li>A React adapter, full table/float fidelity, writing-mode, WOFF2 and complex masks</li>
+              <li>A working React adapter (an experimental one exists but its integration test fails), full table/float fidelity, writing-mode, WOFF2 and complex masks</li>
               <li>A security sandbox for hostile code — capability checks and the 5 s/task interrupt are not a boundary</li>
-              <li>A re-measured cold start after the new font database cache (first frame was ≈0.7 s before it)</li>
+              <li>A quiet-machine cold-start measurement (a 2026-11-22 concurrent-load run reported an 81 ms first frame)</li>
               </ul>
             </div>
           </div>
 
           <div class="notice"><p>Only run code you trust: app code runs with your privileges behind small capability checks, and the execution-budget interrupt is not a sandbox. Early alpha, verified by hand on Windows 11 with Vulkan; macOS and Linux are CI-built but not manually validated.
-            The bundle format is a prototype. No size, memory or startup comparison has been measured beyond the single ~13.8 MB Windows executable.</p></div>
+            The bundle format is a prototype. No like-for-like size, memory or startup comparison has been measured beyond single-machine observations of the bare Windows runtime and a historical ~13.8 MB packaged app.</p></div>
         </div>
       </section>
 
